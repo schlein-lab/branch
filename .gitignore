@@ -35,3 +35,4 @@ venv/
 
 # Phase 0 cached Hummel docs (shared reference, not BRANCH code)
 phase0/hummel_docs/
+.env
