@@ -1,7 +1,8 @@
-# branch_graph: header-only library for v0.1.
-# Will gain .cpp files once implementation starts.
-add_library(branch_graph INTERFACE)
-target_include_directories(branch_graph INTERFACE
+# branch_graph: header-only types + GFA I/O implementation.
+add_library(branch_graph STATIC
+    graph_io.cpp
+)
+target_include_directories(branch_graph PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
 )
-target_compile_features(branch_graph INTERFACE cxx_std_20)
+target_compile_features(branch_graph PUBLIC cxx_std_20)
