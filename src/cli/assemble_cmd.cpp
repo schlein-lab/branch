@@ -36,7 +36,7 @@ void print_assemble_usage(std::ostream& os) {
           "  branch assemble (--fastq <path.fastq> | --bam <path.bam>) --out <path.gfa>\n"
           "                  [--max-reads <N>] [--max-overlaps <N>]\n"
           "                  [--fasta <path>] [--bed <path>] [--paf <path>]\n"
-          "                  [--paths <path>]\n"
+          "                  [--paths <path>] [--reference <path>]\n"
           "\nInput (exactly one of):\n"
           "  --fastq <path>  Plain-text FASTQ. For .gz, pipe via `zcat | branch ... --fastq /dev/stdin`.\n"
           "  --bam   <path>  BAM/CRAM/SAM via htslib. Secondary + supplementary alignments are\n"
@@ -61,6 +61,7 @@ struct Args {
     std::string bed_path;
     std::string paf_path;
     std::string paths_path;
+    std::string reference_path;  // Reference FASTA for alignment
     bool ok{false};
     std::string err;
 };
@@ -82,6 +83,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--bed")      { auto v = needs("--bed");           if (!v) return a; a.bed_path = v; }
         else if (k == "--paf")      { auto v = needs("--paf");           if (!v) return a; a.paf_path = v; }
         else if (k == "--paths")    { auto v = needs("--paths");         if (!v) return a; a.paths_path = v; }
+        else if (k == "--reference"){ auto v = needs("--reference");     if (!v) return a; a.reference_path = v; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
