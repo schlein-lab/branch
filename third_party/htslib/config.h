@@ -12,13 +12,13 @@
    accurate PACKAGE_VERSION as computed by the Makefile.  */
 
 /* Define if HTSlib should enable GCS support. */
-#define ENABLE_GCS 1
+/* #undef ENABLE_GCS */
 
 /* Define if HTSlib should enable plugins. */
 /* #undef ENABLE_PLUGINS */
 
 /* Define if HTSlib should enable S3 support. */
-#define ENABLE_S3 1
+/* #undef ENABLE_S3 */
 
 /* Define if __attribute__((constructor)) is available. */
 #define HAVE_ATTRIBUTE_CONSTRUCTOR 1
@@ -68,28 +68,28 @@
 #define HAVE_GMTIME_R 1
 
 /* Define if you have libcrypto-style HMAC(). */
-#define HAVE_HMAC 1
+/* #undef HAVE_HMAC */
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #define HAVE_INTTYPES_H 1
 
 /* Define to 1 if you have the 'bz2' library (-lbz2). */
-#define HAVE_LIBBZ2 1
+/* #undef HAVE_LIBBZ2 */
 
 /* Define if libcurl file access is enabled. */
-#define HAVE_LIBCURL 1
+/* #undef HAVE_LIBCURL */
 
 /* Define if libdeflate is available. */
-/* #undef HAVE_LIBDEFLATE */
+#define HAVE_LIBDEFLATE 1
 
 /* Define to 1 if you have the 'lzma' library (-llzma). */
-#define HAVE_LIBLZMA 1
+/* #undef HAVE_LIBLZMA */
 
 /* Define to 1 if you have the 'z' library (-lz). */
 #define HAVE_LIBZ 1
 
 /* Define to 1 if you have the <lzma.h> header file. */
-#define HAVE_LZMA_H 1
+/* #undef HAVE_LZMA_H */
 
 /* Define to 1 if you have a working 'mmap' system call. */
 #define HAVE_MMAP 1

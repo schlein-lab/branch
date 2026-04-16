@@ -1,6 +1,6 @@
 #pragma once
 
-// BRANCH v0.2 — Unitig compaction.
+// BRANCH v0.2 — Unitig compaction with consensus building.
 //
 // Collapses linear chains of nodes (in-degree ≤ 1, out-degree ≤ 1,
 // single successor has in-degree 1) into single unitig nodes. The
@@ -14,6 +14,7 @@
 //   - Node length_bp is summed along the chain.
 //   - Node copy_count is taken from the chain start (CN-aware
 //     inference happens later, in a separate pass).
+//   - Node consensus is built from member sequences via MSA.
 //
 // The compactor returns a new LosslessGraph; the input is not
 // modified. A mapping from old NodeId to new NodeId is returned so
@@ -21,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "graph/lossless_graph.hpp"
@@ -34,6 +36,13 @@ struct CompactionResult {
     std::vector<NodeId> old_to_new;
 };
 
+// Compact unitigs, building consensus from Node::consensus fields.
 [[nodiscard]] CompactionResult compact_unitigs(const LosslessGraph& input);
+
+// Compact unitigs with explicit sequences for consensus building.
+// node_sequences[i] is the sequence for node i (may be empty).
+[[nodiscard]] CompactionResult compact_unitigs_with_sequences(
+    const LosslessGraph& input,
+    const std::vector<std::string>& node_sequences);
 
 }  // namespace branch::graph
