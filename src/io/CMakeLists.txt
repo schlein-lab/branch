@@ -1,5 +1,6 @@
 add_library(branch_io STATIC
     mosdepth_reader.cpp
+    fastq_reader.cpp
 )
 target_include_directories(branch_io PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
