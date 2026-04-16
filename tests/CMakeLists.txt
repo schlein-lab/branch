@@ -143,3 +143,9 @@ target_link_libraries(test_annotation_bed PRIVATE branch_analysis GTest::gtest_m
 target_compile_features(test_annotation_bed PRIVATE cxx_std_20)
 target_include_directories(test_annotation_bed PRIVATE ${CMAKE_SOURCE_DIR}/src)
 gtest_discover_tests(test_annotation_bed)
+
+add_executable(test_mixed_decomposer test_mixed_decomposer.cpp)
+target_link_libraries(test_mixed_decomposer PRIVATE branch_classify GTest::gtest_main)
+target_compile_features(test_mixed_decomposer PRIVATE cxx_std_20)
+target_include_directories(test_mixed_decomposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_mixed_decomposer)

@@ -6,6 +6,7 @@
 # The LightGBM classifier implementation still arrives with v0.3.
 add_library(branch_classify STATIC
     feature_extractor.cpp
+    mixed_decomposer.cpp
 )
 target_include_directories(branch_classify PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
