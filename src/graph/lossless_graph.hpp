@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include <vector>
 #include <stdexcept>
 
@@ -26,6 +27,7 @@ struct Node {
     std::uint32_t copy_count{1}; // CN-aware: per-node attribute, not duplication
     float copy_count_confidence{1.0f};   // [0, 1]
     std::uint32_t read_support{0};       // number of reads traversing this node
+    std::string consensus;               // optional consensus sequence (for abPOA)
 };
 
 struct Edge {
@@ -60,6 +62,9 @@ public:
             .id = id,
             .length_bp = length_bp,
             .copy_count = copy_count,
+            .copy_count_confidence = 1.0f,
+            .read_support = 0,
+            .consensus = {},
         });
         return id;
     }
