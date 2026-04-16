@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, asan, ubsan]
+    name: ${{ matrix.sanitizer }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build g++-13
+
+      - name: Configure
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          SAN_FLAGS=""
+          case "${{ matrix.sanitizer }}" in
+            asan)  SAN_FLAGS="-DBRANCH_USE_ASAN=ON" ;;
+            ubsan) SAN_FLAGS="-DBRANCH_USE_UBSAN=ON" ;;
+          esac
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBRANCH_BUILD_CUDA=OFF \
+            -DBRANCH_BUILD_TESTS=ON \
+            $SAN_FLAGS
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure --parallel $(nproc)
+
+  cuda-configure:
+    runs-on: ubuntu-24.04
+    name: cuda-configure-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
+
+      - name: Install CUDA toolkit (headers only)
+        run: |
+          sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit
+
+      - name: Configure with CUDA
+        run: |
+          cmake -S . -B build-cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBRANCH_BUILD_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="80;90"
+
+      - name: Build CUDA targets
+        run: cmake --build build-cuda --target branch_gpu -j $(nproc)

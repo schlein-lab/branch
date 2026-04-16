@@ -16,16 +16,16 @@
 #include <cstdint>
 #include <span>
 
+// BubbleCandidate lives in classify/features.hpp. Included here (before
+// any namespace) because classify_batch takes a span of values.
+#include "classify/features.hpp"
+
 namespace branch::backend {
 
-// Opaque per-backend state. The Backend struct owns ctx_ and calls the
-// vtable function pointers with it as first argument.
 using BackendContext = void*;
+using BubbleCandidate = branch::classify::BubbleCandidate;
 
-// Forward declarations. Full types live in their respective modules
-// (classify/, graph/, align/) and are referenced only by pointer here
-// to keep the vtable header minimal.
-struct BubbleCandidate;
+// Forward-declared because only a pointer is passed.
 struct ReadBatch;
 
 // Output of classification.
