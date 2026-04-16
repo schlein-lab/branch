@@ -15,7 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ------------------------------------------------------------------------------
 # Build Options
 # ------------------------------------------------------------------------------
-option(BRANCH_BUILD_CUDA "Build CUDA backends" ON)
+option(BRANCH_BUILD_CUDA "Build CUDA backends" OFF)
 option(BRANCH_BUILD_TESTS "Build test suite" ON)
 option(BRANCH_USE_ASAN "Enable AddressSanitizer" OFF)
 option(BRANCH_USE_TSAN "Enable ThreadSanitizer" OFF)
