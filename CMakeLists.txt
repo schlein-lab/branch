@@ -33,15 +33,15 @@ if(BRANCH_BUILD_CUDA)
 endif()
 
 # ------------------------------------------------------------------------------
-# Compiler Warnings
+# Compiler Warnings (CXX only — nvcc chokes on many host-compiler flags)
 # ------------------------------------------------------------------------------
 add_compile_options(
-    -Wall
-    -Wextra
-    -Wpedantic
-    -Werror
-    -Wconversion
-    -Wshadow
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+    $<$<COMPILE_LANGUAGE:CXX>:-Werror>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wshadow>
 )
 
 # ------------------------------------------------------------------------------
