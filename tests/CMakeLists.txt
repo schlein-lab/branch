@@ -121,3 +121,9 @@ if(TARGET branch)
     add_dependencies(test_e2e_assemble branch generate_toy_fastq)
     add_test(NAME E2E_Assemble COMMAND test_e2e_assemble)
 endif()
+
+add_executable(test_reference_aligner test_reference_aligner.cpp)
+target_link_libraries(test_reference_aligner PRIVATE GTest::gtest_main)
+target_compile_features(test_reference_aligner PRIVATE cxx_std_20)
+gtest_discover_tests(test_reference_aligner)
+

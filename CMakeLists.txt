@@ -90,6 +90,22 @@ target_link_libraries(branch_htslib INTERFACE
     deflate z m pthread)
 
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# minimap2 (FetchContent for ksw2 alignment)
+# ------------------------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+    minimap2
+    GIT_REPOSITORY https://github.com/lh3/minimap2.git
+    GIT_TAG        v2.28
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(minimap2)
+
+# Create interface library for minimap2 headers (-isystem to suppress warnings)
+add_library(branch_minimap2 INTERFACE)
+target_include_directories(branch_minimap2 SYSTEM INTERFACE "${minimap2_SOURCE_DIR}")
+
 # Subdirectories
 # ------------------------------------------------------------------------------
 add_subdirectory(src)
