@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <string>
+#include <vector>
+
 #include "backend/cpu_backend.hpp"
 #include "classify/features.hpp"
 
@@ -9,6 +12,7 @@ using branch::backend::ClassificationResult;
 using branch::backend::kCpuBackendName;
 using branch::backend::make_cpu_backend;
 using branch::backend::OverlapPair;
+using branch::backend::ReadBatch;
 using branch::backend::VAFEstimate;
 
 TEST(CpuBackendTest, Creates_non_empty_backend) {
@@ -56,4 +60,59 @@ TEST(CpuBackendTest, Destructor_cleans_up_without_leak) {
         EXPECT_FALSE(b.empty());
     }
     // b destroyed — under ASan a leak or double-free would fire.
+}
+
+TEST(CpuBackendTest, Overlap_detects_shared_minimizers) {
+    // Two reads sharing a 200bp identical substring should produce >= 1 overlap.
+    // Read 1: 300bp with shared region at [50..250)
+    // Read 2: 300bp with shared region at [100..300)
+    // The shared region is identical -> minimizer hits should match.
+
+    // Generate deterministic "random" sequence
+    auto make_seq = [](std::size_t len, unsigned seed) {
+        const char bases[] = "ACGT";
+        std::string s;
+        s.reserve(len);
+        for (std::size_t i = 0; i < len; ++i) {
+            seed = seed * 1103515245 + 12345;
+            s.push_back(bases[(seed >> 16) & 3]);
+        }
+        return s;
+    };
+
+    // Shared 200bp region
+    std::string shared = make_seq(200, 42);
+
+    // Read 1: 50bp prefix + 200bp shared + 50bp suffix
+    std::string read1 = make_seq(50, 100) + shared + make_seq(50, 200);
+
+    // Read 2: 100bp prefix + 200bp shared
+    std::string read2 = make_seq(100, 300) + shared;
+
+    // Build ReadBatch
+    ReadBatch batch;
+    batch.reads.push_back({std::string_view(read1), 0});
+    batch.reads.push_back({std::string_view(read2), 1});
+
+    auto b = make_cpu_backend();
+    std::array<OverlapPair, 10> out_pairs{};
+    std::size_t count = 0;
+
+    b.compute_overlaps(&batch, out_pairs, &count);
+
+    // Should detect at least 1 overlap between reads 0 and 1
+    EXPECT_GE(count, 1u) << "Expected >= 1 overlap for 200bp shared region";
+
+    if (count > 0) {
+        // Verify the pair is (0, 1) in canonical order
+        bool found_pair = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            if ((out_pairs[i].read_a == 0 && out_pairs[i].read_b == 1) ||
+                (out_pairs[i].read_a == 1 && out_pairs[i].read_b == 0)) {
+                found_pair = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found_pair) << "Overlap should be between reads 0 and 1";
+    }
 }

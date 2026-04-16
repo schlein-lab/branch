@@ -18,8 +18,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "backend/backend_vtable.hpp"
+#include "graph/delta_read.hpp"
 
 namespace branch::backend {
 
@@ -27,6 +30,16 @@ namespace branch::backend {
 // forward declaration so the header stays minimal; the full struct
 // is opaque to callers outside of the CPU backend .cpp.
 struct CpuBackendContext;
+
+// ReadBatch: container of sequences for overlap computation.
+// Each read is a (sequence, read_id) pair.
+struct ReadBatch {
+    struct Read {
+        std::string_view seq;
+        graph::ReadId id;
+    };
+    std::vector<Read> reads;
+};
 
 // Construct a CPU-backed Backend. Never returns an empty Backend;
 // context is always allocated. Throws std::bad_alloc on OOM.
