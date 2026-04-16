@@ -60,6 +60,28 @@ namespace branch::graph {
     return hf < hr ? hf : hr;
 }
 
+// Strand-aware canonical hash. Returns the canonical hash together
+// with the strand bit that picked it (0 = forward k-mer was smaller,
+// 1 = reverse-complement was smaller). Callers in overlap detection
+// use the strand bit to distinguish same-strand from opposite-strand
+// minimizer hits — the base `canonical_hash()` collapses both sides
+// into one bucket, which makes strand information irrecoverable once
+// the hit has been emitted.
+struct CanonicalHash {
+    std::uint64_t hash;
+    std::uint8_t strand;  // 0 = forward, 1 = reverse-complement picked
+};
+
+[[nodiscard]] inline CanonicalHash canonical_hash_with_strand(
+    std::uint64_t kmer, std::size_t k) noexcept {
+    auto hf = splitmix64(kmer);
+    auto hr = splitmix64(rc_kmer(kmer, k));
+    if (hf <= hr) {
+        return CanonicalHash{hf, 0};
+    }
+    return CanonicalHash{hr, 1};
+}
+
 // Append the minimizer sketch of `seq` to `out`. Resets and appends
 // one MinimizerHit per window. `read_id` is stamped onto each hit so
 // the hits can be merged into a single per-batch table later.

@@ -31,6 +31,10 @@ BuildResult build_graph(std::span<const ReadMeta> reads,
     // is implicit in the pair's offset_a/offset_b semantics — v0.1
     // treats every pair as a single undirected edge emitted as an
     // a→b directed edge, matching the LosslessGraph model.
+    //
+    // v0.2: propagate the strand bit from OverlapPair onto the Edge
+    // via flag bit 4 (0x10). graph_io.cpp consumes that bit when
+    // emitting GFA L-line orientation.
     for (const auto& op : overlaps) {
         if (op.read_a >= r.read_to_node.size() ||
             op.read_b >= r.read_to_node.size()) {
@@ -43,6 +47,10 @@ BuildResult build_graph(std::span<const ReadMeta> reads,
             continue;
         }
         r.graph.add_edge(na, nb, 1u);
+        if (op.strand != 0) {
+            auto& e = const_cast<Edge&>(r.graph.edges().back());
+            e.flags = static_cast<std::uint16_t>(e.flags | 0x10);
+        }
     }
 
     return r;

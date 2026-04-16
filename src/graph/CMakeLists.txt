@@ -4,6 +4,8 @@ add_library(branch_graph STATIC
     minimizer_sketcher.cpp
     graph_builder.cpp
     graph_compactor.cpp
+    graph_filter.cpp
+    delta_read.cpp
 )
 target_include_directories(branch_graph PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>

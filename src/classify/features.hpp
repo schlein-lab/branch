@@ -37,6 +37,29 @@ struct BubbleCandidate {
     std::uint32_t start;
     std::uint32_t end;
     FeatureVector features;
+
+    // Graph linkage to the structural bubble this candidate is derived
+    // from. NodeIds (branch::graph::NodeId == std::uint32_t) of the
+    // detect::Bubble's entry and exit. Zero means "unknown / not set".
+    std::uint32_t entry_node{0};
+    std::uint32_t exit_node{0};
+
+    // Support on the two alt paths of the bubble (branch vs. alt).
+    // Populated by the feature extractor from detect::Bubble.alts.
+    // Used by the VAF estimator: vaf = branch / (branch + alt).
+    std::uint32_t read_support_branch{0};
+    std::uint32_t read_support_alt{0};
+
+    // Cached length of the longest alt path in bp — passed into
+    // Feature::BubbleLengthBp by the extractor, kept here as the raw
+    // source value for downstream passes (e.g. VAF / phasing).
+    std::uint32_t bubble_length_bp{0};
+
+    // Annotation flags (segdup / repeat) propagated from the reference-
+    // track intersector. Zero is the "unannotated" default and means the
+    // feature extractor will emit 0.0 for the corresponding Feature slot.
+    std::uint8_t segdup_flag{0};
+    std::uint8_t repeat_flag{0};
 };
 
 static_assert(sizeof(FeatureVector) == kNumFeatures * sizeof(float),

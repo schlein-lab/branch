@@ -1,8 +1,11 @@
 // BRANCH v0.1 — GFA-1.2 I/O implementation.
+// BRANCH v0.2 — FASTA / BED / PAF sidecar writers.
 
 #include "graph/graph_io.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -27,7 +30,14 @@ bool write_gfa(const LosslessGraph& graph, std::ostream& out) {
     for (std::size_t i = 0; i < graph.edges().size(); ++i) {
         const auto& edge = graph.edges()[i];
         // GFA L-line: L <from> <from_orient> <to> <to_orient> <cigar>
-        out << "L\t" << edge.from << "\t+\t" << edge.to << "\t+\t0M"
+        //
+        // v0.2 strand-aware output: bit 4 (0x10) of edge.flags marks an
+        // opposite-strand overlap. When set we emit "+/-" so the target
+        // node enters on its reverse-complement side; otherwise "+/+".
+        const bool opp_strand = (edge.flags & 0x10) != 0;
+        const char to_orient = opp_strand ? '-' : '+';
+        out << "L\t" << edge.from << "\t+\t" << edge.to << '\t' << to_orient
+            << "\t0M"
             << "\tVC:i:" << edge.read_support
             << "\tVF:f:" << std::fixed << std::setprecision(4) << edge.vaf
             << "\tCT:f:" << std::fixed << std::setprecision(4) << edge.vaf_confidence;
@@ -153,6 +163,153 @@ bool read_gfa(LosslessGraph& graph, const std::string& path) {
     std::ifstream ifs(path);
     if (!ifs) return false;
     return read_gfa(graph, ifs);
+}
+
+// =====================================================================
+// FASTA writer
+// =====================================================================
+//
+// TODO(v0.3): write node consensus instead of raw reads once the
+// compactor stores a per-Node consensus sequence.
+
+bool write_fasta(const LosslessGraph& /*graph*/,
+                 const std::vector<std::string>& sequences,
+                 const std::vector<std::string>& names,
+                 std::ostream& out) {
+    if (sequences.size() != names.size()) return false;
+
+    constexpr std::size_t kWrap = 80;
+    for (std::size_t i = 0; i < sequences.size(); ++i) {
+        out << '>' << names[i] << '\n';
+        const auto& seq = sequences[i];
+        for (std::size_t p = 0; p < seq.size(); p += kWrap) {
+            const std::size_t len = std::min(kWrap, seq.size() - p);
+            out.write(seq.data() + p, static_cast<std::streamsize>(len));
+            out << '\n';
+        }
+    }
+    return out.good();
+}
+
+bool write_fasta(const LosslessGraph& graph,
+                 const std::vector<std::string>& sequences,
+                 const std::vector<std::string>& names,
+                 const std::string& path) {
+    std::ofstream ofs(path);
+    if (!ofs) return false;
+    return write_fasta(graph, sequences, names, ofs);
+}
+
+// =====================================================================
+// BED writer
+// =====================================================================
+//
+// TODO(v0.3): use real chrom/start/end once reference alignment exists.
+// BED6 layout: chrom  start  end  name  score  strand
+
+bool write_bed(const LosslessGraph& graph, std::ostream& out) {
+    for (const auto& node : graph.nodes()) {
+        out << "NA" << '\t'
+            << 0 << '\t'
+            << node.length_bp << '\t'
+            << "node_" << node.id << '\t'
+            << node.copy_count << '\t'
+            << '.' << '\n';
+    }
+    return out.good();
+}
+
+bool write_bed(const LosslessGraph& graph, const std::string& path) {
+    std::ofstream ofs(path);
+    if (!ofs) return false;
+    return write_bed(graph, ofs);
+}
+
+// =====================================================================
+// PAF writer
+// =====================================================================
+//
+// PAF-12 columns (minimap2 standard):
+//   qname qlen qstart qend strand tname tlen tstart tend matches alnlen mapq
+//
+// Our OverlapPair carries (read_a, read_b, offset_a, offset_b,
+// overlap_len, diff_count, strand). Map them directly:
+//   qstart = offset_a, qend = offset_a + overlap_len
+//   tstart = offset_b, tend = offset_b + overlap_len
+//   matches = max(0, overlap_len - diff_count)
+//   alnlen  = overlap_len
+//   mapq    = min(60, int((matches / overlap_len) * 60))
+//
+// TODO(v0.3): propagate per-side strand from minimizer_sketcher so
+// the '+'/'-' column is accurate at sub-read granularity.
+
+bool write_paf(const std::vector<branch::backend::OverlapPair>& pairs,
+               const std::vector<std::string>& sequences,
+               const std::vector<std::string>& names,
+               std::ostream& out) {
+    if (sequences.size() != names.size()) return false;
+
+    for (const auto& p : pairs) {
+        if (p.read_a >= sequences.size() || p.read_b >= sequences.size()) {
+            return false;
+        }
+        const auto qlen = static_cast<std::uint64_t>(sequences[p.read_a].size());
+        const auto tlen = static_cast<std::uint64_t>(sequences[p.read_b].size());
+
+        std::uint64_t qstart = p.offset_a;
+        std::uint64_t tstart = p.offset_b;
+        std::uint64_t aln    = p.overlap_len;
+
+        // Clamp against read lengths in case the backend emits an
+        // overlap that extends past the end of either sequence. The
+        // real aligner enforces this invariant; we defend here so the
+        // PAF stays consistent for downstream parsers.
+        if (qstart > qlen) qstart = qlen;
+        if (tstart > tlen) tstart = tlen;
+        if (qstart + aln > qlen) aln = qlen - qstart;
+        if (tstart + aln > tlen) aln = tlen - tstart;
+
+        const std::uint64_t qend = qstart + aln;
+        const std::uint64_t tend = tstart + aln;
+
+        const std::int64_t diff = p.diff_count;
+        std::int64_t matches = static_cast<std::int64_t>(aln) - diff;
+        if (matches < 0) matches = 0;
+
+        int mapq = 0;
+        if (aln > 0) {
+            const double identity = static_cast<double>(matches) /
+                                    static_cast<double>(aln);
+            mapq = static_cast<int>(identity * 60.0);
+            if (mapq > 60) mapq = 60;
+            if (mapq < 0) mapq = 0;
+        }
+
+        const char strand_c = (p.strand == 0) ? '+' : '-';
+
+        out << names[p.read_a] << '\t'
+            << qlen   << '\t'
+            << qstart << '\t'
+            << qend   << '\t'
+            << strand_c << '\t'
+            << names[p.read_b] << '\t'
+            << tlen   << '\t'
+            << tstart << '\t'
+            << tend   << '\t'
+            << matches << '\t'
+            << aln    << '\t'
+            << mapq   << '\n';
+    }
+    return out.good();
+}
+
+bool write_paf(const std::vector<branch::backend::OverlapPair>& pairs,
+               const std::vector<std::string>& sequences,
+               const std::vector<std::string>& names,
+               const std::string& path) {
+    std::ofstream ofs(path);
+    if (!ofs) return false;
+    return write_paf(pairs, sequences, names, ofs);
 }
 
 }  // namespace branch::graph
