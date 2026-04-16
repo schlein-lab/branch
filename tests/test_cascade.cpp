@@ -79,3 +79,46 @@ TEST(CascadeTest, Config_threshold_changes_affect_decision) {
     auto r2 = classify_one(f, cfg);
     EXPECT_EQ(r2.label, BubbleClass::Branch);
 }
+
+// ============ Mixed Class / Ambiguous Cases ============
+
+TEST(CascadeTest, Mixed_high_flank_but_high_depth_ratio) {
+    // Edge case: FlankJaccard suggests Branch (high), but DepthRatio suggests Dup
+    // Stage 1 checks FlankJaccard first (>= 0.99), so high enough flank wins
+    auto f = make_features();
+    f[static_cast<std::size_t>(Feature::FlankJaccardK31)] = 0.995f;  // High -> Branch
+    f[static_cast<std::size_t>(Feature::DepthRatioDiploid)] = 2.5f;  // Also high (Dup signal)
+    auto r = classify_one(f);
+    // Stage 1 fires first due to cascade order
+    EXPECT_EQ(r.label, BubbleClass::Branch);
+    EXPECT_EQ(r.stage_index, 0u);
+}
+
+TEST(CascadeTest, Mixed_moderate_flank_high_depth_goes_to_dup) {
+    // FlankJaccard not high enough for Stage 1, but DepthRatio >= 2.0 fires Stage 2
+    auto f = make_features();
+    f[static_cast<std::size_t>(Feature::FlankJaccardK31)] = 0.8f;    // Not enough for Stage 1
+    f[static_cast<std::size_t>(Feature::DepthRatioDiploid)] = 2.1f;  // >= 2.0 -> Stage 2 Dup
+    auto r = classify_one(f);
+    EXPECT_EQ(r.label, BubbleClass::Duplication);
+    EXPECT_EQ(r.stage_index, 1u);
+}
+
+// ============ Guard Tests (min_bubble_length, min_coverage) ============
+
+TEST(CascadeTest, Guard_min_bubble_length_rejects_short_bubble) {
+    FeatureVector f{};
+    f[static_cast<std::size_t>(Feature::BubbleLengthBp)] = 200.0f;   // Below 500bp guard
+    f[static_cast<std::size_t>(Feature::DepthRatioDiploid)] = 5.0f;  // OK
+    f[static_cast<std::size_t>(Feature::FlankJaccardK31)] = 0.999f;  // Would fire Stage 1
+    auto r = classify_one(f);
+    // Guard rejects before any stage fires
+    EXPECT_EQ(r.label, BubbleClass::NonSeparable);
+}
+
+// NOTE: the min_coverage guard was removed from classify_one() because
+// it used the same DepthRatioDiploid feature that Stage 2 needs for
+// Duplication detection, making Stage 3 unreachable. Low coverage is
+// handled by per-stage confidence damping rather than a hard reject.
+// When that damping lands, re-add a test here that verifies reduced
+// confidence at low coverage rather than a NonSeparable return.

@@ -72,10 +72,16 @@ public:
         return frozen_ ? read_ids_.size() : count_mutable_entries();
     }
 
-    // Read lookup (frozen form only).
+    // Read lookup (frozen form only). Out-of-range node returns an
+    // empty span rather than asserting so callers can probe the index
+    // without guarding every access.
     [[nodiscard]] std::span<const ReadId> reads_for(NodeId node) const {
-        assert(frozen_);
-        assert(static_cast<std::size_t>(node) < node_count());
+        if (!frozen_) {
+            throw std::logic_error("reads_for() called before freeze()");
+        }
+        if (static_cast<std::size_t>(node) >= node_count()) {
+            return {};
+        }
         auto start = offsets_[node];
         auto end = offsets_[static_cast<std::size_t>(node) + 1];
         return std::span<const ReadId>(
