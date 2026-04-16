@@ -3,6 +3,14 @@
 
 sample: HG002
 
+# Path overrides (all optional, defaults constructed from $USER environment var).
+# Uncomment and adjust if running as different user or custom layout.
+# shared_dir: /beegfs/u/<user>/<group>/shared
+# project_dir: /beegfs/u/<user>/<group>/<lab>/<user>/projects/branch
+# container_dir: /beegfs/u/<user>/<group>/<lab>/<user>/containers
+# log_dir: /beegfs/u/<user>/<group>/<lab>/<user>/logs/slurm_jobs
+# tmp_dir: /beegfs/u/<user>/<group>/<lab>/<user>/projects/branch/tmp
+
 # Optional override. If unset, the Snakefile constructs the path from
 # BeeGFS shared-reference layout using ${USER} and the sample name.
 # Example: /beegfs/u/<user>/<group>/shared/references/human_pangenome/hifi_reads/HG002/15kb

@@ -16,6 +16,7 @@
 #include <vector>
 #include <cassert>
 #include <span>
+#include <stdexcept>
 
 #include "graph/delta_read.hpp"
 
@@ -31,6 +32,9 @@ public:
     }
 
     void add(NodeId node, ReadId read) {
+        if (frozen_) {
+            throw std::logic_error("add() called after freeze()");
+        }
         if (node >= buckets_.size()) {
             buckets_.resize(static_cast<std::size_t>(node) + 1);
         }
@@ -59,17 +63,17 @@ public:
         frozen_ = true;
     }
 
-    bool is_frozen() const noexcept { return frozen_; }
-    std::size_t node_count() const noexcept {
+    [[nodiscard]] bool is_frozen() const noexcept { return frozen_; }
+    [[nodiscard]] std::size_t node_count() const noexcept {
         return frozen_ ? (offsets_.empty() ? 0 : offsets_.size() - 1)
                        : buckets_.size();
     }
-    std::size_t total_entries() const noexcept {
+    [[nodiscard]] std::size_t total_entries() const noexcept {
         return frozen_ ? read_ids_.size() : count_mutable_entries();
     }
 
     // Read lookup (frozen form only).
-    std::span<const ReadId> reads_for(NodeId node) const {
+    [[nodiscard]] std::span<const ReadId> reads_for(NodeId node) const {
         assert(frozen_);
         assert(static_cast<std::size_t>(node) < node_count());
         auto start = offsets_[node];
@@ -79,7 +83,7 @@ public:
     }
 
 private:
-    std::size_t count_mutable_entries() const {
+    [[nodiscard]] std::size_t count_mutable_entries() const {
         std::size_t n = 0;
         for (const auto& b : buckets_) n += b.size();
         return n;

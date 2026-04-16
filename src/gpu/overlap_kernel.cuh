@@ -14,6 +14,13 @@
 #include <cstddef>
 #include <cstdint>
 
+// Forward declare cudaStream_t to avoid CUDA header dependency in CPU code
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#else
+using cudaStream_t = void*;
+#endif
+
 #include "backend/backend_vtable.hpp"
 
 namespace branch::gpu {
@@ -41,6 +48,7 @@ struct OverlapKernelLaunchConfig {
     std::size_t max_output_pairs;
     int device_id{0};
     int threads_per_block{256};
+    cudaStream_t stream{nullptr};  // FIX: Added stream member for async execution
 };
 
 // Opaque device pointers passed in by a Backend implementation that

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <stdexcept>
 
 #include "graph/delta_read.hpp"
 
@@ -50,8 +51,8 @@ class LosslessGraph {
 public:
     LosslessGraph() = default;
 
-    std::size_t node_count() const noexcept { return nodes_.size(); }
-    std::size_t edge_count() const noexcept { return edges_.size(); }
+    [[nodiscard]] std::size_t node_count() const noexcept { return nodes_.size(); }
+    [[nodiscard]] std::size_t edge_count() const noexcept { return edges_.size(); }
 
     NodeId add_node(std::uint32_t length_bp, std::uint32_t copy_count = 1) {
         NodeId id = static_cast<NodeId>(nodes_.size());
@@ -67,20 +68,37 @@ public:
         edges_.push_back(Edge{.from = from, .to = to, .read_support = read_support});
     }
 
-    const Node& node(NodeId id) const { return nodes_[id]; }
-    Node& node(NodeId id) { return nodes_[id]; }
+    [[nodiscard]] const Node& node(NodeId id) const {
+        if (id >= nodes_.size()) {
+            throw std::out_of_range("NodeId out of range");
+        }
+        return nodes_[id];
+    }
 
-    const std::vector<Node>& nodes() const noexcept { return nodes_; }
-    const std::vector<Edge>& edges() const noexcept { return edges_; }
+    [[nodiscard]] Node& node(NodeId id) {
+        if (id >= nodes_.size()) {
+            throw std::out_of_range("NodeId out of range");
+        }
+        return nodes_[id];
+    }
+
+    [[nodiscard]] const std::vector<Node>& nodes() const noexcept { return nodes_; }
+    [[nodiscard]] const std::vector<Edge>& edges() const noexcept { return edges_; }
 
     // Bulk-update helpers used by the classifier and CN-inference passes.
     void set_copy_count(NodeId id, std::uint32_t cc, float confidence) {
+        if (id >= nodes_.size()) {
+            throw std::out_of_range("NodeId out of range");
+        }
         auto& n = nodes_[id];
         n.copy_count = cc;
         n.copy_count_confidence = confidence;
     }
 
     void set_edge_vaf(std::size_t edge_index, float vaf, float confidence) {
+        if (edge_index >= edges_.size()) {
+            throw std::out_of_range("edge index out of range");
+        }
         edges_[edge_index].vaf = vaf;
         edges_[edge_index].vaf_confidence = confidence;
     }
