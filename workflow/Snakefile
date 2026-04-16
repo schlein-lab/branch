@@ -14,11 +14,12 @@ configfile: "config/config.yaml"
 
 USER = os.environ.get("USER", "bbg6775")
 BEEGFS_BASE = f"/beegfs/u/{USER}/humangenetik/ag/schlein/{USER}"
-PROJECT_DIR = f"{BEEGFS_BASE}/projects/branch"
-CONTAINER_DIR = f"{BEEGFS_BASE}/containers"
-LOG_DIR = f"{BEEGFS_BASE}/logs/slurm_jobs"
+PROJECT_DIR = config.get("project_dir", f"{BEEGFS_BASE}/projects/branch")
+CONTAINER_DIR = config.get("container_dir", f"{BEEGFS_BASE}/containers")
+LOG_DIR = config.get("log_dir", f"{BEEGFS_BASE}/logs/slurm_jobs")
+TMP_DIR = config.get("tmp_dir", f"{PROJECT_DIR}/tmp")
 
-SHARED = "/beegfs/u/bbg6775/humangenetik/shared"
+SHARED = config.get("shared_dir", f"/beegfs/u/{USER}/humangenetik/shared")
 REFERENCE = f"{SHARED}/references/GRCh38/GRCh38_full_analysis_set_plus_decoy_hla.fa"
 SEGDUP_UCSC = f"{SHARED}/annotations/segdups/hg38_genomicSuperDups.txt.gz"
 STR_UCSC = f"{SHARED}/annotations/repeatmasker/hg38_simpleRepeat.txt.gz"
@@ -53,11 +54,11 @@ rule align_hifi:
         r"""
         set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
         cat {params.hifi_dir}/*.fastq \
-          | apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.minimap2_sif} \
+          | apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.minimap2_sif} \
               minimap2 -ax map-hifi --secondary=no -t {threads} {input.ref} - \
-          | apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.samtools_sif} \
+          | apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.samtools_sif} \
               samtools sort -@ 4 -O bam -o {output.bam} -
-        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.samtools_sif} \
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.samtools_sif} \
             samtools index -@ 4 {output.bam}
         """
 
@@ -83,11 +84,12 @@ rule roi_catalog:
         mkdir -p {PROJECT_DIR}/phase0/rois
         zcat {input.segdup} | awk -F"\t" "BEGIN{{OFS=\"\\t\"}} \$2 ~ /^chr/ {{print \$2,\$3,\$4,\"segdup_\"NR,\"segdup\"}}" | sort -k1,1 -k2,2n > {output.segdup_bed}
         zcat {input.str_tr} | awk -F"\t" "BEGIN{{OFS=\"\\t\"}} \$2 ~ /^chr/ {{print \$2,\$3,\$4,\"trf_\"\$6\"_\"\$7,\"simple_repeat\"}}" | sort -k1,1 -k2,2n > {output.str_bed}
-        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.bedtools_sif} \
-            bedtools merge -i {output.segdup_bed} -c 5 -o distinct > /tmp/segdup_merged.bed
-        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.bedtools_sif} \
-            bedtools merge -i {output.str_bed} -c 5 -o distinct > /tmp/str_merged.bed
-        cat /tmp/segdup_merged.bed /tmp/str_merged.bed | sort -k1,1 -k2,2n > {output.catalog}
+        mkdir -p {TMP_DIR}
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.bedtools_sif} \
+            bedtools merge -i {output.segdup_bed} -c 5 -o distinct > {TMP_DIR}/segdup_merged.bed
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.bedtools_sif} \
+            bedtools merge -i {output.str_bed} -c 5 -o distinct > {TMP_DIR}/str_merged.bed
+        cat {TMP_DIR}/segdup_merged.bed {TMP_DIR}/str_merged.bed | sort -k1,1 -k2,2n > {output.catalog}
         """
 
 rule coverage_profile:
@@ -109,7 +111,7 @@ rule coverage_profile:
         r"""
         set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
         cd {PROJECT_DIR}/phase0/rois
-        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.mosdepth_sif} \
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.mosdepth_sif} \
             mosdepth --by {input.catalog} --no-per-base --threads {threads} \
             {SAMPLE}_coverage {input.bam}
         echo aggregation_placeholder > {output.stats}

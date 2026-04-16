@@ -1,47 +1,33 @@
-# Backend + GPU Review
+# Backend + GPU Review (Part 3/4)
 
-**Reviewer**: service-zyrkel
-**Datum**: 2026-04-16
-**Scope**: Backend VTable + GPU Overlap Kernel Layer
-
-## Files (4 Dateien, LOC)
-
-| File | LOC | Zweck |
-|------|-----|-------|
-| backend_vtable.hpp | 154 | Type-erased Backend mit Batch-APIs, RAII-Ownership |
-| overlap_kernel.cuh | 59 | CPU-kompilierbarer CUDA-Header, MinimizerEntry 16B |
-| overlap_kernel.cu | 48 | CUDA Kernel-Stub (no-op), synchroner Launch |
-| overlap_kernel_stub.cpp | 20 | CPU-Fallback, gibt 0 zurueck |
+## Files
+| File | LOC | Purpose |
+|------|-----|----------|
+| `src/backend/backend_vtable.hpp` | 143 | Type-erased VTable, OverlapPair 24B, RAII Backend class |
+| `src/gpu/overlap_kernel.cuh` | 56 | Host-side CUDA decl, MinimizerEntry 16B, CPU-compilable |
+| `src/gpu/overlap_kernel.cu` | 44 | CUDA kernel impl, skeleton no-op, launch wrapper |
+| `src/gpu/overlap_kernel_stub.cpp` | 17 | CPU fallback, returns 0, links without CUDA |
 
 ## Critical Issues
-
-| Datei:Zeile | Severity | Problem |
-|-------------|----------|---------|
-| overlap_kernel.cu:30-31 | **HIGH** | `cudaMalloc`/`cudaFree` pro Launch — synchrone Allokation blockiert GPU-Pipeline. Memory-Pool erforderlich. |
-| overlap_kernel.cu:30-43 | **HIGH** | Keine CUDA-Error-Checks. `cudaMalloc` kann OOM returnen, wird ignoriert. |
-| overlap_kernel.cu:42 | **MEDIUM** | `cudaMemcpy` D2H ist synchron — blockiert bis Kernel fertig. Stream-async fehlt. |
-| overlap_kernel.cuh:39-44 | **LOW** | `OverlapKernelLaunchConfig` hat keinen `cudaStream_t` Parameter — Multi-Stream unmoeglich. |
+1. **Per-call cudaMalloc** — `overlap_kernel.cu:24-34` allocates/frees `d_count` every call. For batch processing this kills perf. Use persistent memory pool or pre-allocated workspace.
+2. **No CUDA error checking** — Missing `cudaGetLastError()` after kernel launch. Silent failures will corrupt results.
+3. **No stream parameter** — Kernel launches on default stream (0). Blocks multi-GPU concurrency on Hummel-2 H100s.
+4. **Hardcoded grid/block** — `launch_overlap_kernel` ignores `config.threads_per_block`. Uses 256 unconditionally.
 
 ## Design Feedback
-
-**Positiv:**
-- VTable-Ansatz vermeidet virtual-dispatch auf Hot-Paths — korrekt
-- `OverlapPair` 24B SIMD-aligned, `MinimizerEntry` 16B Shared-Mem-freundlich
-- Stub-Fallback erlaubt CPU-only-Builds ohne Link-Fehler
-- Header CPU-kompilierbar (kein `__global__` im .cuh)
-
-**Fehlend fuer Hummel-2 Multi-GPU:**
-- Kein Device-Selection (`cudaSetDevice` fehlt trotz `device_id` in Config)
-- Kein Multi-Stream-Support fuer Overlap von Compute+Transfer
-- Fat-Binary sm_80+sm_90 nur in CMake definiert, nicht validiert
+- **VTable pattern: GOOD** — Type-erasure allows CPU↔GPU swap without recompile. Move-only semantics correct.
+- **Alignment: CORRECT** — `OverlapPair` 24B, `MinimizerEntry` 16B fit shared mem constraints (3072 entries/48KB).
+- **Header separation: CORRECT** — `.cuh` has no `__global__`, compiles with g++ for CPU builds.
+- **Stub fallback: FUNCTIONAL** — Returns 0, prevents link errors when `BRANCH_BUILD_CUDA=OFF`.
+- **Fat-binary ready: PARTIAL** — sm_80/sm_90 in CMake, but no runtime device selection in kernel.
 
 ## TODOs
-
-- [ ] **P0**: CUDA-Error-Macro `CUDA_CHECK(...)` mit `cudaGetLastError()` einfuehren
-- [ ] **P0**: Memory-Pool (`cudaMallocAsync`/`cudaFreeAsync` oder vorallokierter Pool)
-- [ ] **P1**: `cudaStream_t` in `OverlapKernelLaunchConfig` + async Memcpy
-- [ ] **P1**: `cudaSetDevice(cfg.device_id)` vor Launch
-- [ ] **P2**: CI-Test mit `nvcc -arch=sm_80,sm_90` auf Hummel-2 GPU-Node
+- [ ] Add `CUDA_CHECK()` macro wrapping all CUDA calls
+- [ ] Implement memory pool in `GpuBackend` class for `d_count` workspace
+- [ ] Add `cudaStream_t` parameter to `launch_overlap_kernel`
+- [ ] Use `config.threads_per_block` instead of hardcoded 256
+- [ ] Add `cudaGetDeviceCount`/`cudaSetDevice` for multi-GPU dispatch
+- [ ] Implement actual overlap logic in kernel (currently no-op)
 
 ---
-*Review abgeschlossen. 4 Files, 281 LOC total. 2 HIGH, 1 MEDIUM, 1 LOW.*
+*Review: 2025-01-XX | Scope: Backend abstraction, CUDA correctness, Fat-Binary, Stub*

@@ -13,6 +13,7 @@ std::size_t launch_overlap_kernel(
     DeviceOverlapPairPtr /*d_output_pairs*/,
     const OverlapKernelLaunchConfig& /*cfg*/) {
     // No-op on CPU-only builds: no GPU device, no overlap computation here.
+    // Note: cfg.stream is ignored in stub - signature matches header for ABI compatibility.
     return 0;
 }
 

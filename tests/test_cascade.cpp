@@ -9,8 +9,12 @@ using branch::classify::Feature;
 using branch::classify::FeatureVector;
 
 namespace {
+// Cascade has early guards: BubbleLengthBp >= 500 and DepthRatio >= 3.0
+// (= coverage proxy). All tests must satisfy these to reach the stages.
 FeatureVector make_features() {
     FeatureVector f{};
+    f[static_cast<std::size_t>(Feature::BubbleLengthBp)] = 1000.0f;
+    f[static_cast<std::size_t>(Feature::DepthRatioDiploid)] = 5.0f;
     return f;
 }
 }  // namespace
