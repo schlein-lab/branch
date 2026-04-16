@@ -23,8 +23,11 @@ bool write_gfa(const LosslessGraph& graph, std::ostream& out) {
             << "\tLN:i:" << node.length_bp
             << "\tRC:i:" << node.read_support
             << "\tCN:i:" << node.copy_count
-            << "\tCV:f:" << std::fixed << std::setprecision(3) << node.copy_count_confidence
-            << '\n';
+            << "\tCV:f:" << std::fixed << std::setprecision(3) << node.copy_count_confidence;
+        if (!node.consensus.empty()) {
+            out << "\tCS:Z:" << node.consensus;
+        }
+        out << '\n';
     }
 
     for (std::size_t i = 0; i < graph.edges().size(); ++i) {
@@ -90,6 +93,14 @@ bool parse_tag_float(std::string_view token, std::string_view tag, float& out) {
     return false;
 }
 
+bool parse_tag_string(std::string_view token, std::string_view tag, std::string& out) {
+    if (token.size() > tag.size() && token.substr(0, tag.size()) == tag) {
+        out = std::string(token.substr(tag.size()));
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 bool read_gfa(LosslessGraph& graph, std::istream& in) {
@@ -108,12 +119,14 @@ bool read_gfa(LosslessGraph& graph, std::istream& in) {
 
             std::uint32_t len = 0, rc = 0, cn = 1;
             float cv = 1.0f;
+            std::string cs;
             std::string token;
             while (iss >> token) {
                 parse_tag_int(token, "LN:i:", len);
                 parse_tag_int(token, "RC:i:", rc);
                 parse_tag_int(token, "CN:i:", cn);
                 parse_tag_float(token, "CV:f:", cv);
+                parse_tag_string(token, "CS:Z:", cs);
             }
 
             // Grow node vector to fit id (nodes must arrive in order or
@@ -126,6 +139,7 @@ bool read_gfa(LosslessGraph& graph, std::istream& in) {
             n.read_support = rc;
             n.copy_count = cn;
             n.copy_count_confidence = cv;
+            n.consensus = std::move(cs);
 
         } else if (record_type == 'L') {
             std::uint32_t from{}, to{};
