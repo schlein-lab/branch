@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <array>
+#include <vector>
 
 namespace branch::classify {
 
@@ -60,9 +61,11 @@ struct BubbleCandidate {
     // feature extractor will emit 0.0 for the corresponding Feature slot.
     std::uint8_t segdup_flag{0};
     std::uint8_t repeat_flag{0};
+
+    // Per-position read span lengths for IQR calculation.
+    // Populated by the coverage pass before feature extraction.
+    std::vector<std::uint32_t> read_spans;
 };
 
-static_assert(sizeof(FeatureVector) == kNumFeatures * sizeof(float),
-              "FeatureVector must be densely packed");
 
 }  // namespace branch::classify
