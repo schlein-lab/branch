@@ -69,7 +69,8 @@ for e in entries:
         continue
     if "/downsampled/" in key:
         continue
-    if key.endswith((".bam", ".bam.pbi", ".bam.bai")):
+    if key.endswith((".bam", ".bam.pbi", ".bam.bai",
+                     ".fastq", ".fastq.gz", ".fq", ".fq.gz")):
         print(f"{key}\t{size}")
 PYEOF
 
