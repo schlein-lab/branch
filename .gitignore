@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.dll
+compile_commands.json
+*.gcov
+*.gcda
+*.gcno
+*.profdata
+*.profraw
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Python (for future tooling)
+__pycache__/
+*.pyc
+*.egg-info/
+venv/
+.venv/
+
+# Claude workspace cache (session-local)
+.claude/
+
+# Phase 0 cached Hummel docs (shared reference, not BRANCH code)
+phase0/hummel_docs/
