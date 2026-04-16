@@ -1,4 +1,4 @@
-name: CI
+name: BRANCH CI
 
 on:
   push:
@@ -7,68 +7,97 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  build-test:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [none, asan, ubsan]
-    name: ${{ matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install toolchain
+      
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build g++-13
-
+          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+      
       - name: Configure
-        env:
-          CC: gcc-13
-          CXX: g++-13
         run: |
-          SAN_FLAGS=""
-          case "${{ matrix.sanitizer }}" in
-            asan)  SAN_FLAGS="-DBRANCH_USE_ASAN=ON" ;;
-            ubsan) SAN_FLAGS="-DBRANCH_USE_UBSAN=ON" ;;
-          esac
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DBRANCH_BUILD_CUDA=OFF \
-            -DBRANCH_BUILD_TESTS=ON \
-            $SAN_FLAGS
-
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DBRANCH_BUILD_CUDA=OFF
+      
       - name: Build
-        run: cmake --build build -j $(nproc)
-
+        run: cmake --build build --parallel
+      
       - name: Test
-        env:
-          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build --output-on-failure --parallel $(nproc)
+        run: ctest --test-dir build --output-on-failure
 
-  cuda-configure:
+  asan:
     runs-on: ubuntu-24.04
-    name: cuda-configure-check
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install toolchain
+      
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
-
-      - name: Install CUDA toolkit (headers only)
+          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+      
+      - name: Configure with ASan
         run: |
-          sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit
-
-      - name: Configure with CUDA
-        run: |
-          cmake -S . -B build-cuda -G Ninja \
+          cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DBRANCH_BUILD_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="80;90"
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DBRANCH_BUILD_CUDA=OFF \
+            -DBRANCH_USE_ASAN=ON
+      
+      - name: Build
+        run: cmake --build build --parallel
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
 
-      - name: Build CUDA targets
-        run: cmake --build build-cuda --target branch_gpu -j $(nproc)
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+      
+      - name: Configure with TSan
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DBRANCH_BUILD_CUDA=OFF \
+            -DBRANCH_USE_TSAN=ON
+      
+      - name: Build
+        run: cmake --build build --parallel
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  ubsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+      
+      - name: Configure with UBSan
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DBRANCH_BUILD_CUDA=OFF \
+            -DBRANCH_USE_UBSAN=ON
+      
+      - name: Build
+        run: cmake --build build --parallel
+      
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

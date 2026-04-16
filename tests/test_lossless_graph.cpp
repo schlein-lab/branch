@@ -56,3 +56,41 @@ TEST(LosslessGraphTest, set_copy_count_and_vaf_update_in_place) {
     EXPECT_FLOAT_EQ(g.edges()[0].vaf, 0.05f);
     EXPECT_FLOAT_EQ(g.edges()[0].vaf_confidence, 0.9f);
 }
+
+// ============ Death Tests (bounds checking) ============
+
+TEST(LosslessGraphDeathTest, node_throws_on_invalid_id) {
+    LosslessGraph g;
+    g.add_node(100);  // id 0 exists
+    // Discard [[nodiscard]] return via lambda — EXPECT_THROW doesn't look
+    // at the returned reference, only whether it throws first.
+    EXPECT_THROW({ [[maybe_unused]] const auto& n = g.node(999999); }, std::out_of_range);
+    EXPECT_THROW({ [[maybe_unused]] const auto& n = g.node(1); }, std::out_of_range);
+}
+
+TEST(LosslessGraphDeathTest, set_edge_vaf_throws_on_invalid_index) {
+    LosslessGraph g;
+    NodeId a = g.add_node(100);
+    NodeId b = g.add_node(100);
+    g.add_edge(a, b);  // edge index 0 exists
+    EXPECT_THROW(g.set_edge_vaf(1, 0.5f, 0.9f), std::out_of_range);
+    EXPECT_THROW(g.set_edge_vaf(999, 0.5f, 0.9f), std::out_of_range);
+}
+
+TEST(LosslessGraphDeathTest, set_copy_count_throws_on_invalid_node) {
+    LosslessGraph g;
+    g.add_node(100);  // id 0 exists
+    EXPECT_THROW(g.set_copy_count(1, 2, 0.9f), std::out_of_range);
+    EXPECT_THROW(g.set_copy_count(999999, 2, 0.9f), std::out_of_range);
+}
+
+// ============ Edge Cases ============
+
+TEST(LosslessGraphTest, Empty_graph_edge_cases) {
+    LosslessGraph g;
+    // Fresh graph must have zero counts
+    EXPECT_EQ(g.node_count(), 0u);
+    EXPECT_EQ(g.edge_count(), 0u);
+    // edges() returns empty span
+    EXPECT_TRUE(g.edges().empty());
+}

@@ -62,3 +62,31 @@ TEST(ReverseIndexTest, reads_for_returns_span_pointing_into_csr) {
     // Contiguous layout -> data pointers differ by sizeof(ReadId)
     EXPECT_EQ(&span0[1] - &span0[0], 1);
 }
+
+// ============ Death Tests ============
+
+TEST(ReverseIndexDeathTest, add_after_freeze_throws) {
+    ReverseIndex ri;
+    ri.add(0u, 1u);
+    ri.freeze();
+    EXPECT_TRUE(ri.is_frozen());
+    // Adding after freeze must throw
+    EXPECT_THROW(ri.add(0u, 2u), std::logic_error);
+    EXPECT_THROW(ri.add(5u, 99u), std::logic_error);
+}
+
+// ============ Edge Cases ============
+
+TEST(ReverseIndexTest, freeze_with_zero_entries) {
+    ReverseIndex ri;
+    // No entries added
+    EXPECT_EQ(ri.total_entries(), 0u);
+    EXPECT_FALSE(ri.is_frozen());
+    // Freeze empty index must succeed
+    ri.freeze();
+    EXPECT_TRUE(ri.is_frozen());
+    EXPECT_EQ(ri.total_entries(), 0u);
+    // reads_for on any node returns empty span
+    auto span = ri.reads_for(0u);
+    EXPECT_EQ(span.size(), 0u);
+}
