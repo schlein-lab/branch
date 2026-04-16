@@ -14,7 +14,14 @@
 #include <string_view>
 #include <vector>
 
+// Forward-declare the backend OverlapPair so this header does not
+// pull in the backend target (avoids a branch_graph <-> branch_backend
+// CMake cycle: branch_backend depends on branch_graph).
+namespace branch::backend { struct OverlapPair; }
+
 namespace branch::graph {
+
+class LosslessGraph;
 
 using NodeId = std::uint32_t;
 using ReadId = std::uint32_t;
@@ -52,5 +59,33 @@ struct ReadPathView {
     std::span<const NodeId> path;
     std::span<const PositionalDelta> deltas;
 };
+
+// Populate read paths from overlap-based graph construction.
+//
+// v0.2 best-effort mapping: for each read, emit a ReadPath containing
+// its own node and the nodes of all reads it overlaps with, ordered by
+// the overlap's offset along this read. `deltas` is left empty because
+// Node currently stores only `length_bp` (no consensus sequence). This
+// is sufficient for:
+//   - Debugging: which reads landed on which branch of a bubble.
+//   - Downstream VAF: count reads per bubble branch.
+//
+// TODO(v0.3): compute_delta(ref, read_sub) once Node has consensus.
+//
+// Parameters:
+//   n_reads      Number of input reads. Output vector has n_reads entries
+//                in read_id order; reads with no overlaps get a ReadPath
+//                containing only their own node (still useful downstream).
+//   read_to_node Mapping from read_id -> NodeId as produced by build_graph.
+//   read_lengths Read lengths in bp, indexed by read_id. May be empty; if
+//                empty the ReadPath.read_length is set to 0.
+//   overlaps     The same overlap pairs passed to build_graph.
+//   out          Output read paths, one per read_id in [0, n_reads).
+void populate_read_paths(
+    std::size_t n_reads,
+    std::span<const NodeId> read_to_node,
+    std::span<const std::uint32_t> read_lengths,
+    std::span<const branch::backend::OverlapPair> overlaps,
+    std::vector<ReadPath>& out);
 
 }  // namespace branch::graph

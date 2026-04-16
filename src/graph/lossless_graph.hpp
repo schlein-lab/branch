@@ -103,6 +103,13 @@ public:
         edges_[edge_index].vaf_confidence = confidence;
     }
 
+    // Bulk replacement of the edge vector. Used by passes that rewrite
+    // the edge set in place (e.g. graph_filter). Node identities are
+    // preserved; no validation of the new edges is performed here.
+    void replace_edges(std::vector<Edge> new_edges) {
+        edges_ = std::move(new_edges);
+    }
+
 private:
     std::vector<Node> nodes_;
     std::vector<Edge> edges_;

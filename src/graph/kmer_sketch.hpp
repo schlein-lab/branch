@@ -29,10 +29,20 @@ namespace branch::graph {
 inline constexpr std::size_t kMinimizerK = 21;
 inline constexpr std::size_t kMinimizerW = 19;
 
+// Minimizer hit — one minimizer from one read.
+//
+// v0.2 adds a strand bit so the overlap backend can tell same-strand
+// from opposite-strand matches. The struct is still 16 bytes: `pos`
+// shrinks from 32 to 24 bits (HiFi reads fit comfortably in 16 MB)
+// to reclaim one byte for the strand.
+//
+// Layout is kept identical to branch::gpu::MinimizerEntry on purpose,
+// so the sketch can be uploaded to a GPU without transformation.
 struct MinimizerHit {
     std::uint64_t hash;       // canonical 2-bit-packed k-mer hash
     std::uint32_t read_id;
-    std::uint32_t pos;        // 0-based position in the read
+    std::uint32_t pos : 24;   // 0-based position in the read (<= 16 MB)
+    std::uint32_t strand : 8; // 0 = forward canonical, 1 = reverse canonical
 };
 
 static_assert(sizeof(MinimizerHit) == 16,

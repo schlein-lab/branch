@@ -25,10 +25,11 @@ void sketch_read(std::string_view seq,
     std::uint64_t kmer = 0;
     const std::uint64_t mask = (k == 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
 
-    // Rolling window of (hash, position) for the last w k-mers.
+    // Rolling window of (hash, strand, position) for the last w k-mers.
     struct WinEntry {
         std::uint64_t hash;
         std::uint32_t pos;
+        std::uint8_t strand;
     };
     std::vector<WinEntry> window;
     window.reserve(w);
@@ -46,11 +47,15 @@ void sketch_read(std::string_view seq,
             if (e.hash < best.hash) best = e;
         }
         if (best.hash != last_emitted_hash || best.pos != last_emitted_pos) {
-            out.push_back(MinimizerHit{
-                .hash = best.hash,
-                .read_id = read_id,
-                .pos = best.pos,
-            });
+            MinimizerHit h{};
+            h.hash = best.hash;
+            h.read_id = read_id;
+            // pos is a 24-bit bitfield (reads bounded by 16 MB per the
+            // header contract); explicitly mask before narrowing to
+            // silence -Wconversion.
+            h.pos = (best.pos & 0x00FF'FFFFu);
+            h.strand = (best.strand & 0xFFu);
+            out.push_back(h);
             last_emitted_hash = best.hash;
             last_emitted_pos = best.pos;
         }
@@ -72,9 +77,9 @@ void sketch_read(std::string_view seq,
         if (filled < k) continue;
 
         std::uint32_t kmer_start = static_cast<std::uint32_t>(i + 1 - k);
-        std::uint64_t h = canonical_hash(kmer, k);
+        CanonicalHash ch = canonical_hash_with_strand(kmer, k);
 
-        window.push_back(WinEntry{.hash = h, .pos = kmer_start});
+        window.push_back(WinEntry{.hash = ch.hash, .pos = kmer_start, .strand = ch.strand});
         // Keep window at most w k-mers: drop the oldest.
         if (window.size() > w) {
             window.erase(window.begin());

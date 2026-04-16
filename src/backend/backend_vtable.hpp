@@ -39,7 +39,11 @@ enum class BubbleClass : std::uint8_t {
 
 struct ClassificationResult {
     BubbleClass label;
-    float confidence;  // [0.0, 1.0]
+    float confidence;   // [0.0, 1.0]
+    // Cascade stage index that produced the label (0..3), or 255 if
+    // not emitted by the cascade (e.g. legacy stub paths). Populated
+    // by CPU backend from classify::StageResult.stage_index.
+    std::uint8_t stage{255};
 };
 
 // VAF estimate with a simple confidence interval.
@@ -50,6 +54,12 @@ struct VAFEstimate {
 };
 
 // Overlap pair: two reads overlap starting at given offsets.
+//
+// v0.2: strand distinguishes same-strand from opposite-strand overlaps.
+// 0 = reads A and B overlap on the same strand (minimizer hits agreed
+//     on canonical orientation).
+// 1 = reads overlap on opposite strands (one side is reverse-complement
+//     relative to the other).
 struct OverlapPair {
     std::uint32_t read_a;
     std::uint32_t read_b;
@@ -57,7 +67,8 @@ struct OverlapPair {
     std::uint32_t offset_b;
     std::uint32_t overlap_len;
     std::int16_t diff_count;
-    std::uint16_t _pad;  // explicit padding for 24-byte alignment
+    std::uint8_t strand;  // 0 = same-strand, 1 = opposite-strand
+    std::uint8_t _pad;    // explicit padding for 24-byte alignment
 };
 
 static_assert(sizeof(OverlapPair) == 24,

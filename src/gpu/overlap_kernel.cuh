@@ -27,10 +27,18 @@ namespace branch::gpu {
 
 // Device-side minimizer sketch entry. 16 bytes, cache-line friendly
 // when used in shared memory (48 KB per SM = 3072 entries).
+//
+// v0.2: layout mirrors branch::graph::MinimizerHit (24-bit position +
+// 8-bit strand) so the host-side sketch can be uploaded to the device
+// without transformation. GPU code that only needs hash/read_id/pos
+// keeps working — the pos field is still the low 24 bits of the same
+// uint32 word, and the strand byte is now available for strand-aware
+// overlap kernels.
 struct MinimizerEntry {
     std::uint64_t hash;
     std::uint32_t read_id;
-    std::uint32_t pos;
+    std::uint32_t pos : 24;
+    std::uint32_t strand : 8;
 };
 
 static_assert(sizeof(MinimizerEntry) == 16,

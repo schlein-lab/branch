@@ -63,6 +63,28 @@ if(BRANCH_USE_UBSAN)
 endif()
 
 # ------------------------------------------------------------------------------
+# HTSlib (vendored under third_party/htslib — built by its own Makefile)
+# ------------------------------------------------------------------------------
+# BAM/CRAM/VCF I/O. We deliberately vendor rather than depend on a system
+# package because Ubuntu ships libhts3 without matching dev headers in some
+# configurations. `third_party/htslib/libhts.a` is the pre-built static
+# library (the bundled Makefile is invoked once at setup time); we only
+# consume its headers + .a here.
+set(BRANCH_HTSLIB_DIR "${CMAKE_SOURCE_DIR}/third_party/htslib")
+if(NOT EXISTS "${BRANCH_HTSLIB_DIR}/libhts.a")
+    message(FATAL_ERROR
+        "Vendored htslib not built. Run:\n"
+        "  make -C ${BRANCH_HTSLIB_DIR} -j4 libhts.a")
+endif()
+add_library(branch_htslib INTERFACE)
+target_include_directories(branch_htslib INTERFACE "${BRANCH_HTSLIB_DIR}")
+# htslib's own transitive deps (see `htslib_default_libs` in its Makefile):
+#   -lz -lm -lbz2 -llzma -lcurl ; plus -lpthread for thread_pool.
+target_link_libraries(branch_htslib INTERFACE
+    "${BRANCH_HTSLIB_DIR}/libhts.a"
+    z m bz2 lzma curl pthread)
+
+# ------------------------------------------------------------------------------
 # Subdirectories
 # ------------------------------------------------------------------------------
 add_subdirectory(src)

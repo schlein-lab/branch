@@ -12,7 +12,7 @@ FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
 add_executable(test_delta_read test_delta_read.cpp)
-target_link_libraries(test_delta_read PRIVATE branch_graph GTest::gtest_main)
+target_link_libraries(test_delta_read PRIVATE branch_graph branch_backend GTest::gtest_main)
 target_compile_features(test_delta_read PRIVATE cxx_std_20)
 gtest_discover_tests(test_delta_read)
 
@@ -80,3 +80,36 @@ add_executable(test_graph_compactor test_graph_compactor.cpp)
 target_link_libraries(test_graph_compactor PRIVATE branch_graph GTest::gtest_main)
 target_compile_features(test_graph_compactor PRIVATE cxx_std_20)
 gtest_discover_tests(test_graph_compactor)
+
+add_executable(test_majority_voter test_majority_voter.cpp)
+target_link_libraries(test_majority_voter PRIVATE branch_consensus GTest::gtest_main)
+target_compile_features(test_majority_voter PRIVATE cxx_std_20)
+gtest_discover_tests(test_majority_voter)
+
+add_executable(test_graph_filter test_graph_filter.cpp)
+target_link_libraries(test_graph_filter PRIVATE branch_graph GTest::gtest_main)
+target_compile_features(test_graph_filter PRIVATE cxx_std_20)
+gtest_discover_tests(test_graph_filter)
+
+add_executable(test_strand_handling test_strand_handling.cpp)
+target_link_libraries(test_strand_handling PRIVATE branch_backend branch_graph GTest::gtest_main)
+target_compile_features(test_strand_handling PRIVATE cxx_std_20)
+gtest_discover_tests(test_strand_handling)
+
+# --- E2E integration test -------------------------------------------------
+# Spawns the real `branch` binary on a synthetic FASTQ and validates the
+# emitted GFA. Gated on the `branch` target being defined so a standalone
+# tests build (unlikely, but possible) still configures.
+if(TARGET branch)
+    add_executable(generate_toy_fastq fixtures/generate_toy_fastq.cpp)
+    target_compile_features(generate_toy_fastq PRIVATE cxx_std_20)
+
+    add_executable(test_e2e_assemble test_e2e_assemble.cpp)
+    target_link_libraries(test_e2e_assemble PRIVATE GTest::gtest GTest::gtest_main)
+    target_compile_features(test_e2e_assemble PRIVATE cxx_std_20)
+    target_compile_definitions(test_e2e_assemble PRIVATE
+        BRANCH_BINARY="$<TARGET_FILE:branch>"
+        GEN_FASTQ_BINARY="$<TARGET_FILE:generate_toy_fastq>")
+    add_dependencies(test_e2e_assemble branch generate_toy_fastq)
+    add_test(NAME E2E_Assemble COMMAND test_e2e_assemble)
+endif()
