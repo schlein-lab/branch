@@ -3,3 +3,4 @@
 add_subdirectory(graph)
 add_subdirectory(backend)
 add_subdirectory(classify)
+add_subdirectory(gpu)

@@ -35,3 +35,13 @@ add_executable(test_reverse_index test_reverse_index.cpp)
 target_link_libraries(test_reverse_index PRIVATE branch_graph GTest::gtest_main)
 target_compile_features(test_reverse_index PRIVATE cxx_std_20)
 gtest_discover_tests(test_reverse_index)
+
+add_executable(test_cascade test_cascade.cpp)
+target_link_libraries(test_cascade PRIVATE branch_classify branch_backend GTest::gtest_main)
+target_compile_features(test_cascade PRIVATE cxx_std_20)
+gtest_discover_tests(test_cascade)
+
+add_executable(test_gpu_stub test_gpu_stub.cpp)
+target_link_libraries(test_gpu_stub PRIVATE branch_gpu GTest::gtest_main)
+target_compile_features(test_gpu_stub PRIVATE cxx_std_20)
+gtest_discover_tests(test_gpu_stub)
