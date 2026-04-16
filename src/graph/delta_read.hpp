@@ -88,4 +88,26 @@ void populate_read_paths(
     std::span<const branch::backend::OverlapPair> overlaps,
     std::vector<ReadPath>& out);
 
+
+// --- Delta encoding for read reconstruction (v0.3) ---
+
+// Simple delta operation for linear diff encoding
+struct DeltaOp {
+    std::uint32_t pos;   // position in path_seq
+    char op;             // 'S' = substitution, 'I' = insertion, 'D' = deletion
+    char base;           // the read base (for S/I) or deleted base (for D)
+};
+
+// Encode differences between read_seq and path_seq.
+// Returns vector of DeltaOp describing how read differs from path.
+// Limited to max 1000 ops to avoid pathological cases.
+std::vector<DeltaOp> encode_delta(
+    std::string_view read_seq,
+    std::string_view path_seq);
+
+// Reconstruct original read from path_seq + delta ops.
+std::string reconstruct_read(
+    std::string_view path_seq,
+    std::span<const DeltaOp> delta);
+
 }  // namespace branch::graph
