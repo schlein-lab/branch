@@ -75,3 +75,8 @@ add_executable(test_graph_io test_graph_io.cpp)
 target_link_libraries(test_graph_io PRIVATE branch_graph GTest::gtest_main)
 target_compile_features(test_graph_io PRIVATE cxx_std_20)
 gtest_discover_tests(test_graph_io)
+
+add_executable(test_graph_compactor test_graph_compactor.cpp)
+target_link_libraries(test_graph_compactor PRIVATE branch_graph GTest::gtest_main)
+target_compile_features(test_graph_compactor PRIVATE cxx_std_20)
+gtest_discover_tests(test_graph_compactor)
