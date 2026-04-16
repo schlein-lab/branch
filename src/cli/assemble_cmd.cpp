@@ -23,6 +23,7 @@
 #include "graph/graph_builder.hpp"
 #include "graph/graph_io.hpp"
 #include "graph/lossless_graph.hpp"
+#include "io/bam_reader.hpp"
 #include "io/fastq_reader.hpp"
 
 namespace branch::cli {
@@ -32,22 +33,27 @@ namespace {
 void print_assemble_usage(std::ostream& os) {
     os << "branch assemble — reads -> minimizer overlap -> lossless graph\n"
           "\nUsage:\n"
-          "  branch assemble --fastq <path.fastq> --out <path.gfa>\n"
+          "  branch assemble (--fastq <path.fastq> | --bam <path.bam>) --out <path.gfa>\n"
           "                  [--max-reads <N>] [--max-overlaps <N>]\n"
           "                  [--fasta <path>] [--bed <path>] [--paf <path>]\n"
           "                  [--paths <path>]\n"
+          "\nInput (exactly one of):\n"
+          "  --fastq <path>  Plain-text FASTQ. For .gz, pipe via `zcat | branch ... --fastq /dev/stdin`.\n"
+          "  --bam   <path>  BAM/CRAM/SAM via htslib. Secondary + supplementary alignments are\n"
+          "                  skipped; reverse-strand reads are reverse-complemented back to the\n"
+          "                  read's original sequencing orientation.\n"
           "\nOptional output sidecars:\n"
           "  --fasta <path>  Write input reads as FASTA (one record per read, 80-col wrap).\n"
           "  --bed   <path>  Write per-node BED (chrom=NA placeholder until v0.3).\n"
           "  --paf   <path>  Write backend overlap pairs as PAF-12 (pre-graph-build).\n"
           "  --paths <path>  Write per-read graph paths as TSV: read_name\\tnode_ids\\tn_deltas.\n"
           "\nv0.2 notes:\n"
-          "  - Accepts plain-text FASTQ only. Use `zcat x.fastq.gz | branch assemble --fastq /dev/stdin ...`\n"
           "  - No compaction, no repeat resolution. Raw read-level graph.\n";
 }
 
 struct Args {
     std::string fastq;
+    std::string bam;
     std::string out;
     std::size_t max_reads{0};       // 0 = no cap
     std::size_t max_overlaps{10'000'000};
@@ -68,6 +74,7 @@ Args parse(int argc, char** argv) {
             return argv[++i];
         };
         if (k == "--fastq")         { auto v = needs("--fastq");         if (!v) return a; a.fastq = v; }
+        else if (k == "--bam")      { auto v = needs("--bam");           if (!v) return a; a.bam = v; }
         else if (k == "--out")      { auto v = needs("--out");           if (!v) return a; a.out = v; }
         else if (k == "--max-reads"){ auto v = needs("--max-reads");     if (!v) return a; a.max_reads = std::strtoull(v, nullptr, 10); }
         else if (k == "--max-overlaps"){ auto v = needs("--max-overlaps"); if (!v) return a; a.max_overlaps = std::strtoull(v, nullptr, 10); }
@@ -78,8 +85,14 @@ Args parse(int argc, char** argv) {
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
-    if (a.fastq.empty() || a.out.empty()) {
-        a.err = "--fastq and --out are required";
+    const bool has_fastq = !a.fastq.empty();
+    const bool has_bam = !a.bam.empty();
+    if (has_fastq == has_bam) {
+        a.err = "exactly one of --fastq or --bam is required";
+        return a;
+    }
+    if (a.out.empty()) {
+        a.err = "--out is required";
         return a;
     }
     a.ok = true;
@@ -104,19 +117,35 @@ int run_assemble(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Read FASTQ into memory (string_views into this backing store
-    // are handed to the backend).
-    branch::io::FastqReader reader(a.fastq);
-    if (!reader.ok()) {
-        std::cerr << "branch assemble: cannot open " << a.fastq << "\n";
-        return 3;
-    }
+    // 1. Read input (FASTQ or BAM) into memory. string_views into this
+    // backing store are handed to the backend.
     ReadStore store;
-    branch::io::FastqRecord rec;
-    while (reader.next_record(rec)) {
-        store.names.push_back(std::move(rec.name));
-        store.sequences.push_back(std::move(rec.sequence));
-        if (a.max_reads > 0 && store.names.size() >= a.max_reads) break;
+    if (!a.fastq.empty()) {
+        branch::io::FastqReader reader(a.fastq);
+        if (!reader.ok()) {
+            std::cerr << "branch assemble: cannot open " << a.fastq << "\n";
+            return 3;
+        }
+        branch::io::FastqRecord rec;
+        while (reader.next_record(rec)) {
+            store.names.push_back(std::move(rec.name));
+            store.sequences.push_back(std::move(rec.sequence));
+            if (a.max_reads > 0 && store.names.size() >= a.max_reads) break;
+        }
+    } else {
+        branch::io::BamReader reader;
+        if (!reader.open(a.bam)) {
+            std::cerr << "branch assemble: cannot open " << a.bam << "\n";
+            return 3;
+        }
+        std::string name, seq;
+        while (reader.next(name, seq)) {
+            store.names.push_back(std::move(name));
+            store.sequences.push_back(std::move(seq));
+            name.clear();
+            seq.clear();
+            if (a.max_reads > 0 && store.names.size() >= a.max_reads) break;
+        }
     }
     std::cerr << "[branch assemble] reads=" << store.names.size() << "\n";
     if (store.names.empty()) {
