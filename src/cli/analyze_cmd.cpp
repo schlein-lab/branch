@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "analysis/coverage_cn.hpp"
+#include "analysis/repeat_cn.hpp"
 #include "io/mosdepth_reader.hpp"
 
 namespace branch::cli {
@@ -22,9 +23,13 @@ void print_analyze_usage(std::ostream& os) {
           "  branch analyze --regions <regions.bed>\n"
           "                 [--baseline-prefix <prefix>] [--baseline-cov <float>]\n"
           "                 [--cluster <name:prefix,prefix,...>]\n"
+          "                 [--repeat-bed <path>]\n"
           "\nOne of --baseline-cov (explicit haploid baseline) or\n"
           "--baseline-prefix (median of regions whose name begins with prefix)\n"
           "must be provided.\n"
+          "\nOptions:\n"
+          "  --repeat-bed <path>  Repeat annotation BED file for genome-wide\n"
+          "                       repeat family CN analysis. Output: <out>.repeat_cn.tsv\n"
           "\nExample:\n"
           "  branch analyze --regions mosdepth.regions.bed \\\n"
           "                 --baseline-prefix control_ \\\n"
@@ -37,6 +42,7 @@ struct Args {
     std::string baseline_prefix;
     float baseline_cov = 0.0f;
     std::vector<std::pair<std::string, std::vector<std::string>>> clusters;
+    std::string repeat_bed;
     bool ok = false;
     std::string err;
 };
@@ -89,6 +95,10 @@ Args parse_args(int argc, char** argv) {
                 return a;
             }
             a.clusters.emplace_back(s.substr(0, colon), split_csv(s.substr(colon + 1)));
+        } else if (k == "--repeat-bed") {
+            auto v = needs_val("--repeat-bed");
+            if (!v) return a;
+            a.repeat_bed = v;
         } else if (k == "--help" || k == "-h") {
             a.err = "HELP";
             return a;
@@ -164,6 +174,25 @@ int run_analyze(int argc, char** argv) {
                   << " members=" << s.member_count
                   << " total_rel_cn=" << s.total_relative_cn
                   << " mean_per_member=" << s.mean_per_member << "\n";
+    }
+
+    // Repeat family CN analysis
+    if (!a.repeat_bed.empty()) {
+        auto repeats = branch::analysis::parse_repeat_bed(a.repeat_bed);
+        // Build per-base coverage from regions (simplified: use region mean as proxy)
+        std::map<std::string, std::vector<uint32_t>> per_base_cov;
+        for (const auto& r : regions) {
+            auto& vec = per_base_cov[r.chrom];
+            if (vec.size() < r.end) vec.resize(r.end, 0);
+            uint32_t cov_val = static_cast<uint32_t>(r.mean_coverage + 0.5);
+            for (size_t i = r.start; i < r.end && i < vec.size(); ++i) {
+                vec[i] = cov_val;
+            }
+        }
+        auto cn_stats = branch::analysis::compute_family_cn(repeats, per_base_cov, baseline);
+        std::string out_path = a.regions + ".repeat_cn.tsv";
+        branch::analysis::write_cn_tsv(cn_stats, out_path);
+        std::cerr << "# repeat_cn written to " << out_path << "\n";
     }
     return 0;
 }
