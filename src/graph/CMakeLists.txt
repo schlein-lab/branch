@@ -1,6 +1,7 @@
-# branch_graph: header-only types + GFA I/O implementation.
+# branch_graph: data types + GFA I/O + minimizer sketcher.
 add_library(branch_graph STATIC
     graph_io.cpp
+    minimizer_sketcher.cpp
 )
 target_include_directories(branch_graph PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
