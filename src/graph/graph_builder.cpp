@@ -1,0 +1,51 @@
+// BRANCH v0.1 — Graph builder implementation.
+
+#include "graph/graph_builder.hpp"
+
+#include <algorithm>
+#include <limits>
+
+namespace branch::graph {
+
+BuildResult build_graph(std::span<const ReadMeta> reads,
+                        std::span<const branch::backend::OverlapPair> overlaps) {
+    BuildResult r{};
+
+    // Determine mapping capacity: the largest read_id we'll see.
+    ReadId max_id = 0;
+    for (const auto& rm : reads) {
+        if (rm.read_id > max_id) max_id = rm.read_id;
+    }
+    r.read_to_node.assign(static_cast<std::size_t>(max_id) + 1,
+                          std::numeric_limits<NodeId>::max());
+
+    // Allocate one node per read. Overlap-derived node attributes are
+    // filled in later passes (unitig compaction, CN inference).
+    for (const auto& rm : reads) {
+        NodeId nid = r.graph.add_node(rm.length_bp);
+        r.read_to_node[rm.read_id] = nid;
+    }
+
+    // Translate overlap pairs to edges. Count a per-edge read_support
+    // of 1 for each pair; later passes aggregate. Overlap direction
+    // is implicit in the pair's offset_a/offset_b semantics — v0.1
+    // treats every pair as a single undirected edge emitted as an
+    // a→b directed edge, matching the LosslessGraph model.
+    for (const auto& op : overlaps) {
+        if (op.read_a >= r.read_to_node.size() ||
+            op.read_b >= r.read_to_node.size()) {
+            continue;
+        }
+        NodeId na = r.read_to_node[op.read_a];
+        NodeId nb = r.read_to_node[op.read_b];
+        if (na == std::numeric_limits<NodeId>::max() ||
+            nb == std::numeric_limits<NodeId>::max()) {
+            continue;
+        }
+        r.graph.add_edge(na, nb, 1u);
+    }
+
+    return r;
+}
+
+}  // namespace branch::graph
