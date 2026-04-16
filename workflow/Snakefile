@@ -1,14 +1,14 @@
-# BRANCH Snakemake Workflow v0.1
+# BRANCH Snakemake Workflow v0.2
 #
 # Runs on Hummel-2 via the SLURM executor plugin. All paths are BeeGFS
 # because /home is readonly inside batch jobs. Containers are Apptainer
 # SIF files pulled in Phase-0 T1, located under CONTAINER_DIR.
 #
-# This v0.1 stub covers the alignment + ROI-annotation stages that
-# Phase 0 T5/T6/T7 already produced. Later phases (v0.2+) extend it
-# with the BRANCH tool itself once the C++ binary is in place.
+# v0.2 wires in the real BRANCH binary (subcommands: analyze, assemble)
+# built from the C++ core. See BRANCH_BIN below.
 
 import os
+from pathlib import Path
 
 configfile: "config/config.yaml"
 
@@ -28,10 +28,31 @@ SAMPLE = config.get("sample", "HG002")
 HIFI_DIR = config.get("hifi_dir",
                        f"{SHARED}/references/human_pangenome/hifi_reads/{SAMPLE}/15kb")
 
+# --- BRANCH binary ---------------------------------------------------------
+# Resolved from config; on the cluster this lives on BeeGFS, locally it points
+# to the in-tree build/ directory. Set `skip_check: true` in the configfile to
+# bypass the existence check (useful for --dry-run on a machine where the
+# binary hasn't been deployed yet).
+BRANCH_BIN = config.get(
+    "branch_bin",
+    f"{PROJECT_DIR}/build/src/cli/branch",
+)
+assert Path(BRANCH_BIN).exists() or config.get("skip_check"), \
+    f"branch binary missing: {BRANCH_BIN} (set skip_check: true in config to bypass)"
+
+# Baseline prefix for `branch analyze` CN normalization — regions whose name
+# starts with this prefix are used as single-copy reference amplicons.
+ANALYZE_BASELINE_PREFIX = config.get("analyze_baseline_prefix", "control_")
+
+
 rule all:
     input:
         f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam.bai",
         f"{PROJECT_DIR}/phase0/rois/roi_stats.json",
+        f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.gfa",
+        f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.analyze.tsv",
+        f"{PROJECT_DIR}/phase0/branch/summary.tsv",
+
 
 rule align_hifi:
     input:
@@ -61,6 +82,7 @@ rule align_hifi:
         apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.samtools_sif} \
             samtools index -@ 4 {output.bam}
         """
+
 
 rule roi_catalog:
     input:
@@ -92,6 +114,7 @@ rule roi_catalog:
         cat {TMP_DIR}/segdup_merged.bed {TMP_DIR}/str_merged.bed | sort -k1,1 -k2,2n > {output.catalog}
         """
 
+
 rule coverage_profile:
     input:
         bam = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam",
@@ -99,6 +122,7 @@ rule coverage_profile:
         catalog = f"{PROJECT_DIR}/phase0/rois/roi_catalog.bed",
         mosdepth_sif = f"{CONTAINER_DIR}/mosdepth_0.3.13.sif",
     output:
+        regions = f"{PROJECT_DIR}/phase0/rois/{SAMPLE}_coverage.regions.bed.gz",
         stats = f"{PROJECT_DIR}/phase0/rois/roi_stats.json",
     threads: 4
     resources:
@@ -114,5 +138,158 @@ rule coverage_profile:
         apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.mosdepth_sif} \
             mosdepth --by {input.catalog} --no-per-base --threads {threads} \
             {SAMPLE}_coverage {input.bam}
-        echo aggregation_placeholder > {output.stats}
+        python3 -c "import json, gzip, sys; \
+f='{output.regions}'; \
+n=sum(1 for _ in gzip.open(f,'rt')); \
+json.dump({{'regions_file': f, 'n_regions': n, 'sample': '{SAMPLE}'}}, open('{output.stats}','w'))"
         """
+
+
+# --- BRANCH binary rules ---------------------------------------------------
+
+# Per-sample assembly: BAM -> FASTQ -> lossless overlap graph (GFA-1.2).
+# BRANCH v0.2 `assemble` accepts only plain-text FASTQ via --fastq/--out and
+# has no --threads / --bam flags yet; we stream via samtools fastq.
+# TODO(v0.3): replace with direct --bam input once BRANCH supports it.
+rule branch_assemble:
+    input:
+        bam = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam",
+        bai = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam.bai",
+        samtools_sif = f"{CONTAINER_DIR}/samtools_1.21.sif",
+    output:
+        gfa = f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.gfa",
+    log:
+        f"{LOG_DIR}/branch_assemble_{SAMPLE}.log",
+    params:
+        branch_bin = BRANCH_BIN,
+        tmp_fastq = f"{TMP_DIR}/{SAMPLE}.assemble.fastq",
+    threads: 16
+    resources:
+        slurm_account = "kubisch_std",
+        slurm_partition = "std",
+        runtime = 240,  # 4h
+        cpus_per_task = 16,
+        mem_mb = 0,
+        disk_mb = 0,
+    shell:
+        r"""
+        set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
+        mkdir -p $(dirname {output.gfa}) {TMP_DIR} $(dirname {log})
+        # BAM -> FASTQ (primary reads only)
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR={TMP_DIR} {input.samtools_sif} \
+            samtools fastq -@ {threads} -F 0x900 {input.bam} > {params.tmp_fastq}
+        # BRANCH v0.2 assemble: single-threaded lossless graph build
+        # requires v0.2+; flags: --fastq <path>  --out <gfa>  [--max-reads N]  [--max-overlaps N]
+        {params.branch_bin} assemble \
+            --fastq {params.tmp_fastq} \
+            --out {output.gfa} 2> {log}
+        rm -f {params.tmp_fastq}
+        """
+
+
+# Paralog-aware CN inference on the mosdepth regions bed.gz.
+# BRANCH v0.2 `analyze` CLI:
+#   branch analyze --regions <regions.bed>
+#                  [--baseline-prefix <prefix>] [--baseline-cov <float>]
+#                  [--cluster <name:prefix,prefix,...>]
+# It prints the CN table to stdout; we redirect to the TSV output.
+rule branch_analyze:
+    input:
+        regions = f"{PROJECT_DIR}/phase0/rois/{SAMPLE}_coverage.regions.bed.gz",
+        roi = f"{PROJECT_DIR}/phase0/rois/roi_catalog.bed",
+        gfa = f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.gfa",
+    output:
+        tsv = f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.analyze.tsv",
+    log:
+        f"{LOG_DIR}/branch_analyze_{SAMPLE}.log",
+    params:
+        branch_bin = BRANCH_BIN,
+        baseline_prefix = ANALYZE_BASELINE_PREFIX,
+        regions_decompressed = f"{TMP_DIR}/{SAMPLE}_coverage.regions.bed",
+    threads: 4
+    resources:
+        slurm_account = "kubisch_std",
+        slurm_partition = "std",
+        runtime = 60,
+        cpus_per_task = 4,
+        mem_mb = 0,
+        disk_mb = 0,
+    shell:
+        r"""
+        set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
+        mkdir -p $(dirname {output.tsv}) {TMP_DIR} $(dirname {log})
+        # GFA is declared as input so snakemake orders branch_assemble before
+        # branch_analyze (even though analyze doesn't consume it yet in v0.2).
+        test -s {input.gfa} || (echo "GFA missing or empty: {input.gfa}" >&2; exit 1)
+        # BRANCH analyze reads plain-text BED; mosdepth emits .bed.gz.
+        zcat {input.regions} > {params.regions_decompressed}
+        {params.branch_bin} analyze \
+            --regions {params.regions_decompressed} \
+            --baseline-prefix {params.baseline_prefix} \
+            > {output.tsv} 2> {log}
+        rm -f {params.regions_decompressed}
+        """
+
+
+# Aggregate: small summary TSV over node/edge counts and per-sample CN profile.
+# Replaces the v0.1 placeholder rule.
+rule aggregate:
+    input:
+        gfa = f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.gfa",
+        analyze_tsv = f"{PROJECT_DIR}/phase0/branch/{SAMPLE}.analyze.tsv",
+    output:
+        summary = f"{PROJECT_DIR}/phase0/branch/summary.tsv",
+    threads: 1
+    resources:
+        slurm_account = "kubisch_std",
+        slurm_partition = "std",
+        runtime = 10,
+        mem_mb = 0,
+        disk_mb = 0,
+    run:
+        # Snakemake 9.x run-block: pure Python, no shell wrapper.
+        try:
+            n_segments = 0
+            n_links = 0
+            with open(input.gfa) as fh:
+                for line in fh:
+                    if line.startswith("S\t"):
+                        n_segments += 1
+                    elif line.startswith("L\t"):
+                        n_links += 1
+
+            analyze_rows = 0
+            cn_sum = 0.0
+            cn_seen = 0
+            with open(input.analyze_tsv) as fh:
+                header = None
+                for line in fh:
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    fields = line.rstrip("\n").split("\t")
+                    if header is None:
+                        header = fields
+                        continue
+                    analyze_rows += 1
+                    # Best-effort CN column: pick any field whose header
+                    # contains "cn" (case-insensitive). Non-numeric -> skip.
+                    for h, v in zip(header, fields):
+                        if "cn" in h.lower():
+                            try:
+                                cn_sum += float(v)
+                                cn_seen += 1
+                                break
+                            except ValueError:
+                                pass
+
+            mean_cn = (cn_sum / cn_seen) if cn_seen else float("nan")
+            with open(output.summary, "w") as out:
+                out.write("sample\tn_segments\tn_links\tn_analyze_rows\tmean_cn\n")
+                out.write(f"{SAMPLE}\t{n_segments}\t{n_links}\t{analyze_rows}\t{mean_cn:.4f}\n")
+        except Exception as exc:
+            # Snakemake 9.x-friendly: surface the error but still write a
+            # diagnostic summary so downstream runs can see what broke.
+            with open(output.summary, "w") as out:
+                out.write("sample\terror\n")
+                out.write(f"{SAMPLE}\t{type(exc).__name__}: {exc}\n")
+            raise

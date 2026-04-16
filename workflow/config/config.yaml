@@ -1,5 +1,5 @@
 # BRANCH workflow configuration.
-# Default values for v0.1 Phase-0-equivalent pipeline run on Hummel-2.
+# Default values for v0.2 pipeline run on Hummel-2.
 
 sample: HG002
 
@@ -19,3 +19,27 @@ sample: HG002
 # Runtime knobs that may change per workload size.
 threads_align: 16
 threads_mosdepth: 4
+
+# --- BRANCH v0.2 binary ---------------------------------------------------
+# Absolute path to the `branch` CLI on the cluster. Locally (e.g. for a
+# --dry-run on a dev machine), override via --config branch_bin=... and/or
+# set skip_check: true below.
+branch_bin: /beegfs/u/bbg6775/humangenetik/ag/schlein/bbg6775/projects/branch/build/src/cli/branch
+
+# Baseline prefix for `branch analyze` CN normalization. Regions in the
+# mosdepth regions.bed whose `name` column starts with this prefix are used
+# as single-copy reference amplicons (see BRANCH Output Contract).
+analyze_baseline_prefix: control_
+
+# Apptainer container for BRANCH itself. Referenced by the submit wrapper; the
+# Snakefile does not yet mount it because v0.2 rules run the binary directly.
+# TODO(phase0): build BRANCH apptainer SIF and place at this path. Until the
+# SIF exists, `branch_bin` is executed directly on the compute node (requires
+# the build/ tree to be present on BeeGFS, which submit_hummel.sh verifies).
+container:
+  sif: /beegfs/u/bbg6775/humangenetik/ag/schlein/bbg6775/containers/branch-v0.2.sif
+
+# Set to true to skip the BRANCH_BIN existence assert at parse time.
+# Useful for running `snakemake --dry-run` on a machine where the binary
+# hasn't been deployed yet.
+# skip_check: true
