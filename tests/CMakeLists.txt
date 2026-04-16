@@ -51,6 +51,11 @@ target_link_libraries(test_kmer_sketch PRIVATE branch_graph GTest::gtest_main)
 target_compile_features(test_kmer_sketch PRIVATE cxx_std_20)
 gtest_discover_tests(test_kmer_sketch)
 
+add_executable(test_minimizer_sketcher test_minimizer_sketcher.cpp)
+target_link_libraries(test_minimizer_sketcher PRIVATE branch_graph GTest::gtest_main)
+target_compile_features(test_minimizer_sketcher PRIVATE cxx_std_20)
+gtest_discover_tests(test_minimizer_sketcher)
+
 add_executable(test_cpu_backend test_cpu_backend.cpp)
 target_link_libraries(test_cpu_backend PRIVATE branch_backend GTest::gtest_main)
 target_compile_features(test_cpu_backend PRIVATE cxx_std_20)
