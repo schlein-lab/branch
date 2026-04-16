@@ -133,3 +133,7 @@ target_link_libraries(test_vpcr PRIVATE branch_vpcr GTest::gtest_main)
 target_compile_features(test_vpcr PRIVATE cxx_std_20)
 target_include_directories(test_vpcr PRIVATE ${CMAKE_SOURCE_DIR}/src)
 gtest_discover_tests(test_vpcr)
+
+add_executable(test_repeat_cn test_repeat_cn.cpp)
+target_link_libraries(test_repeat_cn PRIVATE branch_analysis)
+add_test(NAME test_repeat_cn COMMAND test_repeat_cn)
