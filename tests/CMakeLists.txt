@@ -45,3 +45,8 @@ add_executable(test_gpu_stub test_gpu_stub.cpp)
 target_link_libraries(test_gpu_stub PRIVATE branch_gpu GTest::gtest_main)
 target_compile_features(test_gpu_stub PRIVATE cxx_std_20)
 gtest_discover_tests(test_gpu_stub)
+
+add_executable(test_kmer_sketch test_kmer_sketch.cpp)
+target_link_libraries(test_kmer_sketch PRIVATE branch_graph GTest::gtest_main)
+target_compile_features(test_kmer_sketch PRIVATE cxx_std_20)
+gtest_discover_tests(test_kmer_sketch)
