@@ -15,13 +15,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
-      
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
+
       - name: Configure
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-13 \
             -DBRANCH_BUILD_CUDA=OFF
       
       - name: Build
@@ -38,13 +37,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
       
       - name: Configure with ASan
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=g++-13 \
             -DBRANCH_BUILD_CUDA=OFF \
             -DBRANCH_USE_ASAN=ON
       
@@ -62,13 +60,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
       
       - name: Configure with TSan
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=g++-13 \
             -DBRANCH_BUILD_CUDA=OFF \
             -DBRANCH_USE_TSAN=ON
       
@@ -86,13 +83,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 cmake ninja-build libhts-dev zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
       
       - name: Configure with UBSan
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=g++-13 \
             -DBRANCH_BUILD_CUDA=OFF \
             -DBRANCH_USE_UBSAN=ON
       
