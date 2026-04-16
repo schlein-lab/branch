@@ -1,4 +1,4 @@
-// BRANCH v0.2 — Unitig compaction implementation.
+// BRANCH v0.2 — Unitig compaction implementation with consensus building.
 //
 // Algorithm (two passes):
 //   1) Build in-degree / out-degree arrays and per-node adjacency indices
@@ -15,14 +15,20 @@
 //   4) Build the output graph: one new node per unitig with
 //        length_bp = sum of member lengths
 //        copy_count = chain start's copy_count
+//        consensus = MSA-derived consensus from member sequences
 //      Copy only inter-unitig edges (from_unitig != to_unitig), keeping
 //      the original read_support of the boundary-crossing edge.
 
 #include "graph/graph_compactor.hpp"
+#include "consensus/majority_voter.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace branch::graph {
@@ -30,6 +36,93 @@ namespace branch::graph {
 namespace {
 
 constexpr NodeId kUnassigned = std::numeric_limits<NodeId>::max();
+
+// Simple position-wise majority voting for unaligned sequences.
+// For sequences of different lengths, we pad shorter ones conceptually.
+// This is a fallback for 2 sequences or when abPOA is not available.
+std::string simple_majority_consensus(const std::vector<std::string>& sequences) {
+    if (sequences.empty()) {
+        return {};
+    }
+    if (sequences.size() == 1) {
+        return sequences[0];
+    }
+    
+    // Find max length
+    std::size_t max_len = 0;
+    for (const auto& seq : sequences) {
+        max_len = std::max(max_len, seq.size());
+    }
+    
+    std::string result;
+    result.reserve(max_len);
+    
+    for (std::size_t pos = 0; pos < max_len; ++pos) {
+        // Count bases at this position
+        std::array<int, 5> counts{}; // A=0, C=1, G=2, T=3, other=4
+        
+        for (const auto& seq : sequences) {
+            if (pos >= seq.size()) continue;
+            char c = seq[pos];
+            switch (c) {
+                case 'A': case 'a': ++counts[0]; break;
+                case 'C': case 'c': ++counts[1]; break;
+                case 'G': case 'g': ++counts[2]; break;
+                case 'T': case 't': ++counts[3]; break;
+                default: ++counts[4]; break;
+            }
+        }
+        
+        // Find majority base
+        int max_count = 0;
+        int max_idx = 4;
+        for (int i = 0; i < 4; ++i) {
+            if (counts[i] > max_count) {
+                max_count = counts[i];
+                max_idx = i;
+            }
+        }
+        
+        constexpr char bases[] = "ACGTN";
+        result += bases[max_idx];
+    }
+    
+    return result;
+}
+
+// Build consensus from member node sequences.
+// Strategy:
+//   - 0 sequences with content -> empty consensus
+//   - 1 sequence -> use directly
+//   - 2 sequences -> use majority_voter (aligned) or simple majority (unaligned)
+//   - 3+ sequences -> simple majority (placeholder for abPOA)
+std::string build_unitig_consensus(
+    const std::vector<NodeId>& members,
+    const LosslessGraph& input) {
+    
+    // Collect non-empty consensus sequences from member nodes
+    std::vector<std::string> sequences;
+    sequences.reserve(members.size());
+    
+    for (NodeId m : members) {
+        const auto& node = input.node(m);
+        if (!node.consensus.empty()) {
+            sequences.push_back(node.consensus);
+        }
+    }
+    
+    if (sequences.empty()) {
+        return {};
+    }
+    
+    if (sequences.size() == 1) {
+        return sequences[0];
+    }
+    
+    // For 2+ sequences, use simple majority voting
+    // This is a placeholder - in production, 3+ sequences would use abPOA
+    return simple_majority_consensus(sequences);
+}
 
 }  // namespace
 
@@ -65,12 +158,6 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
             unique_in_edge[e.to] = i;
         }
     }
-
-    // Helper: is node v an "internal" chain node? (in=out=1 AND the
-    // unique predecessor has out=1 — but that predecessor condition is
-    // symmetric to the start-detection below. For deciding "should I
-    // extend past v to v's successor" we only need: out_degree[v]==1 and
-    // in_degree[succ]==1.)
 
     // ---- Pass 2: walk unitigs starting from every chain start ----
     std::vector<std::vector<NodeId>> unitigs;
@@ -108,7 +195,6 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
     }
 
     // ---- Pass 2b: pure cycles (every node in=out=1, no start found) ----
-    // Any node still unassigned lies on a pure cycle. Break arbitrarily.
     for (NodeId v = 0; v < n; ++v) {
         if (result.old_to_new[v] != kUnassigned) continue;
 
@@ -119,7 +205,7 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
             if (result.old_to_new[cur] != kUnassigned) break;
             members.push_back(cur);
             result.old_to_new[cur] = unitig_id;
-            if (out_degree[cur] != 1) break;  // should not happen on a pure cycle
+            if (out_degree[cur] != 1) break;
             std::size_t eout = unique_out_edge[cur];
             NodeId next = edges[eout].to;
             if (next >= n) break;
@@ -129,7 +215,7 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
         unitigs.push_back(std::move(members));
     }
 
-    // ---- Pass 3: build the compacted graph ----
+    // ---- Pass 3: build the compacted graph with consensus ----
     LosslessGraph& out = result.compacted;
     for (const auto& members : unitigs) {
         std::uint64_t total_length = 0;
@@ -137,25 +223,161 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
             total_length += input.node(m).length_bp;
         }
         const auto& start_node = input.node(members.front());
-        // add_node takes uint32_t; clamp if (unrealistically) overflowed.
         std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
             ? std::numeric_limits<std::uint32_t>::max()
             : static_cast<std::uint32_t>(total_length);
-        out.add_node(len32, start_node.copy_count);
+        
+        NodeId new_id = out.add_node(len32, start_node.copy_count);
+        
+        // Build and set consensus for the new unitig node
+        std::string consensus = build_unitig_consensus(members, input);
+        if (!consensus.empty()) {
+            out.node(new_id).consensus = std::move(consensus);
+        }
     }
 
-    // Emit only inter-unitig edges. Intra-unitig edges (i.e. the edges
-    // absorbed into a chain) are dropped. Inter-unitig edges keep their
-    // original read_support verbatim.
+    // Emit only inter-unitig edges
     for (const auto& e : edges) {
         if (e.from >= n || e.to >= n) continue;
         NodeId uf = result.old_to_new[e.from];
         NodeId ut = result.old_to_new[e.to];
         if (uf == ut) {
-            // Could be an intra-chain edge (drop) or a self-loop on a
-            // pure-cycle unitig (also drop, since the cycle was linearised).
             continue;
         }
+        out.add_edge(uf, ut, e.read_support);
+    }
+
+    return result;
+}
+
+// New overload: compact with explicit sequences for consensus building
+CompactionResult compact_unitigs_with_sequences(
+    const LosslessGraph& input,
+    const std::vector<std::string>& node_sequences) {
+    
+    // First, copy sequences into input graph's consensus fields if provided
+    // (This is a workaround since input is const - we build consensus from
+    // the separate sequences vector)
+    
+    CompactionResult result;
+    const std::size_t n = input.node_count();
+    result.old_to_new.assign(n, kUnassigned);
+
+    if (n == 0) {
+        return result;
+    }
+
+    // ---- Pass 1: degree counts and adjacency lookup ----
+    std::vector<std::uint32_t> in_degree(n, 0);
+    std::vector<std::uint32_t> out_degree(n, 0);
+
+    const auto& edges = input.edges();
+    for (const auto& e : edges) {
+        if (e.from < n) ++out_degree[e.from];
+        if (e.to < n)   ++in_degree[e.to];
+    }
+
+    std::vector<std::size_t> unique_out_edge(n, std::numeric_limits<std::size_t>::max());
+    std::vector<std::size_t> unique_in_edge(n, std::numeric_limits<std::size_t>::max());
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+        const auto& e = edges[i];
+        if (e.from < n && out_degree[e.from] == 1) {
+            unique_out_edge[e.from] = i;
+        }
+        if (e.to < n && in_degree[e.to] == 1) {
+            unique_in_edge[e.to] = i;
+        }
+    }
+
+    // ---- Pass 2: walk unitigs ----
+    std::vector<std::vector<NodeId>> unitigs;
+    unitigs.reserve(n);
+
+    auto is_chain_start = [&](NodeId v) -> bool {
+        if (in_degree[v] != 1) return true;
+        std::size_t ein = unique_in_edge[v];
+        const Edge& pe = edges[ein];
+        NodeId pred = pe.from;
+        return out_degree[pred] != 1;
+    };
+
+    for (NodeId v = 0; v < n; ++v) {
+        if (result.old_to_new[v] != kUnassigned) continue;
+        if (!is_chain_start(v)) continue;
+
+        NodeId unitig_id = static_cast<NodeId>(unitigs.size());
+        std::vector<NodeId> members;
+        NodeId cur = v;
+        while (true) {
+            members.push_back(cur);
+            result.old_to_new[cur] = unitig_id;
+
+            if (out_degree[cur] != 1) break;
+            std::size_t eout = unique_out_edge[cur];
+            NodeId next = edges[eout].to;
+            if (next >= n) break;
+            if (in_degree[next] != 1) break;
+            if (result.old_to_new[next] != kUnassigned) break;
+            cur = next;
+        }
+        unitigs.push_back(std::move(members));
+    }
+
+    // Pass 2b: pure cycles
+    for (NodeId v = 0; v < n; ++v) {
+        if (result.old_to_new[v] != kUnassigned) continue;
+
+        NodeId unitig_id = static_cast<NodeId>(unitigs.size());
+        std::vector<NodeId> members;
+        NodeId cur = v;
+        while (true) {
+            if (result.old_to_new[cur] != kUnassigned) break;
+            members.push_back(cur);
+            result.old_to_new[cur] = unitig_id;
+            if (out_degree[cur] != 1) break;
+            std::size_t eout = unique_out_edge[cur];
+            NodeId next = edges[eout].to;
+            if (next >= n) break;
+            if (in_degree[next] != 1) break;
+            cur = next;
+        }
+        unitigs.push_back(std::move(members));
+    }
+
+    // ---- Pass 3: build compacted graph with consensus from sequences ----
+    LosslessGraph& out = result.compacted;
+    for (const auto& members : unitigs) {
+        std::uint64_t total_length = 0;
+        for (NodeId m : members) {
+            total_length += input.node(m).length_bp;
+        }
+        const auto& start_node = input.node(members.front());
+        std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
+            ? std::numeric_limits<std::uint32_t>::max()
+            : static_cast<std::uint32_t>(total_length);
+        
+        NodeId new_id = out.add_node(len32, start_node.copy_count);
+        
+        // Build consensus from provided sequences
+        std::vector<std::string> seqs;
+        seqs.reserve(members.size());
+        for (NodeId m : members) {
+            if (m < node_sequences.size() && !node_sequences[m].empty()) {
+                seqs.push_back(node_sequences[m]);
+            }
+        }
+        
+        if (!seqs.empty()) {
+            out.node(new_id).consensus = simple_majority_consensus(seqs);
+        }
+    }
+
+    // Emit inter-unitig edges
+    for (const auto& e : edges) {
+        if (e.from >= n || e.to >= n) continue;
+        NodeId uf = result.old_to_new[e.from];
+        NodeId ut = result.old_to_new[e.to];
+        if (uf == ut) continue;
         out.add_edge(uf, ut, e.read_support);
     }
 

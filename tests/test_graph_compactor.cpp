@@ -1,12 +1,15 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "graph/graph_compactor.hpp"
 #include "graph/lossless_graph.hpp"
 
 using branch::graph::compact_unitigs;
+using branch::graph::compact_unitigs_with_sequences;
 using branch::graph::CompactionResult;
 using branch::graph::LosslessGraph;
 using branch::graph::NodeId;
@@ -50,11 +53,6 @@ TEST(GraphCompactorTest, Linear_chain_collapses_to_single_unitig) {
 
 TEST(GraphCompactorTest, Chain_then_branch_yields_two_unitigs) {
     // A(10) -> B(20) -> C(30) -> { D1(40), D2(50) }
-    // Expected: unitig U0 = {A, B, C} with length 60,
-    //           unitig U1 = {D1} with length 40,
-    //           unitig U2 = {D2} with length 50,
-    //           two inter-unitig edges from U0 to U1 and U0 to U2,
-    //           preserving read_support 7 and 9 respectively.
     LosslessGraph g;
     NodeId a  = g.add_node(10, 3);
     NodeId b  = g.add_node(20, 1);
@@ -90,8 +88,7 @@ TEST(GraphCompactorTest, Chain_then_branch_yields_two_unitigs) {
     EXPECT_EQ(r.compacted.node(u_d1).length_bp, 40u);
     EXPECT_EQ(r.compacted.node(u_d2).length_bp, 50u);
 
-    // Two inter-unitig edges, both starting from the ABC unitig,
-    // preserving read_support verbatim from the C->D1 / C->D2 originals.
+    // Two inter-unitig edges, both starting from the ABC unitig.
     bool saw_d1 = false, saw_d2 = false;
     for (const auto& e : r.compacted.edges()) {
         EXPECT_EQ(e.from, u_abc);
@@ -107,4 +104,85 @@ TEST(GraphCompactorTest, Chain_then_branch_yields_two_unitigs) {
     }
     EXPECT_TRUE(saw_d1);
     EXPECT_TRUE(saw_d2);
+}
+
+TEST(GraphCompactorTest, Consensus_from_three_reads_with_snp) {
+    // Test: 3 reads with 1 SNP position (majority voting)
+    // Read 1: ACGTACGT
+    // Read 2: ACGAACGT  (T->A at position 3)
+    // Read 3: ACGAACGT  (T->A at position 3)
+    // Expected consensus: ACGAACGT (A wins 2:1 at position 3)
+    
+    LosslessGraph g;
+    NodeId n0 = g.add_node(8, 1);  // length 8bp
+    NodeId n1 = g.add_node(8, 1);
+    NodeId n2 = g.add_node(8, 1);
+    
+    // Linear chain: n0 -> n1 -> n2
+    g.add_edge(n0, n1, 1);
+    g.add_edge(n1, n2, 1);
+    
+    // Provide sequences for each node
+    std::vector<std::string> sequences = {
+        "ACGTACGT",  // node 0
+        "ACGAACGT",  // node 1 (SNP at pos 3: T->A)
+        "ACGAACGT"   // node 2 (SNP at pos 3: T->A)
+    };
+    
+    CompactionResult r = compact_unitigs_with_sequences(g, sequences);
+    
+    // Should collapse to 1 unitig
+    ASSERT_EQ(r.compacted.node_count(), 1u);
+    
+    // Consensus should be ACGAACGT (majority wins)
+    const std::string& cons = r.compacted.node(0).consensus;
+    EXPECT_FALSE(cons.empty()) << "Consensus should not be empty";
+    
+    // At position 3, 'A' should win (2 votes) over 'T' (1 vote)
+    if (cons.size() >= 4) {
+        EXPECT_EQ(cons[3], 'A') << "Position 3 should be 'A' (majority)";
+    }
+    
+    // Full consensus check
+    EXPECT_EQ(cons, "ACGAACGT") << "Full consensus mismatch";
+}
+
+TEST(GraphCompactorTest, Single_read_consensus_direct_copy) {
+    // Single read: consensus is the read itself
+    LosslessGraph g;
+    (void)g.add_node(5, 1);
+    
+    std::vector<std::string> sequences = { "ATCGA" };
+    
+    CompactionResult r = compact_unitigs_with_sequences(g, sequences);
+    
+    ASSERT_EQ(r.compacted.node_count(), 1u);
+    EXPECT_EQ(r.compacted.node(0).consensus, "ATCGA");
+}
+
+TEST(GraphCompactorTest, Two_reads_consensus_majority) {
+    // Two reads with 1 difference
+    // Read 1: AAAA
+    // Read 2: AATA
+    // Expected: AATA or AAAA (tie at position 2, either valid)
+    
+    LosslessGraph g;
+    NodeId n0 = g.add_node(4, 1);
+    NodeId n1 = g.add_node(4, 1);
+    g.add_edge(n0, n1, 1);
+    
+    std::vector<std::string> sequences = { "AAAA", "AATA" };
+    
+    CompactionResult r = compact_unitigs_with_sequences(g, sequences);
+    
+    ASSERT_EQ(r.compacted.node_count(), 1u);
+    const std::string& cons = r.compacted.node(0).consensus;
+    EXPECT_FALSE(cons.empty());
+    EXPECT_EQ(cons.size(), 4u);
+    // First, second, fourth positions should be 'A'
+    EXPECT_EQ(cons[0], 'A');
+    EXPECT_EQ(cons[1], 'A');
+    EXPECT_EQ(cons[3], 'A');
+    // Position 2 could be 'A' or 'T' (tie)
+    EXPECT_TRUE(cons[2] == 'A' || cons[2] == 'T');
 }
