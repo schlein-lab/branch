@@ -1,0 +1,116 @@
+# BRANCH Snakemake Workflow v0.1
+#
+# Runs on Hummel-2 via the SLURM executor plugin. All paths are BeeGFS
+# because /home is readonly inside batch jobs. Containers are Apptainer
+# SIF files pulled in Phase-0 T1, located under CONTAINER_DIR.
+#
+# This v0.1 stub covers the alignment + ROI-annotation stages that
+# Phase 0 T5/T6/T7 already produced. Later phases (v0.2+) extend it
+# with the BRANCH tool itself once the C++ binary is in place.
+
+import os
+
+configfile: "config/config.yaml"
+
+USER = os.environ.get("USER", "bbg6775")
+BEEGFS_BASE = f"/beegfs/u/{USER}/humangenetik/ag/schlein/{USER}"
+PROJECT_DIR = f"{BEEGFS_BASE}/projects/branch"
+CONTAINER_DIR = f"{BEEGFS_BASE}/containers"
+LOG_DIR = f"{BEEGFS_BASE}/logs/slurm_jobs"
+
+SHARED = "/beegfs/u/bbg6775/humangenetik/shared"
+REFERENCE = f"{SHARED}/references/GRCh38/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+SEGDUP_UCSC = f"{SHARED}/annotations/segdups/hg38_genomicSuperDups.txt.gz"
+STR_UCSC = f"{SHARED}/annotations/repeatmasker/hg38_simpleRepeat.txt.gz"
+
+SAMPLE = config.get("sample", "HG002")
+HIFI_DIR = config.get("hifi_dir",
+                       f"{SHARED}/references/human_pangenome/hifi_reads/{SAMPLE}/15kb")
+
+rule all:
+    input:
+        f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam.bai",
+        f"{PROJECT_DIR}/phase0/rois/roi_stats.json",
+
+rule align_hifi:
+    input:
+        ref = REFERENCE,
+        minimap2_sif = f"{CONTAINER_DIR}/minimap2_2.28.sif",
+        samtools_sif = f"{CONTAINER_DIR}/samtools_1.21.sif",
+    output:
+        bam = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam",
+        bai = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam.bai",
+    params:
+        hifi_dir = HIFI_DIR,
+    threads: 16
+    resources:
+        slurm_account = "kubisch_std",
+        slurm_partition = "std",
+        runtime = 120,
+        mem_mb = 0,
+        disk_mb = 0,
+    shell:
+        r"""
+        set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
+        cat {params.hifi_dir}/*.fastq \
+          | apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.minimap2_sif} \
+              minimap2 -ax map-hifi --secondary=no -t {threads} {input.ref} - \
+          | apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.samtools_sif} \
+              samtools sort -@ 4 -O bam -o {output.bam} -
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.samtools_sif} \
+            samtools index -@ 4 {output.bam}
+        """
+
+rule roi_catalog:
+    input:
+        segdup = SEGDUP_UCSC,
+        str_tr = STR_UCSC,
+        bedtools_sif = f"{CONTAINER_DIR}/bedtools_2.31.1.sif",
+    output:
+        segdup_bed = f"{PROJECT_DIR}/phase0/rois/roi_segdups.bed",
+        str_bed = f"{PROJECT_DIR}/phase0/rois/roi_simplerepeat.bed",
+        catalog = f"{PROJECT_DIR}/phase0/rois/roi_catalog.bed",
+    threads: 4
+    resources:
+        slurm_account = "kubisch_std",
+        slurm_partition = "std",
+        runtime = 30,
+        mem_mb = 0,
+        disk_mb = 0,
+    shell:
+        r"""
+        set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
+        mkdir -p {PROJECT_DIR}/phase0/rois
+        zcat {input.segdup} | awk -F"\t" "BEGIN{{OFS=\"\\t\"}} \$2 ~ /^chr/ {{print \$2,\$3,\$4,\"segdup_\"NR,\"segdup\"}}" | sort -k1,1 -k2,2n > {output.segdup_bed}
+        zcat {input.str_tr} | awk -F"\t" "BEGIN{{OFS=\"\\t\"}} \$2 ~ /^chr/ {{print \$2,\$3,\$4,\"trf_\"\$6\"_\"\$7,\"simple_repeat\"}}" | sort -k1,1 -k2,2n > {output.str_bed}
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.bedtools_sif} \
+            bedtools merge -i {output.segdup_bed} -c 5 -o distinct > /tmp/segdup_merged.bed
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.bedtools_sif} \
+            bedtools merge -i {output.str_bed} -c 5 -o distinct > /tmp/str_merged.bed
+        cat /tmp/segdup_merged.bed /tmp/str_merged.bed | sort -k1,1 -k2,2n > {output.catalog}
+        """
+
+rule coverage_profile:
+    input:
+        bam = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam",
+        bai = f"{PROJECT_DIR}/phase0/{SAMPLE}_grch38.bam.bai",
+        catalog = f"{PROJECT_DIR}/phase0/rois/roi_catalog.bed",
+        mosdepth_sif = f"{CONTAINER_DIR}/mosdepth_0.3.13.sif",
+    output:
+        stats = f"{PROJECT_DIR}/phase0/rois/roi_stats.json",
+    threads: 4
+    resources:
+        slurm_account = "kubisch_std",
+        slurm_partition = "std",
+        runtime = 30,
+        mem_mb = 0,
+        disk_mb = 0,
+    shell:
+        r"""
+        set +u; source /sw/batch/init.sh; module load apptainer/1.2.5; set -u
+        cd {PROJECT_DIR}/phase0/rois
+        apptainer exec --bind /beegfs:/beegfs --env TMPDIR=/tmp {input.mosdepth_sif} \
+            mosdepth --by {input.catalog} --no-per-base --threads {threads} \
+            {SAMPLE}_coverage {input.bam}
+        echo aggregation_placeholder > {output.stats}
+        """

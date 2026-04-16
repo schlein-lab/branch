@@ -1,0 +1,13 @@
+# BRANCH workflow configuration.
+# Default values for v0.1 Phase-0-equivalent pipeline run on Hummel-2.
+
+sample: HG002
+
+# Optional override. If unset, the Snakefile constructs the path from
+# BeeGFS shared-reference layout using ${USER} and the sample name.
+# Example: /beegfs/u/bbg6775/humangenetik/shared/references/human_pangenome/hifi_reads/HG002/15kb
+# hifi_dir: ""
+
+# Runtime knobs that may change per workload size.
+threads_align: 16
+threads_mosdepth: 4

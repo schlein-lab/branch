@@ -1,0 +1,42 @@
+# Snakemake SLURM profile for Hummel-2.
+# Follows AG-Schlein HUMMEL2_SNAKEMAKE_GUIDE.md rules:
+#   - no --mem (forbidden by RRZ policy)
+#   - all caches on BeeGFS (/home is readonly in batch jobs)
+#   - SLURM-PATH must be set before snakemake invocation
+
+executor: slurm
+
+# --- BeeGFS-only paths (placeholders; run scripts fill $USER/$PROJECT) ---
+# Users override these via env vars or symlinks before launch.
+# directory:                  /beegfs/u/$USER/humangenetik/ag/schlein/$USER/projects/branch
+# slurm-logdir:               /beegfs/u/$USER/humangenetik/ag/schlein/$USER/logs/slurm_jobs
+# runtime-source-cache-path:  /beegfs/u/$USER/humangenetik/ag/schlein/$USER/.cache/snakemake
+# conda-prefix:               /beegfs/u/$USER/humangenetik/ag/schlein/$USER/.snakemake/conda
+# apptainer-prefix:           /beegfs/u/$USER/humangenetik/ag/schlein/$USER/containers
+# shadow-prefix:              /beegfs/u/$USER/humangenetik/ag/schlein/$USER/projects/branch/.snakemake/shadow
+# local-storage-prefix:       /beegfs/u/$USER/humangenetik/ag/schlein/$USER/.snakemake/storage
+
+default-resources:
+  slurm_account: kubisch_std
+  slurm_partition: std
+  cpus_per_task: 8
+  runtime: 240
+  mem_mb: 0       # REQUIRED: RRZ rejects any --mem
+  disk_mb: 0      # REQUIRED: same rule
+
+# Example GPU-rule overrides. Remove when you actually have a rule.
+set-resources: {}
+# set-resources:
+#   rule_using_gpu:
+#     slurm_account: kubisch_gpu
+#     slurm_partition: gpu
+#     gpu: 1
+#     tasks_per_gpu: 0    # CRITICAL: without this, plugin sets --ntasks-per-gpu=1 which RRZ rejects
+#     cpus_per_gpu: 8
+
+retries: 3
+jobs: 50
+latency-wait: 120
+keep-going: true
+use-conda: false
+use-apptainer: true
