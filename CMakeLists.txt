@@ -78,11 +78,16 @@ if(NOT EXISTS "${BRANCH_HTSLIB_DIR}/libhts.a")
 endif()
 add_library(branch_htslib INTERFACE)
 target_include_directories(branch_htslib INTERFACE "${BRANCH_HTSLIB_DIR}")
-# htslib's own transitive deps (see `htslib_default_libs` in its Makefile):
-#   -lz -lm -lbz2 -llzma -lcurl ; plus -lpthread for thread_pool.
+# htslib transitive deps. htscodecs and the rANS/RLE codecs are compiled
+# into libhts.a from third_party/htslib's bundled htscodecs sources (see
+# `htscodecs_bundled.mk` and the configure output `linking
+# htscodecs_bundled.mk to htscodecs.mk`). libdeflate is autodetected at
+# configure time, so we link it explicitly. zlib + libm + pthread round
+# out the base deps; bz2/lzma/curl/plugins were disabled at configure
+# time so we do not need them.
 target_link_libraries(branch_htslib INTERFACE
     "${BRANCH_HTSLIB_DIR}/libhts.a"
-    z m bz2 lzma curl pthread)
+    deflate z m pthread)
 
 # ------------------------------------------------------------------------------
 # Subdirectories

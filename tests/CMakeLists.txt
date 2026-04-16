@@ -96,6 +96,14 @@ target_link_libraries(test_strand_handling PRIVATE branch_backend branch_graph G
 target_compile_features(test_strand_handling PRIVATE cxx_std_20)
 gtest_discover_tests(test_strand_handling)
 
+add_executable(test_bam_reader test_bam_reader.cpp)
+target_link_libraries(test_bam_reader PRIVATE branch_io branch_htslib GTest::gtest_main)
+target_compile_features(test_bam_reader PRIVATE cxx_std_20)
+# Silence -Werror=conversion from vendored htslib headers included here.
+target_include_directories(test_bam_reader SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/htslib)
+gtest_discover_tests(test_bam_reader)
+
 # --- E2E integration test -------------------------------------------------
 # Spawns the real `branch` binary on a synthetic FASTQ and validates the
 # emitted GFA. Gated on the `branch` target being defined so a standalone
