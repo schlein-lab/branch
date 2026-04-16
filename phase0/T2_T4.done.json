@@ -1,0 +1,27 @@
+{
+  "task": "T2_T4_hg002_selection_stats",
+  "completed_at": "2026-04-16T16:30",
+  "status": "partial_coverage_warning",
+  "data_path": "/beegfs/u/bbg6775/humangenetik/shared/references/human_pangenome/hifi_reads/HG002/15kb/",
+  "file_count": 6,
+  "format": "FASTQ (uncompressed)",
+  "sequencer": "PacBio Sequel II (2020 dataset, pre-Revio)",
+  "total_reads": 994142,
+  "total_bases_gbp": 12.76,
+  "avg_read_length_bp": 12830,
+  "n50_bp": 12818,
+  "q20_percent": 97.8,
+  "q30_percent": 95.5,
+  "estimated_coverage": 4.1,
+  "gc_content_percent": 40.9,
+  "coverage_warning": "Lokale HG002-Daten liefern ca 4x Coverage - INSUFFICIENT fuer BRANCH-v0.3+ Mosaik-Detection (benoetigt >=30x). Geeignet fuer Phase-0 Pipeline-Validation aber NICHT fuer v0.3-Klassifikator-Training oder v0.7-Benchmarks. Vor v0.3 muss voller HPRC-HG002-Dataset (40-80 GB aus s3://human-pangenomics) nach BeeGFS transferiert werden.",
+  "files": [
+    "m54238_180901_011437.Q20.fastq",
+    "m54238_180902_013549.Q20.fastq",
+    "m54238_180903_015530.Q20.fastq",
+    "m54238_180904_021549.Q20.fastq",
+    "m54238_180907_170406.Q20.fastq",
+    "m54238_180908_172515.Q20.fastq"
+  ],
+  "next_task": "T5_reference_alignment"
+}

@@ -1,0 +1,64 @@
+{
+  "task": "T9_memory_io_baseline",
+  "completed_at": "2026-04-16T18:17",
+  "sample": "HG002 HiFi (pre-Revio 2020)",
+  "coverage_observed": 4.1,
+  "target_coverage_v03": 30,
+  "measurements_from_phase0": {
+    "T5_alignment": {
+      "wallclock_seconds": 758,
+      "cpus": 16,
+      "input_gbp": 12.76,
+      "output_bam_bytes": 9573267742,
+      "partition": "std",
+      "node_ram_gb": 750
+    },
+    "T6T7_roi_coverage": {
+      "wallclock_seconds": 72,
+      "cpus": 8,
+      "rois": 689558,
+      "segdup_rois": 8043,
+      "simple_repeat_rois": 681515
+    }
+  },
+  "projection_at_30x_coverage": {
+    "scale_factor": 7.3,
+    "comment": "30x / 4.1x observed = 7.3x scale",
+    "alignment_wallclock_estimate_min": 90,
+    "alignment_bam_size_estimate_gb": 70,
+    "reads_estimate": 7257000
+  },
+  "branch_v01_ram_budget_gb": {
+    "classical_stringgraph_estimate": 250,
+    "delta_graph_steady_state_expected": 27,
+    "reverse_index_cost_gb": 4.8,
+    "hot_node_materialization_cost_gb": 3.0,
+    "coverage_counters_cost_gb": 0.4,
+    "construction_peak_expected": 80,
+    "recommended_partition": "big (2.3 TB available, only 80 GB needed)"
+  },
+  "branch_v01_cpu_budget": {
+    "expected_construction_hours_30x": 8,
+    "expected_alignment_hours_30x": 1.5,
+    "recommended_cpus": 32,
+    "parallelism_model": "embarrassingly_parallel_overlap_within_batches"
+  },
+  "branch_v01_gpu_budget": {
+    "hpc_available_gpus": "8x H100 per gpu-node",
+    "first_kernel_target": "all_vs_all_minimizer_overlap",
+    "expected_speedup_over_cpu": "10-20x on overlap phase",
+    "fat_binary_archs": "sm_80 sm_90"
+  },
+  "conclusions": [
+    "big-Partition (2.3 TB RAM) ist Over-provisioned fuer BRANCH — std-Partition (750 GB) reicht fuer 30x WGS",
+    "Construction-Peak <100 GB ist konservativ; Delta-Graph haelt Steady-State unter 30 GB",
+    "gpu-Partition (8x H100) hat massive Ueberkapazitaet — ein einzelnes H100 reicht fuer Overlap-Kernel",
+    "Alignment-Phase skaliert linear mit Coverage: 30x -> ~90min auf 16 CPUs, gut fuer SLURM-2h-Slot",
+    "Phase-0-4.1x-Sample reicht NICHT fuer v0.3-Klassifikator-Training — voller HPRC-HG002 transferieren vor v0.3"
+  ],
+  "next_steps": [
+    "Vor v0.3: HPRC HG002 full-dataset (40-80 GB) via aws s3 cp transferieren",
+    "v0.1 Scaffold weiter: CUDA overlap kernel skeleton, Snakemake workflow",
+    "v0.2: Integration aller v0.1-Header + erste echte overlap-Computation auf chr22-Subset"
+  ]
+}

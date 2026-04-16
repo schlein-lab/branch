@@ -1,0 +1,80 @@
+{
+  "task": "T0_environment_probe",
+  "completed_at": "2026-04-16T15:46",
+  "hummel_host": "hummel2-front1",
+  "status": "complete",
+  "accounts": {
+    "std": "kubisch_std",
+    "gpu": "kubisch_gpu",
+    "gputest": "gputest"
+  },
+  "partitions": {
+    "std": {
+      "cpu_per_node": 192,
+      "ram_gb_per_node": 750,
+      "gpu": null,
+      "timelimit": "infinite"
+    },
+    "big": {
+      "cpu_per_node": 192,
+      "ram_gb_per_node": 2263,
+      "gpu": null,
+      "timelimit": "infinite"
+    },
+    "gpu_variant1": {
+      "cpu_per_node": 64,
+      "ram_gb_per_node": 1125,
+      "gpu": "8x H100",
+      "timelimit": "infinite"
+    },
+    "gpu_variant2": {
+      "cpu_per_node": 192,
+      "ram_gb_per_node": 1500,
+      "gpu": "8x H100",
+      "timelimit": "infinite"
+    },
+    "gputest": {
+      "cpu_per_node": 32,
+      "ram_gb_per_node": 375,
+      "gpu": null,
+      "timelimit": "infinite"
+    }
+  },
+  "beegfs": {
+    "total_pb": 2.9,
+    "used_tb": 423,
+    "avail_pb": 2.5,
+    "user_quota": "none"
+  },
+  "front_node_hw": {
+    "cpu": 64,
+    "ram_gb": 188
+  },
+  "findings": [
+    "big-Partition 2.3 TB RAM macht BRANCH Construction-Peak (60-100 GB) trivial erreichbar; Standard-Node reicht locker",
+    "gpu-Partition mit 8x H100 pro Node ermoeglicht Multi-GPU-Scaling spaeter; CUDA-Compute >= sm_90",
+    "BeeGFS 2.5 PB frei ohne Quota - kein Storage-Bottleneck fuer HPRC-Downloads",
+    "GCC 15.1.0 verfuegbar - C++20 voll unterstuetzt",
+    "CUDA 12.9.0 latest fuer H100 sm_90 - Multi-arch fat binary empfohlen (sm_80+sm_90)",
+    "apptainer 1.2.5 vorhanden - Container-Pipeline (T1) kann direkt laufen"
+  ],
+  "next_task": "T1_container_builds",
+  "env_json_path": "/home/christian/branch/phase0/env.json",
+  "modules_confirmed": {
+    "gcc": [
+      "13.2.0",
+      "13.3.0",
+      "14.2.0",
+      "15.1.0"
+    ],
+    "cuda": [
+      "11.8.0",
+      "12.5.1",
+      "12.9.0"
+    ],
+    "apptainer": "1.2.5",
+    "cmake": "3.28.1",
+    "activation_pattern": "source /sw/batch/init.sh && module load env/gcc-15.1.0 cuda/12.9.0 apptainer/1.2.5"
+  },
+  "module_system": "tcl-modules 4.1.4 via /sw/batch/init.sh (MODULEPATH: /sw/LIB/system-gcc:/sw/BASE:/sw/TOOL:/sw/APP)"
+}

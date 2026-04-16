@@ -1,0 +1,10 @@
+{
+  "task": "T5_reference_alignment",
+  "resubmitted_at": "2026-04-16T16:32",
+  "status": "running",
+  "slurm_job_id": 1821166,
+  "previous_failed_job": 1821145,
+  "failure_root_cause": "set -u crashed on /sw/batch/init.sh due to RRZ_SW_INIT unbound variable",
+  "fix_applied": "set +u around module init block, set -u re-enabled after",
+  "teaching_memory_key": "teaching_hummel2_set_u_init"
+}

@@ -1,0 +1,18 @@
+{
+  "task": "T1_container_pulls",
+  "completed_at": "2026-04-16T16:26",
+  "status": "complete",
+  "container_dir": "/beegfs/u/bbg6775/humangenetik/ag/schlein/bbg6775/containers",
+  "containers": {
+    "minimap2": {"version": "2.28-r1209", "sha256": "c4289263730305997ccb9771001ad5f04eda5ef4f9c98a92620fd3f5585da728"},
+    "samtools": {"version": "1.21", "sha256": "c1bc2596b042a0619b4641095734b8b9339b473add0c54c304aa460b82240478"},
+    "mosdepth": {"version": "0.3.13", "sha256": "723169ec5b947a7572abaf2fc90a2c7990db2e7c8d66ce2e2cac4dab46ef0c1b"},
+    "bedtools": {"version": "2.31.1", "sha256": "b1f199b696d7bd4e2dabc62050a0198c3f471824b0ce354994ffc1298720358b"},
+    "seqkit":   {"version": "2.8.2",  "sha256": "0149f6d727f3b803010da9f6f4a8b5cd93b431c6d863bd25c0045c30f2665b27"}
+  },
+  "corrections": [
+    "Registry hallucination: zyrkel verwendete oras://ghcr.io/biocontainers statt docker://quay.io/biocontainers — korrigiert, Teaching-Memory gespeichert",
+    "mosdepth tag 0.3.9--hbce0af5_1 existiert nicht in quay.io/biocontainers — upgraded zu 0.3.13--hba6dcaf_0 (aktuellste stable)"
+  ],
+  "next_task": "T2_hprc_hg002_selection"
+}

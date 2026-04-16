@@ -1,0 +1,10 @@
+{
+"timestamp": "2026-04-16T15:48:49+02:00",
+"probe_version": "1.1",
+"probe_type": "module_init",
+"init_profile_d": {"status": "ok", "data": "INIT_FAIL: /etc/profile.d/modules.sh does not exist"},
+"init_sw_batch": {"status": "ok", "data": "ERROR: "},
+"init_usr_share": {"status": "ok", "data": "INIT_FAIL: /usr/share/Modules/init/bash does not exist"},
+"init_lmod": {"status": "ok", "data": "INIT_FAIL: No Lmod init found at standard paths"},
+"module_env_vars": {"status": "ok", "data": "MODULEPATH=unset\nLMOD_DIR=unset\nMODULESHOME=unset"}
+}
