@@ -167,8 +167,8 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
     unitigs.reserve(n);
 
     auto is_chain_start = [&](NodeId v) -> bool {
-        if (in_degree[v] != 1) return true;
-        // unique predecessor:
+        if (in_degree[v] != 1) return true;  // source or branching -> chain start
+        // Safe here: in_degree[v] == 1 guarantees unique_in_edge[v] was set above.
         std::size_t ein = unique_in_edge[v];
         const Edge& pe = edges[ein];
         NodeId pred = pe.from;
@@ -297,7 +297,8 @@ CompactionResult compact_unitigs_with_sequences(
     unitigs.reserve(n);
 
     auto is_chain_start = [&](NodeId v) -> bool {
-        if (in_degree[v] != 1) return true;
+        if (in_degree[v] != 1) return true;  // source or branching -> chain start
+        // Safe here: in_degree[v] == 1 guarantees unique_in_edge[v] was set above.
         std::size_t ein = unique_in_edge[v];
         const Edge& pe = edges[ein];
         NodeId pred = pe.from;
