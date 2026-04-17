@@ -59,8 +59,7 @@ meaningful CNV benchmark. They are prerequisites, not Phase 1 deliverables:
 4. **chrom = NA in BED** — output is unusable for any genomic benchmark;
    every truth set is chromosome-keyed.
 
-These are tracked as separate diagnostic findings; see
-`coding-zyrkel-1` report (WIP).
+These are tracked as separate diagnostic findings (internal tracker).
 
 ## Phase 1 — Measurable CNV discovery
 
