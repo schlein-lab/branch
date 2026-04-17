@@ -144,9 +144,14 @@ std::size_t compute_overlaps_impl(
         return 0;
     }
 
-    // Step 2: Build hash buckets
+    // Step 2: Build hash buckets. Sized for the number of *unique*
+    // hashes rather than total hits to avoid a wasteful over-reserve
+    // (all_hits >> unique hashes when reads share many k-mers). An
+    // approximate factor of 4 is a conservative lower-bound seen on
+    // HiFi data; the map will rehash once or twice in the worst case
+    // instead of never, which is a small, deterministic RAM hit.
     std::unordered_map<std::uint64_t, std::vector<BucketEntry>> buckets;
-    buckets.reserve(all_hits.size());
+    buckets.reserve(all_hits.size() / 4 + 16);
 
     for (const auto& hit : all_hits) {
         buckets[hit.hash].push_back(BucketEntry{
@@ -156,10 +161,24 @@ std::size_t compute_overlaps_impl(
         });
     }
 
-    // Step 3+4: Collect matches per candidate pair
-    std::unordered_map<PairKey, std::vector<MatchInfo>, PairKeyHash> pair_matches;
+    // Snapshot bucket keys in sorted order so Step 3+4 iterates the
+    // buckets deterministically — without this, two runs on the same
+    // input can iterate buckets in different orders (hash seed, load
+    // factor) and emit OverlapPairs in shuffled positions, making
+    // output files irreproducible.
+    std::vector<std::uint64_t> bucket_keys;
+    bucket_keys.reserve(buckets.size());
+    for (const auto& kv : buckets) bucket_keys.push_back(kv.first);
+    std::sort(bucket_keys.begin(), bucket_keys.end());
 
-    for (const auto& [hash, entries] : buckets) {
+    // Step 3+4: Collect matches per candidate pair. Reserve to the
+    // number of distinct pairs a well-behaved HiFi batch generates
+    // (~same scale as buckets.size()) to keep rehash spikes bounded.
+    std::unordered_map<PairKey, std::vector<MatchInfo>, PairKeyHash> pair_matches;
+    pair_matches.reserve(buckets.size());
+
+    for (std::uint64_t hash : bucket_keys) {
+        const auto& entries = buckets[hash];
         if (entries.size() < 2) continue;
 
         for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -195,10 +214,22 @@ std::size_t compute_overlaps_impl(
         }
     }
 
-    // Step 5: Filter pairs by match count and offset consistency
+    // Step 5: Filter pairs by match count and offset consistency.
+    // Iterate pair_matches in sorted (read_a, read_b) order so the
+    // emitted OverlapPairs appear in the same order on every run.
+    std::vector<PairKey> pair_keys;
+    pair_keys.reserve(pair_matches.size());
+    for (const auto& kv : pair_matches) pair_keys.push_back(kv.first);
+    std::sort(pair_keys.begin(), pair_keys.end(),
+              [](const PairKey& x, const PairKey& y) {
+                  if (x.a != y.a) return x.a < y.a;
+                  return x.b < y.b;
+              });
+
     std::size_t out_idx = 0;
 
-    for (const auto& [pair, matches] : pair_matches) {
+    for (const auto& pair : pair_keys) {
+        const auto& matches = pair_matches[pair];
         if (matches.size() < cfg.min_matches) continue;
 
         std::int32_t best_offset = matches[0].offset;
