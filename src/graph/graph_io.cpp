@@ -186,11 +186,8 @@ bool read_gfa(LosslessGraph& graph, const std::string& path) {
 }
 
 // =====================================================================
-// FASTA writer
+// FASTA writer (reads)
 // =====================================================================
-//
-// TODO(v0.3): write node consensus instead of raw reads once the
-// compactor stores a per-Node consensus sequence.
 
 bool write_fasta(const LosslessGraph& /*graph*/,
                  const std::vector<std::string>& sequences,
@@ -218,6 +215,32 @@ bool write_fasta(const LosslessGraph& graph,
     std::ofstream ofs(path);
     if (!ofs) return false;
     return write_fasta(graph, sequences, names, ofs);
+}
+
+// =====================================================================
+// FASTA writer (node consensus)
+// =====================================================================
+
+bool write_fasta_consensus(const LosslessGraph& graph, std::ostream& out) {
+    constexpr std::size_t kWrap = 80;
+    for (const auto& node : graph.nodes()) {
+        if (node.consensus.empty()) continue;
+        out << '>' << "node_" << node.id << '\n';
+        const auto& seq = node.consensus;
+        for (std::size_t p = 0; p < seq.size(); p += kWrap) {
+            const std::size_t len = std::min(kWrap, seq.size() - p);
+            out.write(seq.data() + p, static_cast<std::streamsize>(len));
+            out << '\n';
+        }
+    }
+    return out.good();
+}
+
+bool write_fasta_consensus(const LosslessGraph& graph,
+                           const std::string& path) {
+    std::ofstream ofs(path);
+    if (!ofs) return false;
+    return write_fasta_consensus(graph, ofs);
 }
 
 // =====================================================================

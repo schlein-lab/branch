@@ -45,14 +45,11 @@ bool read_gfa(LosslessGraph& graph, std::istream& in);
 bool read_gfa(LosslessGraph& graph, const std::string& path);
 
 // ---------------------------------------------------------------------
-// FASTA writer.
+// FASTA writer (reads).
 //
-// Since Node has no consensus_seq in v0.2, the caller must pass the
-// read-store (sequences + names, indexed by ReadId). Emits one FASTA
-// record per read with the sequence wrapped at 80 columns.
-//
-// TODO(v0.3): write node consensus instead of raw reads once the
-// compactor stores a per-Node consensus sequence.
+// Emits one FASTA record per read with the sequence wrapped at 80
+// columns. Kept for backwards compatibility with callers that want
+// the input-reads dump.
 //
 // Returns false on write error or size mismatch between sequences/names.
 bool write_fasta(const LosslessGraph& graph,
@@ -64,6 +61,18 @@ bool write_fasta(const LosslessGraph& graph,
                  const std::vector<std::string>& sequences,
                  const std::vector<std::string>& names,
                  const std::string& path);
+
+// ---------------------------------------------------------------------
+// FASTA writer (node consensus).
+//
+// Emits one FASTA record per Node that has a non-empty consensus
+// (populated by graph_compactor after unitig compaction). Record name
+// is node_<id>. Nodes without consensus are skipped.
+//
+// Returns false on write error.
+bool write_fasta_consensus(const LosslessGraph& graph, std::ostream& out);
+bool write_fasta_consensus(const LosslessGraph& graph,
+                           const std::string& path);
 
 // ---------------------------------------------------------------------
 // BED writer.
