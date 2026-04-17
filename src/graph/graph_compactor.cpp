@@ -37,9 +37,13 @@ namespace {
 
 constexpr NodeId kUnassigned = std::numeric_limits<NodeId>::max();
 
-// Simple position-wise majority voting for unaligned sequences.
-// For sequences of different lengths, we pad shorter ones conceptually.
-// This is a fallback for 2 sequences or when abPOA is not available.
+// Position-wise majority voting for unaligned sequences.
+// Sequences of different lengths are padded with conceptual gaps
+// (positions past the end contribute nothing to the base count).
+// Adequate for well-overlapping unitig members where indels are rare;
+// a POA-based aligner (abPOA or equivalent) would improve quality on
+// pathological regions but is not vendored yet — revisit when the
+// assembler starts hitting high-indel targets.
 std::string simple_majority_consensus(const std::vector<std::string>& sequences) {
     if (sequences.empty()) {
         return {};
@@ -94,8 +98,9 @@ std::string simple_majority_consensus(const std::vector<std::string>& sequences)
 // Strategy:
 //   - 0 sequences with content -> empty consensus
 //   - 1 sequence -> use directly
-//   - 2 sequences -> use majority_voter (aligned) or simple majority (unaligned)
-//   - 3+ sequences -> simple majority (placeholder for abPOA)
+//   - 2+ sequences -> simple_majority_consensus (position-wise majority
+//     with length padding). A POA-based aligner would improve indel-
+//     heavy regions but is not yet vendored.
 std::string build_unitig_consensus(
     const std::vector<NodeId>& members,
     const LosslessGraph& input) {
@@ -119,8 +124,6 @@ std::string build_unitig_consensus(
         return sequences[0];
     }
     
-    // For 2+ sequences, use simple majority voting
-    // This is a placeholder - in production, 3+ sequences would use abPOA
     return simple_majority_consensus(sequences);
 }
 

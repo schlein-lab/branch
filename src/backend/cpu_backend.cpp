@@ -26,7 +26,9 @@ namespace branch::backend {
 
 // Definition of the forward-declared context struct
 struct CpuBackendContext {
-    // v0.1: no state. Future: thread-pool handle, scratch buffers, etc.
+    // Stateless — worker threads are spawned per compute_overlaps call
+    // via std::async and joined before returning, so no per-instance
+    // pool handle is required.
 };
 
 // Configuration for overlap detection.
