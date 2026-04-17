@@ -1,40 +1,48 @@
-# BRANCH
+# BRANCH — Lossless Assembly Graph for Low-Frequency CNV Discovery
 
-**Breakpoint-Resolved Assembly of Non-diploid Copy-number Heterogeneity**
+## Overview
+BRANCH is a HiFi-read genome assembler built to be state-of-the-art at low-frequency copy-number variants. It produces a lossless, CN-aware assembly graph where branches are graph bifurcations (not tumor clones). Every variant call carries VAF evidence from reads, in-silico PCR, and k-mer counts.
 
-## What
+## Status (Phase 0)
+- End-to-end run on HG002 HiFi: Hummel-2 SLURM job 1823405 on node n093, 4:24 min wall time (2026-04-17).
+- 8 HPRC genomes processed end-to-end.
+- Known gaps: unitig collapse not yet final, RAM consumption non-deterministic, CPU utilisation ~6 %, per-contig chromosome = NA.
 
-Somatic-mosaicism-aware genome assembler for human PacBio HiFi bulk-blood data with vPCR-based CNV quantification.
-
-BRANCH builds a lossless Delta-Graph representation where reads are stored as path + delta-list, not as sequences. This enables efficient classification of parallel graph paths as Branch vs. Duplication vs. Mixed using flanking identity, depth-sum, read-span, and reference priors.
-
-## Status
-
-**v0.1** — In development, alpha.
-
-## Out of Scope
-
-- Plants
-- Tumors
-- Cancer subclones
-
-## Dependencies
-
-- C++20 compiler (GCC 13+ or Clang 17+)
-- CMake 3.28+
-- CUDA 12+ (optional, for GPU acceleration)
-- htslib
-- ksw2
-- abPOA
-
-## Build
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+## Pipeline
+```
+reader → graph_build → graph_compactor → graph_filter → assemble
 ```
 
-## License
+## Output contract
+- BED: branch intervals (chrom, start, end, branch_id, VAF, CN).
+- Consensus FASTA per branch.
+- VAF evidence channels: supporting reads, primer-bracketed in-silico PCR amplicons, k-mer counts on read sequence.
+- Genome-wide repeat CN for main path and every branch, normalised against single-copy reference amplicons.
 
-MIT — see [LICENSE](LICENSE)
+## Build
+```
+cmake -S . -B build
+cmake --build build -j
+```
+
+## Running Phase 0 on Hummel-2
+```
+sbatch workflow/slurm/phase0.slurm <hifi.fastq>
+```
+Outputs: `.gfa`, `.fasta`, `.bed`, `.paf`.
+
+## Tech stack
+- C++20 core (performance-driven decision).
+- htslib (BAM/CRAM I/O), ksw2 (affine-gap alignment), abPOA (partial-order consensus).
+- CMake build; ASan + TSan required in CI.
+
+## Repository layout
+- `src/` — core C++ sources.
+- `docs/architecture.md` — pipeline internals, graph data model, classification problem.
+- `docs/graph-format-spec.md` — on-disk graph format.
+- `workflow/` — Snakemake / SLURM driver.
+- `phase0/` — Phase 0 artefacts.
+- `tests/` — unit + integration tests.
+
+## Design principles
+Lossless graph, CN-aware nodes, VAF-tagged edges, SV-first phasing, multi-allelic branches.
