@@ -64,13 +64,15 @@ struct ReadPathView {
 //
 // v0.2 best-effort mapping: for each read, emit a ReadPath containing
 // its own node and the nodes of all reads it overlaps with, ordered by
-// the overlap's offset along this read. `deltas` is left empty because
-// Node currently stores only `length_bp` (no consensus sequence). This
-// is sufficient for:
+// the overlap's offset along this read. `deltas` is left empty here
+// — this function does not see the per-read sequence, so it cannot
+// call encode_delta. Callers that want populated deltas should use
+// encode_delta(read_seq, concat_of_node_consensus) directly after
+// graph build + compaction.
+//
+// This is sufficient for:
 //   - Debugging: which reads landed on which branch of a bubble.
 //   - Downstream VAF: count reads per bubble branch.
-//
-// TODO(v0.3): compute_delta(ref, read_sub) once Node has consensus.
 //
 // Parameters:
 //   n_reads      Number of input reads. Output vector has n_reads entries

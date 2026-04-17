@@ -8,16 +8,17 @@
 //   CN:i, CV:f (node copy-number)
 //   VF:f, VC:i, BT:A, CT:f (edge branch-type + confidence)
 //
-// v0.1 writes nodes as S-lines and edges as L-lines (no containment
-// or walk lines). Sidecar TSV files are not yet emitted; they arrive
-// with the classifier in v0.3.
+// Nodes are written as S-lines, edges as L-lines (no containment or
+// walk lines).
 //
-// v0.2 adds three additional export formats for downstream tooling:
-//   write_fasta — one record per input read (v0.3 will switch to
-//                 per-node consensus once consensus_seq is tracked).
-//   write_bed   — one line per node; placeholder NA chrom until v0.3
-//                 reference alignment supplies genomic coordinates.
-//   write_paf   — one PAF-12 record per overlap pair from the backend.
+// Sidecar export formats:
+//   write_fasta           — one record per input read (80-col wrap).
+//   write_fasta_consensus — one record per Node carrying a non-empty
+//                           consensus sequence (post-compaction).
+//   write_bed             — one line per node; chrom=NA placeholder.
+//   write_bed_with_refs   — BED6 with real chrom/start/end sourced
+//                           from linear_mapper (minimap2 asm20).
+//   write_paf             — one PAF-12 record per backend overlap pair.
 
 #include <cstddef>
 #include <cstdint>
