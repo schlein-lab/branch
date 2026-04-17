@@ -72,3 +72,27 @@ TEST(GraphBuilderTest, Overlap_to_unknown_read_is_silently_dropped) {
     EXPECT_EQ(r.graph.node_count(), 1u);
     EXPECT_EQ(r.graph.edge_count(), 0u);
 }
+
+TEST(GraphBuilderTest, Read_support_per_node_is_one) {
+    // Each read generates exactly one node, and that node should have
+    // read_support = 1 (the read that created it).
+    std::array<ReadMeta, 3> reads{{
+        {.read_id = 0, .length_bp = 1000},
+        {.read_id = 1, .length_bp = 2000},
+        {.read_id = 2, .length_bp = 3000},
+    }};
+    std::array<OverlapPair, 2> overlaps{{
+        {.read_a = 0, .read_b = 1, .offset_a = 0, .offset_b = 0,
+         .overlap_len = 500, .diff_count = 0, .strand = 0, ._pad = 0},
+        {.read_a = 1, .read_b = 2, .offset_a = 0, .offset_b = 0,
+         .overlap_len = 500, .diff_count = 0, .strand = 0, ._pad = 0},
+    }};
+    auto r = build_graph(reads, overlaps);
+    ASSERT_EQ(r.graph.node_count(), 3u);
+
+    // Every node should have read_support = 1
+    for (std::size_t i = 0; i < r.graph.node_count(); ++i) {
+        EXPECT_EQ(r.graph.node(static_cast<branch::graph::NodeId>(i)).read_support, 1u)
+            << "Node " << i << " should have read_support = 1";
+    }
+}
