@@ -102,7 +102,10 @@ void populate_read_paths(
         for (const auto& pn : partners) {
             rp.path.push_back(pn.node);
         }
-        // TODO(v0.3): compute_delta(ref, read_sub) once Node has consensus.
+        // deltas stay empty here — populate_read_paths has no access to
+        // the read or node-consensus sequences. Callers that want real
+        // deltas must run encode_delta(read_seq, concat-of-node-consensus)
+        // separately; see encode_delta / reconstruct_read below.
     }
 }
 

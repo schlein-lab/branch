@@ -247,8 +247,9 @@ bool write_fasta_consensus(const LosslessGraph& graph,
 // BED writer
 // =====================================================================
 //
-// TODO(v0.3): use real chrom/start/end once reference alignment exists.
 // BED6 layout: chrom  start  end  name  score  strand
+// Plain variant emits chrom=NA placeholders; write_bed_with_refs shells
+// out to minimap2 via linear_mapper to produce real genomic coords.
 
 bool write_bed(const LosslessGraph& graph, std::ostream& out) {
     for (const auto& node : graph.nodes()) {
