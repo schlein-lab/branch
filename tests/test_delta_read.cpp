@@ -153,3 +153,58 @@ TEST(PopulateReadPathsTest, Populate_read_paths_path_nodes_are_ordered) {
     // read_length carried through.
     EXPECT_EQ(paths[1].read_length, 15000u);
 }
+
+// ---------------------------------------------------------------------
+// encode_delta / reconstruct_read round-trip tests
+// ---------------------------------------------------------------------
+
+TEST(EncodeDelta, IdenticalSeqsHaveNoOps) {
+    std::string path = "ACGTACGTACGT";
+    std::string read = path;
+    auto ops = branch::graph::encode_delta(read, path);
+    EXPECT_TRUE(ops.empty());
+
+    auto reconstructed = branch::graph::reconstruct_read(path, ops);
+    EXPECT_EQ(reconstructed, read);
+}
+
+TEST(EncodeDelta, SingleSubstitutionSameLength) {
+    std::string path = "ACGTACGTACGT";
+    std::string read = "ACGTAGGTACGT";  // pos 5: C -> G
+    auto ops = branch::graph::encode_delta(read, path);
+    ASSERT_EQ(ops.size(), 1u);
+    EXPECT_EQ(ops[0].op, 'S');
+    EXPECT_EQ(ops[0].pos, 5u);
+    EXPECT_EQ(ops[0].base, 'G');
+
+    auto reconstructed = branch::graph::reconstruct_read(path, ops);
+    EXPECT_EQ(reconstructed, read);
+}
+
+TEST(EncodeDelta, SingleInsertion) {
+    std::string path = "ACGTACGT";
+    std::string read = "ACGTAXCGT";  // insert X at pos 5
+    auto ops = branch::graph::encode_delta(read, path);
+    ASSERT_FALSE(ops.empty());
+
+    auto reconstructed = branch::graph::reconstruct_read(path, ops);
+    EXPECT_EQ(reconstructed, read);
+}
+
+TEST(EncodeDelta, SingleDeletion) {
+    std::string path = "ACGTACGT";
+    std::string read = "ACGTCGT";  // delete A at pos 4
+    auto ops = branch::graph::encode_delta(read, path);
+    ASSERT_FALSE(ops.empty());
+
+    auto reconstructed = branch::graph::reconstruct_read(path, ops);
+    EXPECT_EQ(reconstructed, read);
+}
+
+TEST(EncodeDelta, TooDivergentReturnsEmpty) {
+    // Lengths differ by more than kBand (64) — should bail out.
+    std::string path(100, 'A');
+    std::string read(300, 'C');
+    auto ops = branch::graph::encode_delta(read, path);
+    EXPECT_TRUE(ops.empty());
+}
