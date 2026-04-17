@@ -6,7 +6,7 @@
 // BRANCH-extended GFA-1.2.
 //
 // This is the first end-to-end path through the BRANCH pipeline.
-// Limitations: no compaction, no repeat resolution, no classifier
+// Limitations: no repeat resolution, no classifier
 // pass — pure "reads → graph". v0.3 layers those on top.
 
 #include <array>
@@ -22,6 +22,7 @@
 #include "graph/delta_read.hpp"
 #include "graph/graph_builder.hpp"
 #include "graph/graph_io.hpp"
+#include "graph/graph_compactor.hpp"
 #include "graph/lossless_graph.hpp"
 #include "io/bam_reader.hpp"
 #include "io/fastq_reader.hpp"
@@ -48,7 +49,7 @@ void print_assemble_usage(std::ostream& os) {
           "  --paf   <path>  Write backend overlap pairs as PAF-12 (pre-graph-build).\n"
           "  --paths <path>  Write per-read graph paths as TSV: read_name\\tnode_ids\\tn_deltas.\n"
           "\nv0.2 notes:\n"
-          "  - No compaction, no repeat resolution. Raw read-level graph.\n";
+          "  - Unitig compaction enabled. No repeat resolution.\n";
 }
 
 struct Args {
@@ -205,23 +206,32 @@ int run_assemble(int argc, char** argv) {
         });
     }
     auto build = branch::graph::build_graph(metas, overlaps);
-    std::cerr << "[branch assemble] nodes=" << build.graph.node_count()
-              << " edges=" << build.graph.edge_count() << "\n";
+    std::cerr << "[branch assemble] raw_nodes=" << build.graph.node_count()
+              << " raw_edges=" << build.graph.edge_count() << "\n";
+
+    // 4b. Compact unitigs (collapse linear chains).
+    auto compaction = branch::graph::compact_unitigs_with_sequences(
+        build.graph, store.sequences);
+    std::cerr << "[branch assemble] compacted_nodes=" << compaction.compacted.node_count()
+              << " compacted_edges=" << compaction.compacted.edge_count() << "\n";
+
+    // Use compacted graph for output
+    const auto& final_graph = compaction.compacted;
 
     // 5. Write GFA.
-    if (!branch::graph::write_gfa(build.graph, a.out)) {
+    if (!branch::graph::write_gfa(final_graph, a.out)) {
         std::cerr << "branch assemble: failed to write " << a.out << "\n";
         return 5;
     }
 
     // 5b. Optional BED sidecar (post-graph-build, per-node).
     if (!a.bed_path.empty()) {
-        if (!branch::graph::write_bed(build.graph, a.bed_path)) {
+        if (!branch::graph::write_bed(final_graph, a.bed_path)) {
             std::cerr << "branch assemble: failed to write BED " << a.bed_path << "\n";
             return 8;
         }
         std::cerr << "[branch assemble] wrote BED " << a.bed_path
-                  << " (" << build.graph.node_count() << " nodes)\n";
+                  << " (" << final_graph.node_count() << " nodes)\n";
     }
 
     // 5c. Populate ReadPaths from overlap pairs (v0.2 best-effort; deltas
