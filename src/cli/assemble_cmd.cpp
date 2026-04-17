@@ -22,6 +22,7 @@
 #include "graph/delta_read.hpp"
 #include "graph/graph_builder.hpp"
 #include "graph/graph_io.hpp"
+#include "graph/graph_filter.hpp"
 #include "graph/graph_compactor.hpp"
 #include "graph/lossless_graph.hpp"
 #include "io/bam_reader.hpp"
@@ -208,6 +209,12 @@ int run_assemble(int argc, char** argv) {
     auto build = branch::graph::build_graph(metas, overlaps);
     std::cerr << "[branch assemble] raw_nodes=" << build.graph.node_count()
               << " raw_edges=" << build.graph.edge_count() << "\n";
+    // 4a-filter. Apply graph filtering (containment + transitive reduction).
+    auto filter_stats = branch::graph::filter_graph(build.graph);
+    std::cerr << "[branch assemble] filtered: edges_before=" << filter_stats.edges_before
+              << " edges_after=" << filter_stats.edges_after
+              << " contained_dropped=" << filter_stats.nodes_dropped_contained
+              << " transitive_removed=" << filter_stats.transitive_edges_removed << "\n";
 
     // 4b. Compact unitigs (collapse linear chains).
     auto compaction = branch::graph::compact_unitigs_with_sequences(
