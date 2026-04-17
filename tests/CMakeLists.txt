@@ -91,6 +91,12 @@ target_link_libraries(test_cpu_thread_determinism PRIVATE branch_backend branch_
 target_compile_features(test_cpu_thread_determinism PRIVATE cxx_std_20)
 gtest_discover_tests(test_cpu_thread_determinism)
 
+add_executable(test_project_report test_project_report.cpp)
+target_link_libraries(test_project_report PRIVATE branch_project GTest::gtest_main)
+target_compile_features(test_project_report PRIVATE cxx_std_20)
+target_include_directories(test_project_report PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_project_report)
+
 add_executable(test_graph_compactor test_graph_compactor.cpp)
 target_link_libraries(test_graph_compactor PRIVATE branch_graph GTest::gtest_main)
 target_compile_features(test_graph_compactor PRIVATE cxx_std_20)
