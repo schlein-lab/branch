@@ -15,6 +15,7 @@ namespace branch::cli {
 
 int run_analyze(int argc, char** argv);
 int run_assemble(int argc, char** argv);
+int run_project(int argc, char** argv);
 
 }  // namespace branch::cli
 
@@ -27,6 +28,7 @@ void print_usage(std::ostream& os) {
           "\nSubcommands:\n"
           "  analyze    paralog-aware CN inference from mosdepth regions\n"
           "  assemble   reads -> minimizer overlap -> lossless graph (GFA-1.2)\n"
+          "  project    three-layer reference projection (v0.4 in development)\n"
           "  version    print version and exit\n"
           "  help       print this help\n";
 }
@@ -52,6 +54,9 @@ int main(int argc, char** argv) {
     }
     if (sub == "assemble") {
         return branch::cli::run_assemble(argc - 1, argv + 1);
+    }
+    if (sub == "project") {
+        return branch::cli::run_project(argc - 1, argv + 1);
     }
     std::cerr << "Unknown subcommand: " << sub << "\n\n";
     print_usage(std::cerr);
