@@ -82,12 +82,15 @@ target_include_directories(branch_htslib INTERFACE "${BRANCH_HTSLIB_DIR}")
 # into libhts.a from third_party/htslib's bundled htscodecs sources (see
 # `htscodecs_bundled.mk` and the configure output `linking
 # htscodecs_bundled.mk to htscodecs.mk`). libdeflate is autodetected at
-# configure time, so we link it explicitly. zlib + libm + pthread round
-# out the base deps; bz2/lzma/curl/plugins were disabled at configure
-# time so we do not need them.
+# htslib configure time; probe for it here and only link if present so the
+# build works on hosts without libdeflate (e.g. HPC login nodes).
 target_link_libraries(branch_htslib INTERFACE
     "${BRANCH_HTSLIB_DIR}/libhts.a"
-    deflate z m pthread)
+    z m pthread)
+find_library(BRANCH_LIBDEFLATE NAMES deflate)
+if(BRANCH_LIBDEFLATE)
+    target_link_libraries(branch_htslib INTERFACE ${BRANCH_LIBDEFLATE})
+endif()
 
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
