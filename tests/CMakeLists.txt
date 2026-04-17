@@ -120,6 +120,14 @@ if(TARGET branch)
         GEN_FASTQ_BINARY="$<TARGET_FILE:generate_toy_fastq>")
     add_dependencies(test_e2e_assemble branch generate_toy_fastq)
     add_test(NAME E2E_Assemble COMMAND test_e2e_assemble)
+
+    add_executable(test_project_smoke test_project_smoke.cpp)
+    target_link_libraries(test_project_smoke PRIVATE GTest::gtest GTest::gtest_main)
+    target_compile_features(test_project_smoke PRIVATE cxx_std_20)
+    target_compile_definitions(test_project_smoke PRIVATE
+        BRANCH_BINARY="$<TARGET_FILE:branch>")
+    add_dependencies(test_project_smoke branch)
+    add_test(NAME ProjectSmoke COMMAND test_project_smoke)
 endif()
 
 add_executable(test_reference_aligner test_reference_aligner.cpp)
