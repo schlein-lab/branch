@@ -68,18 +68,31 @@ bool write_fasta(const LosslessGraph& graph,
 // ---------------------------------------------------------------------
 // BED writer.
 //
-// Nodes have no chrom coordinates in v0.2. Emits one BED line per
-// node with a placeholder chrom=NA, start=0, end=length_bp,
-// name=node_<id>, score=copy_count, strand=".". This lets downstream
-// tools parse the file; real genomic coordinates arrive in v0.3 once
-// the graph is aligned to a reference.
+// The placeholder variant emits one BED line per node with
+// chrom=NA, start=0, end=length_bp — kept for backwards compatibility
+// where no reference is supplied.
 //
-// TODO(v0.3): use real chrom/start/end once reference alignment exists.
+// write_bed_with_refs shells out to linear_mapper (minimap2) with the
+// per-Node consensus sequences and emits real genomic coordinates. A
+// node without a high-MAPQ hit falls back to chrom=NA.
 //
 // Returns false on write error.
 bool write_bed(const LosslessGraph& graph, std::ostream& out);
 
 bool write_bed(const LosslessGraph& graph, const std::string& path);
+
+// One (name, path) pair per linear reference. First hit by MAPQ wins
+// when multiple references map a node. refs listed earlier are tried
+// first (ties broken by order).
+struct BedLinearRef {
+    std::string name;
+    std::string path;
+};
+
+bool write_bed_with_refs(const LosslessGraph& graph,
+                         const std::vector<BedLinearRef>& refs,
+                         const std::string& path,
+                         int threads = 4);
 
 // ---------------------------------------------------------------------
 // PAF writer.
