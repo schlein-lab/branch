@@ -5,6 +5,7 @@
 add_library(branch_project STATIC
     project_cmd.cpp
     linear_mapper.cpp
+    pangenome_mapper.cpp
     project_report.cpp
 )
 

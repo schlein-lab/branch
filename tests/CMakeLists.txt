@@ -141,6 +141,12 @@ target_compile_features(test_linear_mapper PRIVATE cxx_std_20)
 target_include_directories(test_linear_mapper PRIVATE ${CMAKE_SOURCE_DIR}/src)
 gtest_discover_tests(test_linear_mapper)
 
+add_executable(test_pangenome_mapper test_pangenome_mapper.cpp)
+target_link_libraries(test_pangenome_mapper PRIVATE branch_project GTest::gtest_main)
+target_compile_features(test_pangenome_mapper PRIVATE cxx_std_20)
+target_include_directories(test_pangenome_mapper PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_pangenome_mapper)
+
 
 add_executable(test_vpcr test_vpcr.cpp)
 target_link_libraries(test_vpcr PRIVATE branch_vpcr GTest::gtest_main)

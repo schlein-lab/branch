@@ -1,61 +1,47 @@
-// BRANCH v0.4 — Pangenome mapping via minigraph/GraphAligner.
-//
-// Maps branch consensus sequences to HPRC v1.1 pangenome graphs (GBZ format).
-// Identifies the closest haplotype path for each branch.
+// BRANCH v0.4 — Pangenome mapper for `branch project`.
+// Shell-out to GraphAligner or minigraph, parse GAF, return mappings.
 
-#pragma once
+#ifndef BRANCH_PROJECT_PANGENOME_MAPPER_HPP
+#define BRANCH_PROJECT_PANGENOME_MAPPER_HPP
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace branch::project {
 
-/// Pangenome mapping backend selection.
-enum class PangenomeMapper {
-    Minigraph,      ///< minigraph -c (fast, CIGAR-free)
-    GraphAligner,   ///< GraphAligner (high precision for HiFi)
+struct PangenomeMapping {
+    std::string branch_id;     // query name (branch ID from FASTA)
+    std::string ref_name;      // logical name (HPRC-CHM13, HPRC-GRCh38, ...)
+    std::string path_names;    // HPRC haplotype path (e.g., ">HG00733#1#chr1...")
+    std::int64_t path_start = 0;
+    std::int64_t path_end = 0;
+    int mapq = 0;
+    double identity = 0.0;
+    std::int64_t query_len = 0;
 };
 
-/// Represents a pangenome reference configuration.
 struct PangenomeRef {
-    std::string name;      ///< Reference backbone name (e.g., "CHM13-based", "GRCh38-based")
-    std::string gbz_path;  ///< Path to .gbz file
+    std::string name;       // user-tag (HPRC-CHM13, HPRC-GRCh38)
+    std::string gbz_path;   // .gbz / .gfa
 };
 
-/// Result of pangenome mapping for a single branch.
-struct PangenomeMapResult {
-    std::string branch_id;
-    std::string closest_path;   ///< HPRC haplotype path (e.g., "HG00733#1#chr1:...")
-    int mapq{0};
-    double identity{0.0};
-    std::string gaf_line;       ///< Raw GAF record
+struct PangenomeMapOptions {
+    std::string tool = "GraphAligner";      // "GraphAligner" or "minigraph"
+    std::string tool_path = "GraphAligner"; // binary path
+    int threads = 4;
+    int min_mapq = 0;                       // caller filters UNANNOTATED
 };
 
-/// Configuration for pangenome mapping.
-struct PangenomeMapperConfig {
-    std::vector<PangenomeRef> references;
-    std::string fasta_path;           ///< Branch consensus FASTA
-    std::string output_gaf;           ///< Output GAF path
-    PangenomeMapper mapper{PangenomeMapper::Minigraph};
-    int threads{1};
-    std::string minigraph_path{"minigraph"};
-    std::string graphaligner_path{"GraphAligner"};
-};
-
-/// Run pangenome mapping on all branches.
-///
-/// @param config  Mapping configuration
-/// @return true on success, false on error
-///
-/// TODO: Implement in v0.4
-bool run_pangenome_mapping(const PangenomeMapperConfig& config);
-
-/// Parse a GAF file and extract per-branch mapping statistics.
-///
-/// @param gaf_path  Path to GAF file
-/// @return Vector of mapping results
-///
-/// TODO: Implement in v0.4
-std::vector<PangenomeMapResult> parse_pangenome_gaf(const std::string& gaf_path);
+// Map one branch FASTA against all given pangenome refs. Returns mappings
+// sorted by (ref_name, branch_id, path_start). Shell-out to GraphAligner
+// (default) or minigraph.
+std::vector<PangenomeMapping> map_branches_pangenome(
+    const std::string& fasta_path,
+    const std::vector<PangenomeRef>& refs,
+    const PangenomeMapOptions& opts,
+    std::string* err_out);
 
 }  // namespace branch::project
+
+#endif
