@@ -46,7 +46,9 @@ void print_assemble_usage(std::ostream& os) {
           "                  read's original sequencing orientation.\n"
           "\nOptional output sidecars:\n"
           "  --fasta <path>  Write input reads as FASTA (one record per read, 80-col wrap).\n"
-          "  --bed   <path>  Write per-node BED (chrom=NA placeholder until v0.3).\n"
+          "  --fasta-consensus <path>  Write per-node consensus FASTA (post-compaction).\n"
+          "  --bed   <path>  Write per-node BED (chrom=NA by default; see --ref-linear).\n"
+          "  --ref-linear name=path  Linear reference for BED chrom/start/end (repeatable).\n"
           "  --paf   <path>  Write backend overlap pairs as PAF-12 (pre-graph-build).\n"
           "  --paths <path>  Write per-read graph paths as TSV: read_name\\tnode_ids\\tn_deltas.\n"
           "\nv0.2 notes:\n"
@@ -60,6 +62,7 @@ struct Args {
     std::size_t max_reads{0};       // 0 = no cap
     std::size_t max_overlaps{10'000'000};
     std::string fasta_path;
+    std::string fasta_consensus_path;
     std::string bed_path;
     std::string paf_path;
     std::string paths_path;
@@ -84,6 +87,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--max-reads"){ auto v = needs("--max-reads");     if (!v) return a; a.max_reads = std::strtoull(v, nullptr, 10); }
         else if (k == "--max-overlaps"){ auto v = needs("--max-overlaps"); if (!v) return a; a.max_overlaps = std::strtoull(v, nullptr, 10); }
         else if (k == "--fasta")    { auto v = needs("--fasta");         if (!v) return a; a.fasta_path = v; }
+        else if (k == "--fasta-consensus") { auto v = needs("--fasta-consensus"); if (!v) return a; a.fasta_consensus_path = v; }
         else if (k == "--bed")      { auto v = needs("--bed");           if (!v) return a; a.bed_path = v; }
         else if (k == "--paf")      { auto v = needs("--paf");           if (!v) return a; a.paf_path = v; }
         else if (k == "--paths")    { auto v = needs("--paths");         if (!v) return a; a.paths_path = v; }
@@ -272,6 +276,25 @@ int run_assemble(int argc, char** argv) {
                   << " (" << final_graph.node_count() << " nodes"
                   << (a.ref_linear.empty() ? "" : ", ref-linear mapped")
                   << ")\n";
+    }
+
+    // 5b-bis. Optional consensus-FASTA sidecar (one record per Node
+    // with a non-empty consensus). Emitted post-compaction so the
+    // consensus reflects unitig-collapsed sequences.
+    if (!a.fasta_consensus_path.empty()) {
+        if (!branch::graph::write_fasta_consensus(final_graph,
+                                                   a.fasta_consensus_path)) {
+            std::cerr << "branch assemble: failed to write consensus FASTA "
+                      << a.fasta_consensus_path << "\n";
+            return 9;
+        }
+        std::size_t consensus_nodes = 0;
+        for (const auto& n : final_graph.nodes()) {
+            if (!n.consensus.empty()) ++consensus_nodes;
+        }
+        std::cerr << "[branch assemble] wrote consensus FASTA "
+                  << a.fasta_consensus_path
+                  << " (" << consensus_nodes << " nodes)\n";
     }
 
     // 5c. Populate ReadPaths from overlap pairs (v0.2 best-effort; deltas
