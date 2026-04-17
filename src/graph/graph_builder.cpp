@@ -19,10 +19,12 @@ BuildResult build_graph(std::span<const ReadMeta> reads,
     r.read_to_node.assign(static_cast<std::size_t>(max_id) + 1,
                           std::numeric_limits<NodeId>::max());
 
-    // Allocate one node per read. Overlap-derived node attributes are
-    // filled in later passes (unitig compaction, CN inference).
+    // Allocate one node per read. Each node starts with read_support = 1
+    // because exactly one read generated it. Overlap-derived node attributes
+    // are filled in later passes (unitig compaction, CN inference).
     for (const auto& rm : reads) {
         NodeId nid = r.graph.add_node(rm.length_bp);
+        r.graph.node(nid).read_support = 1;
         r.read_to_node[rm.read_id] = nid;
     }
 
