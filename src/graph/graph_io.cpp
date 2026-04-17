@@ -411,8 +411,14 @@ bool write_bed_with_refs(const LosslessGraph& graph,
 //   alnlen  = overlap_len
 //   mapq    = min(60, int((matches / overlap_len) * 60))
 //
-// TODO(v0.3): propagate per-side strand from minimizer_sketcher so
-// the '+'/'-' column is accurate at sub-read granularity.
+// The strand column is the cluster-majority XOR of per-minimizer strand
+// bits computed upstream in the backend (cpu_backend.cpp). '+' means
+// read_a and read_b's canonical minimizers agree on orientation;
+// '-' means they are on opposite canonical strands, i.e. the query is
+// reverse-complement-aligned to the target. Accuracy is already at
+// minimizer granularity because each MinimizerHit carries its strand
+// bit from canonical_hash_with_strand; only chimeric (split-strand)
+// reads would need multi-line PAF output, which is out of scope here.
 
 bool write_paf(const std::vector<branch::backend::OverlapPair>& pairs,
                const std::vector<std::string>& sequences,

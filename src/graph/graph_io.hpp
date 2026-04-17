@@ -111,9 +111,11 @@ bool write_bed_with_refs(const LosslessGraph& graph,
 // and `names`). Columns:
 //   qname qlen qstart qend strand tname tlen tstart tend matches alnlen mapq
 //
-// v0.2 assumptions:
-//   - strand '+' or '-' is taken from OverlapPair::strand (0 = +, 1 = -).
-//     TODO(v0.3): propagate per-side strand from minimizer_sketcher.
+// Behaviour:
+//   - strand '+' or '-' is the cluster-majority XOR of per-minimizer
+//     strand bits from OverlapPair::strand (0 = same strand / '+',
+//     1 = opposite strand / '-'). Minimizer strand is already per-hit
+//     via canonical_hash_with_strand, so pair-level strand is accurate.
 //   - matches is estimated as overlap_len - diff_count (best-effort;
 //     the real aligner computes a precise value later).
 //   - mapq is derived from identity = matches/overlap_len via
