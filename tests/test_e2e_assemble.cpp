@@ -329,4 +329,94 @@ TEST_F(E2EAssemble, E2E_missing_input_fails_cleanly) {
         << "stderr should mention missing file, got:\n" << r.stderr_text;
 }
 
+TEST_F(E2EAssemble, E2E_threads_and_fasta_consensus_sidecar) {
+    // Exercises the Phase-0 fixes end-to-end via the real binary:
+    //   --threads 4 -> parallel read sketching path in cpu_backend
+    //   --fasta-consensus -> per-node consensus FASTA sidecar
+    //   --bed -> chrom=NA fallback (no --ref-linear supplied)
+    ASSERT_NO_FATAL_FAILURE(generate("mt.fastq", /*seed=*/17,
+                                     /*n_reads=*/12,
+                                     /*read_len=*/800,
+                                     /*mean_overlap=*/400));
+
+    const auto in_fastq = tmpdir_ / "mt.fastq";
+    const auto out_gfa = tmpdir_ / "mt.gfa";
+    const auto out_bed = tmpdir_ / "mt.bed";
+    const auto out_cons = tmpdir_ / "mt.consensus.fa";
+
+    std::vector<std::string> argv = {
+        BRANCH_BINARY,
+        "assemble",
+        "--fastq", in_fastq.string(),
+        "--out", out_gfa.string(),
+        "--bed", out_bed.string(),
+        "--fasta-consensus", out_cons.string(),
+        "--threads", "4",
+    };
+    auto r = run_capture(argv);
+    ASSERT_EQ(r.exit_code, 0)
+        << "branch assemble multi-threaded sidecar run failed (exit "
+        << r.exit_code << ")\nstderr:\n" << r.stderr_text;
+
+    ASSERT_TRUE(fs::exists(out_gfa));
+    ASSERT_GT(fs::file_size(out_gfa), 0u);
+
+    ASSERT_TRUE(fs::exists(out_bed)) << "BED sidecar missing";
+    const std::string bed = read_file(out_bed);
+    // Without --ref-linear, every row must carry the chrom=NA fallback.
+    EXPECT_NE(bed.find("NA\t"), std::string::npos)
+        << "BED should contain NA placeholder rows without --ref-linear";
+
+    ASSERT_TRUE(fs::exists(out_cons)) << "consensus FASTA sidecar missing";
+    const std::string cons = read_file(out_cons);
+    // Consensus FASTA may be empty if no node has consensus, but the
+    // file must still exist and the command must have completed.
+    (void)cons;
+}
+
+TEST_F(E2EAssemble, E2E_output_deterministic_across_thread_counts) {
+    // Same input, two runs with threads=1 vs threads=4: the GFA and
+    // PAF sidecars must be byte-identical. Locks in commit 3627e20
+    // (RAM determinism) + a3da9b9 (CPU parallelisation) at the binary
+    // integration level.
+    ASSERT_NO_FATAL_FAILURE(generate("det.fastq", /*seed=*/101,
+                                     /*n_reads=*/15,
+                                     /*read_len=*/600,
+                                     /*mean_overlap=*/300));
+    const auto in_fastq = tmpdir_ / "det.fastq";
+    const auto single_gfa = tmpdir_ / "det_single.gfa";
+    const auto single_paf = tmpdir_ / "det_single.paf";
+    const auto multi_gfa  = tmpdir_ / "det_multi.gfa";
+    const auto multi_paf  = tmpdir_ / "det_multi.paf";
+
+    auto run_with_threads = [&](const fs::path& gfa, const fs::path& paf,
+                                const char* t) {
+        std::vector<std::string> argv = {
+            BRANCH_BINARY, "assemble",
+            "--fastq", in_fastq.string(),
+            "--out", gfa.string(),
+            "--paf", paf.string(),
+            "--threads", t,
+        };
+        return run_capture(argv);
+    };
+
+    auto r1 = run_with_threads(single_gfa, single_paf, "1");
+    ASSERT_EQ(r1.exit_code, 0) << r1.stderr_text;
+    auto r4 = run_with_threads(multi_gfa, multi_paf, "4");
+    ASSERT_EQ(r4.exit_code, 0) << r4.stderr_text;
+
+    ASSERT_TRUE(fs::exists(single_gfa));
+    ASSERT_TRUE(fs::exists(multi_gfa));
+    ASSERT_TRUE(fs::exists(single_paf));
+    ASSERT_TRUE(fs::exists(multi_paf));
+
+    EXPECT_EQ(read_file(single_gfa), read_file(multi_gfa))
+        << "GFA output differs between --threads 1 and --threads 4 — "
+           "binary output is not thread-count-invariant";
+    EXPECT_EQ(read_file(single_paf), read_file(multi_paf))
+        << "PAF output differs between --threads 1 and --threads 4 — "
+           "binary output is not thread-count-invariant";
+}
+
 }  // namespace
