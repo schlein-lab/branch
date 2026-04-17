@@ -264,6 +264,7 @@ bool write_fasta_consensus(const LosslessGraph& graph,
 // out to minimap2 via linear_mapper to produce real genomic coords.
 
 bool write_bed(const LosslessGraph& graph, std::ostream& out) {
+    std::size_t na_rows = 0;
     for (const auto& node : graph.nodes()) {
         out << "NA" << '\t'
             << 0 << '\t'
@@ -271,6 +272,15 @@ bool write_bed(const LosslessGraph& graph, std::ostream& out) {
             << "node_" << node.id << '\t'
             << node.copy_count << '\t'
             << '.' << '\n';
+        ++na_rows;
+    }
+    if (na_rows > 0) {
+        // Finding 4: the no-ref path always emits chrom=NA by construction.
+        // The nicer write_bed_with_refs path (below) runs minimap2 when
+        // --ref-linear is supplied; see assemble CLI for wiring.
+        std::cerr << "BRANCH: " << na_rows
+                  << " contigs lacked reference mapping; chrom=NA in BED "
+                     "output. Pass --ref-linear <path.fa> to resolve.\n";
     }
     return out.good();
 }
@@ -375,15 +385,26 @@ bool write_bed_with_refs(const LosslessGraph& graph,
     };
     std::vector<BedRow> rows;
     rows.reserve(graph.nodes().size());
+    std::size_t na_rows = 0;
+    std::size_t empty_consensus = 0;
     for (const auto& node : graph.nodes()) {
         const std::string node_name = "node_" + std::to_string(node.id);
         auto it = best_by_node.find(node_name);
         if (it == best_by_node.end()) {
+            // Either the node had no consensus (skipped in
+            // dump_node_consensus_fasta) or minimap2 found no hit.
+            // Consensus gaps cascade from Finding 1 (unitig collapse) —
+            // graph_compactor.cpp leaves consensus empty when seqs is
+            // empty. See feat/compactor-debug branch for the upstream
+            // fix; once that lands the empty-consensus counter should
+            // drop to zero and only genuine no-hit cases remain.
+            if (node.consensus.empty()) ++empty_consensus;
             rows.push_back({"NA", 0,
                             static_cast<std::int64_t>(node.length_bp),
                             node_name,
                             static_cast<int>(node.copy_count),
                             '.'});
+            ++na_rows;
         } else {
             rows.push_back({it->second.target,
                             it->second.target_start,
@@ -392,6 +413,18 @@ bool write_bed_with_refs(const LosslessGraph& graph,
                             it->second.mapq,
                             it->second.strand});
         }
+    }
+
+    if (na_rows > 0) {
+        std::cerr << "BRANCH: " << na_rows
+                  << " contigs lacked reference mapping; chrom=NA in BED "
+                     "output";
+        if (empty_consensus > 0) {
+            std::cerr << " (" << empty_consensus
+                      << " due to empty consensus — cascades from Finding 1 "
+                         "unitig collapse, see feat/compactor-debug)";
+        }
+        std::cerr << ".\n";
     }
 
     std::sort(rows.begin(), rows.end(),
