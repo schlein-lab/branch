@@ -39,4 +39,4 @@ Central question: is a pair of parallel paths a true branch, a duplication, or a
 - ASan + TSan required for every CI run.
 
 ## HPC
-Hummel-2 cluster, SLURM, BeeGFS storage. Containers via Apptainer with `--nv` for CUDA. Jobs bind `/beegfs`; `TMPDIR=/tmp`; home is read-only inside jobs.
+Targets a SLURM-scheduled cluster with a parallel filesystem. Containers via Apptainer with `--nv` for CUDA. Jobs bind the site's shared filesystem; `TMPDIR=/tmp`; home should be treated as read-only inside jobs.
