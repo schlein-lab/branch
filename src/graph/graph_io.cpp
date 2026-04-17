@@ -6,11 +6,17 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
+#include <unistd.h>
+
+#include "project/linear_mapper.hpp"
 
 namespace branch::graph {
 
@@ -237,6 +243,134 @@ bool write_bed(const LosslessGraph& graph, const std::string& path) {
     std::ofstream ofs(path);
     if (!ofs) return false;
     return write_bed(graph, ofs);
+}
+
+// =====================================================================
+// BED writer with linear references
+// =====================================================================
+//
+// Writes a BED file with real chrom/start/end derived from minimap2
+// mappings of each Node's consensus sequence. Nodes lacking a consensus
+// or without a mapping fall through to the NA-placeholder row so the
+// file still has one line per node.
+
+namespace {
+
+// Write node consensus sequences into a temp FASTA. Returns the path.
+// Nodes without consensus are skipped. The returned path must be
+// removed by the caller.
+std::string dump_node_consensus_fasta(const LosslessGraph& graph) {
+    namespace fs = std::filesystem;
+    std::string path = (fs::temp_directory_path() /
+                        ("branch_nodes_" +
+                         std::to_string(::getpid()) + "_" +
+                         std::to_string(reinterpret_cast<std::uintptr_t>(&graph)) +
+                         ".fa")).string();
+    std::ofstream ofs(path);
+    if (!ofs) return {};
+    for (const auto& node : graph.nodes()) {
+        if (node.consensus.empty()) continue;
+        ofs << '>' << "node_" << node.id << '\n'
+            << node.consensus << '\n';
+    }
+    ofs.close();
+    return ofs ? path : std::string{};
+}
+
+}  // namespace
+
+bool write_bed_with_refs(const LosslessGraph& graph,
+                         const std::vector<BedLinearRef>& refs,
+                         const std::string& path,
+                         int threads) {
+    if (refs.empty()) {
+        return write_bed(graph, path);
+    }
+
+    const std::string fasta_path = dump_node_consensus_fasta(graph);
+    if (fasta_path.empty()) {
+        return write_bed(graph, path);
+    }
+
+    std::vector<branch::project::LinearRef> pm_refs;
+    pm_refs.reserve(refs.size());
+    for (const auto& r : refs) {
+        pm_refs.push_back({r.name, r.path});
+    }
+
+    branch::project::LinearMapOptions opts;
+    opts.threads = threads;
+
+    std::string err;
+    auto mappings = branch::project::map_branches_linear(
+        fasta_path, pm_refs, opts, &err);
+
+    std::error_code ec;
+    std::filesystem::remove(fasta_path, ec);
+
+    // Rank: best MAPQ wins; ties broken by ref order in `refs`.
+    std::map<std::string, std::size_t> ref_rank;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+        ref_rank[refs[i].name] = i;
+    }
+
+    std::map<std::string, branch::project::LinearMapping> best_by_node;
+    for (auto& m : mappings) {
+        auto it = best_by_node.find(m.branch_id);
+        if (it == best_by_node.end()) {
+            best_by_node.emplace(m.branch_id, std::move(m));
+            continue;
+        }
+        auto& cur = it->second;
+        if (m.mapq > cur.mapq ||
+            (m.mapq == cur.mapq &&
+             ref_rank[m.ref_name] < ref_rank[cur.ref_name])) {
+            cur = std::move(m);
+        }
+    }
+
+    struct BedRow {
+        std::string chrom;
+        std::int64_t start;
+        std::int64_t end;
+        std::string name;
+        int score;
+        char strand;
+    };
+    std::vector<BedRow> rows;
+    rows.reserve(graph.nodes().size());
+    for (const auto& node : graph.nodes()) {
+        const std::string node_name = "node_" + std::to_string(node.id);
+        auto it = best_by_node.find(node_name);
+        if (it == best_by_node.end()) {
+            rows.push_back({"NA", 0,
+                            static_cast<std::int64_t>(node.length_bp),
+                            node_name,
+                            static_cast<int>(node.copy_count),
+                            '.'});
+        } else {
+            rows.push_back({it->second.target,
+                            it->second.target_start,
+                            it->second.target_end,
+                            node_name,
+                            it->second.mapq,
+                            it->second.strand});
+        }
+    }
+
+    std::sort(rows.begin(), rows.end(),
+              [](const BedRow& a, const BedRow& b) {
+                  if (a.chrom != b.chrom) return a.chrom < b.chrom;
+                  return a.start < b.start;
+              });
+
+    std::ofstream ofs(path);
+    if (!ofs) return false;
+    for (const auto& r : rows) {
+        ofs << r.chrom << '\t' << r.start << '\t' << r.end << '\t'
+            << r.name << '\t' << r.score << '\t' << r.strand << '\n';
+    }
+    return ofs.good();
 }
 
 // =====================================================================

@@ -64,6 +64,8 @@ struct Args {
     std::string paf_path;
     std::string paths_path;
     std::string reference_path;  // Reference FASTA for alignment
+    std::vector<std::pair<std::string, std::string>> ref_linear;  // name,path pairs
+    int threads{4};
     bool ok{false};
     std::string err;
 };
@@ -86,6 +88,20 @@ Args parse(int argc, char** argv) {
         else if (k == "--paf")      { auto v = needs("--paf");           if (!v) return a; a.paf_path = v; }
         else if (k == "--paths")    { auto v = needs("--paths");         if (!v) return a; a.paths_path = v; }
         else if (k == "--reference"){ auto v = needs("--reference");     if (!v) return a; a.reference_path = v; }
+        else if (k == "--ref-linear"){ auto v = needs("--ref-linear");   if (!v) return a;
+            std::string spec(v);
+            auto eq = spec.find('=');
+            if (eq == std::string::npos) {
+                auto slash = spec.rfind('/');
+                std::string name = (slash != std::string::npos) ? spec.substr(slash + 1) : spec;
+                auto dot = name.rfind('.');
+                if (dot != std::string::npos) name = name.substr(0, dot);
+                a.ref_linear.emplace_back(name, spec);
+            } else {
+                a.ref_linear.emplace_back(spec.substr(0, eq), spec.substr(eq + 1));
+            }
+        }
+        else if (k == "--threads" || k == "-t") { auto v = needs("--threads"); if (!v) return a; a.threads = std::atoi(v); }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -231,14 +247,31 @@ int run_assemble(int argc, char** argv) {
         return 5;
     }
 
-    // 5b. Optional BED sidecar (post-graph-build, per-node).
+    // 5b. Optional BED sidecar (post-graph-build, per-node). With --ref-linear
+    // the nodes' consensus sequences are mapped to the supplied references and
+    // real chrom/start/end are emitted. Without --ref-linear the chrom=NA
+    // placeholder row is written (backwards compat).
     if (!a.bed_path.empty()) {
-        if (!branch::graph::write_bed(final_graph, a.bed_path)) {
+        bool bed_ok = false;
+        if (!a.ref_linear.empty()) {
+            std::vector<branch::graph::BedLinearRef> refs;
+            refs.reserve(a.ref_linear.size());
+            for (const auto& [name, path] : a.ref_linear) {
+                refs.push_back({name, path});
+            }
+            bed_ok = branch::graph::write_bed_with_refs(
+                final_graph, refs, a.bed_path, a.threads);
+        } else {
+            bed_ok = branch::graph::write_bed(final_graph, a.bed_path);
+        }
+        if (!bed_ok) {
             std::cerr << "branch assemble: failed to write BED " << a.bed_path << "\n";
             return 8;
         }
         std::cerr << "[branch assemble] wrote BED " << a.bed_path
-                  << " (" << final_graph.node_count() << " nodes)\n";
+                  << " (" << final_graph.node_count() << " nodes"
+                  << (a.ref_linear.empty() ? "" : ", ref-linear mapped")
+                  << ")\n";
     }
 
     // 5c. Populate ReadPaths from overlap pairs (v0.2 best-effort; deltas
