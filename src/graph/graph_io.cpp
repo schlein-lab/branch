@@ -24,16 +24,21 @@ bool write_gfa(const LosslessGraph& graph, std::ostream& out) {
     out << "H\tVN:Z:1.2\n";
 
     for (const auto& node : graph.nodes()) {
-        out << "S\t" << node.id
-            << "\t*"  // placeholder sequence
-            << "\tLN:i:" << node.length_bp
+        // GFA S-line column 3 is the sequence. Emit the Node's consensus
+        // when it's available (post-compaction); otherwise '*' marks an
+        // unknown/not-yet-computed sequence per GFA spec.
+        out << "S\t" << node.id << '\t';
+        if (!node.consensus.empty()) {
+            out << node.consensus;
+        } else {
+            out << '*';
+        }
+        out << "\tLN:i:" << node.length_bp
             << "\tRC:i:" << node.read_support
             << "\tCN:i:" << node.copy_count
-            << "\tCV:f:" << std::fixed << std::setprecision(3) << node.copy_count_confidence;
-        if (!node.consensus.empty()) {
-            out << "\tCS:Z:" << node.consensus;
-        }
-        out << '\n';
+            << "\tCV:f:" << std::fixed << std::setprecision(3)
+            << node.copy_count_confidence
+            << '\n';
     }
 
     for (std::size_t i = 0; i < graph.edges().size(); ++i) {
@@ -145,7 +150,14 @@ bool read_gfa(LosslessGraph& graph, std::istream& in) {
             n.read_support = rc;
             n.copy_count = cn;
             n.copy_count_confidence = cv;
-            n.consensus = std::move(cs);
+            // Prefer the sequence in column 3 (real GFA consensus) over
+            // the legacy CS:Z tag — older BRANCH outputs used CS:Z with
+            // '*' in column 3, so fall back to cs when column 3 is '*'.
+            if (!seq.empty() && seq != "*") {
+                n.consensus = std::move(seq);
+            } else {
+                n.consensus = std::move(cs);
+            }
 
         } else if (record_type == 'L') {
             std::uint32_t from{}, to{};
