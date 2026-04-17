@@ -94,6 +94,12 @@ endif()
 
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
+# OpenMP — required for parallel hotpaths in graph_filter / graph_compactor.
+# Without this the transitive-reduction + unitig-consensus passes sit at
+# ~6 % CPU on 32-thread nodes (one core used, the rest idle).
+find_package(OpenMP REQUIRED)
+
+# ------------------------------------------------------------------------------
 # minimap2 (FetchContent for ksw2 alignment)
 # ------------------------------------------------------------------------------
 include(FetchContent)

@@ -31,6 +31,8 @@
 #include <limits>
 #include <vector>
 
+#include <omp.h>
+
 namespace branch::graph {
 
 namespace {
@@ -95,13 +97,26 @@ std::vector<std::uint8_t> mark_contained(const LosslessGraph& g,
         }
     }
 
+    // Per-node successor set for O(1) has_out_edge. Without this the inner
+    // `covers_all` loop did a linear scan over out_edges[pred] for each
+    // successor of v, giving O(V · E_in · E_out²) worst case. Build once,
+    // query O(log) (sorted vector + binary search — preferred over
+    // unordered_set for cache and parallelism reasons).
+    std::vector<std::vector<NodeId>> out_succ(n);
+    for (NodeId u = 0; u < static_cast<NodeId>(n); ++u) {
+        out_succ[u].reserve(out_edges[u].size());
+        for (std::size_t ei : out_edges[u]) out_succ[u].push_back(edges[ei].to);
+        std::sort(out_succ[u].begin(), out_succ[u].end());
+        out_succ[u].erase(std::unique(out_succ[u].begin(), out_succ[u].end()),
+                          out_succ[u].end());
+    }
     auto has_out_edge = [&](NodeId pred, NodeId succ) -> bool {
-        for (std::size_t ei : out_edges[pred]) {
-            if (edges[ei].to == succ) return true;
-        }
-        return false;
+        return std::binary_search(out_succ[pred].begin(), out_succ[pred].end(), succ);
     };
 
+    // Writes to `dropped` are idempotent (0 → 1) — concurrent threads
+    // setting the same entry produce the same outcome.
+    #pragma omp parallel for schedule(dynamic, 64)
     for (NodeId v = 0; v < static_cast<NodeId>(n); ++v) {
         if (in_edges[v].empty()) continue;
         const std::uint32_t vlen = g.node(v).length_bp;
@@ -147,68 +162,74 @@ std::vector<Edge> reduce_transitive_edges(const LosslessGraph& g,
     OutAdjacency adj = build_out_adjacency(n, edges);
 
     // Mark, per edge, whether it is a transitive (redundant) edge.
+    // Writes are idempotent (0 → 1) so concurrent threads marking the same
+    // edge is benign — race gives the same outcome either way.
     std::vector<std::uint8_t> is_transitive(edges.size(), 0);
 
     // For quick "direct A->C length" lookup for a fixed source A, we
     // build a flat "direct_to_len" table keyed by destination NodeId.
-    // We only need it to contain A's direct successors at any time.
-    // Using sentinel max() to mean "no direct edge".
+    // Parallel version: each thread gets its own table allocated inside
+    // the parallel region. Before, this was a single shared pair of
+    // vectors that forced the whole outer loop to be sequential and
+    // pinned one core at 100% while the other 31 sat idle.
     const std::uint64_t kNoEdge = std::numeric_limits<std::uint64_t>::max();
-    std::vector<std::uint64_t> direct_to_len(n, kNoEdge);
-    std::vector<std::size_t>   direct_to_edge(n, 0);
 
-    for (NodeId a = 0; a < static_cast<NodeId>(n); ++a) {
-        const std::size_t o_begin = adj.offsets[a];
-        const std::size_t o_end   = adj.offsets[a + 1];
-        if (o_end - o_begin < 2) continue;  // need >=2 successors to reduce
+    #pragma omp parallel
+    {
+        std::vector<std::uint64_t> direct_to_len(n, kNoEdge);
+        std::vector<std::size_t>   direct_to_edge(n, 0);
 
-        // Populate direct_to_len for every successor of A.
-        for (std::size_t k = o_begin; k < o_end; ++k) {
-            const Edge& e = edges[adj.indices[k]];
-            // Per-step length proxy: length_bp of the target node.
-            // (With offset-aware edges this would be the overlap
-            // "advance" distance instead.)
-            direct_to_len[e.to] = g.node(e.to).length_bp;
-            direct_to_edge[e.to] = adj.indices[k];
-        }
+        #pragma omp for schedule(dynamic, 64)
+        for (NodeId a = 0; a < static_cast<NodeId>(n); ++a) {
+            const std::size_t o_begin = adj.offsets[a];
+            const std::size_t o_end   = adj.offsets[a + 1];
+            if (o_end - o_begin < 2) continue;  // need >=2 successors to reduce
 
-        // For each pair (A->B, B->C), test if A has a direct A->C
-        // whose length is within [ len(A->B) + len(B->C) - fuzz,
-        //                         len(A->B) + len(B->C) + fuzz ].
-        // If so, mark the direct A->C as transitive.
-        for (std::size_t kb = o_begin; kb < o_end; ++kb) {
-            const Edge& eab = edges[adj.indices[kb]];
-            NodeId b = eab.to;
-            const std::uint64_t len_ab = g.node(b).length_bp;
+            // Populate direct_to_len for every successor of A.
+            for (std::size_t k = o_begin; k < o_end; ++k) {
+                const Edge& e = edges[adj.indices[k]];
+                direct_to_len[e.to] = g.node(e.to).length_bp;
+                direct_to_edge[e.to] = adj.indices[k];
+            }
 
-            const std::size_t bo_begin = adj.offsets[b];
-            const std::size_t bo_end   = adj.offsets[b + 1];
-            for (std::size_t kc = bo_begin; kc < bo_end; ++kc) {
-                const Edge& ebc = edges[adj.indices[kc]];
-                NodeId c = ebc.to;
-                if (c == a) continue;       // no self-reduction
-                if (c == b) continue;       // defensive
+            // For each pair (A->B, B->C), test if A has a direct A->C
+            // whose length is within [ len(A->B) + len(B->C) - fuzz,
+            //                         len(A->B) + len(B->C) + fuzz ].
+            // If so, mark the direct A->C as transitive.
+            for (std::size_t kb = o_begin; kb < o_end; ++kb) {
+                const Edge& eab = edges[adj.indices[kb]];
+                NodeId b = eab.to;
+                const std::uint64_t len_ab = g.node(b).length_bp;
 
-                if (direct_to_len[c] == kNoEdge) continue;  // no direct A->C
-                const std::uint64_t len_bc   = g.node(c).length_bp;
-                const std::uint64_t sum      = len_ab + len_bc;
-                const std::uint64_t direct   = direct_to_len[c];
-                const std::uint64_t lo = sum > fuzz ? sum - fuzz : 0;
-                const std::uint64_t hi = sum + fuzz;
-                if (direct >= lo && direct <= hi) {
-                    std::size_t ei = direct_to_edge[c];
-                    if (!is_transitive[ei]) {
+                const std::size_t bo_begin = adj.offsets[b];
+                const std::size_t bo_end   = adj.offsets[b + 1];
+                for (std::size_t kc = bo_begin; kc < bo_end; ++kc) {
+                    const Edge& ebc = edges[adj.indices[kc]];
+                    NodeId c = ebc.to;
+                    if (c == a) continue;       // no self-reduction
+                    if (c == b) continue;       // defensive
+
+                    if (direct_to_len[c] == kNoEdge) continue;  // no direct A->C
+                    const std::uint64_t len_bc   = g.node(c).length_bp;
+                    const std::uint64_t sum      = len_ab + len_bc;
+                    const std::uint64_t direct   = direct_to_len[c];
+                    const std::uint64_t lo = sum > fuzz ? sum - fuzz : 0;
+                    const std::uint64_t hi = sum + fuzz;
+                    if (direct >= lo && direct <= hi) {
+                        std::size_t ei = direct_to_edge[c];
+                        // Idempotent 0→1 write; benign race across threads
+                        // marking the same edge — the outcome is the same.
                         is_transitive[ei] = 1;
                     }
                 }
             }
-        }
 
-        // Clear direct_to_len entries we populated (keep the vector
-        // allocated between iterations for cache reuse).
-        for (std::size_t k = o_begin; k < o_end; ++k) {
-            const Edge& e = edges[adj.indices[k]];
-            direct_to_len[e.to] = kNoEdge;
+            // Clear direct_to_len entries we populated (keep the vector
+            // allocated between iterations for cache reuse).
+            for (std::size_t k = o_begin; k < o_end; ++k) {
+                const Edge& e = edges[adj.indices[k]];
+                direct_to_len[e.to] = kNoEdge;
+            }
         }
     }
 

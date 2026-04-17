@@ -350,9 +350,22 @@ CompactionResult compact_unitigs_with_sequences(
     }
 
     // ---- Pass 3: build compacted graph with consensus from sequences ----
+    // Split into three sub-passes so the expensive per-unitig consensus
+    // computation can run in parallel:
+    //   (3a) Sequential: allocate a new_id per unitig and gather its member
+    //        sequences. add_node mutates `out` and must stay single-threaded.
+    //   (3b) Parallel: compute simple_majority_consensus(seqs[i]) for every
+    //        unitig. Pure per-unitig, no shared state.
+    //   (3c) Sequential: assign each consensus into out.node(new_ids[i]).
     LosslessGraph& out = result.compacted;
-    std::size_t empty_consensus_unitigs = 0;
-    for (const auto& members : unitigs) {
+    const std::size_t u_count = unitigs.size();
+
+    std::vector<NodeId> new_ids(u_count);
+    std::vector<std::vector<std::string>> seqs_per_unitig(u_count);
+
+    // (3a)
+    for (std::size_t i = 0; i < u_count; ++i) {
+        const auto& members = unitigs[i];
         std::uint64_t total_length = 0;
         for (NodeId m : members) {
             total_length += input.node(m).length_bp;
@@ -362,19 +375,31 @@ CompactionResult compact_unitigs_with_sequences(
             ? std::numeric_limits<std::uint32_t>::max()
             : static_cast<std::uint32_t>(total_length);
 
-        NodeId new_id = out.add_node(len32, start_node.copy_count);
+        new_ids[i] = out.add_node(len32, start_node.copy_count);
 
-        // Build consensus from provided sequences
-        std::vector<std::string> seqs;
+        auto& seqs = seqs_per_unitig[i];
         seqs.reserve(members.size());
         for (NodeId m : members) {
             if (m < node_sequences.size() && !node_sequences[m].empty()) {
                 seqs.push_back(node_sequences[m]);
             }
         }
+    }
 
-        if (!seqs.empty()) {
-            out.node(new_id).consensus = simple_majority_consensus(seqs);
+    // (3b) — the expensive bit, now parallel
+    std::vector<std::string> consensuses(u_count);
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (std::size_t i = 0; i < u_count; ++i) {
+        if (!seqs_per_unitig[i].empty()) {
+            consensuses[i] = simple_majority_consensus(seqs_per_unitig[i]);
+        }
+    }
+
+    // (3c)
+    std::size_t empty_consensus_unitigs = 0;
+    for (std::size_t i = 0; i < u_count; ++i) {
+        if (!consensuses[i].empty()) {
+            out.node(new_ids[i]).consensus = std::move(consensuses[i]);
         } else {
             // Finding 4 cascade: empty consensus here means the downstream
             // write_bed_with_refs path cannot FASTA-dump this node, so
