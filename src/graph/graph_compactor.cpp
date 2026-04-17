@@ -26,6 +26,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -350,6 +351,7 @@ CompactionResult compact_unitigs_with_sequences(
 
     // ---- Pass 3: build compacted graph with consensus from sequences ----
     LosslessGraph& out = result.compacted;
+    std::size_t empty_consensus_unitigs = 0;
     for (const auto& members : unitigs) {
         std::uint64_t total_length = 0;
         for (NodeId m : members) {
@@ -359,9 +361,9 @@ CompactionResult compact_unitigs_with_sequences(
         std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
             ? std::numeric_limits<std::uint32_t>::max()
             : static_cast<std::uint32_t>(total_length);
-        
+
         NodeId new_id = out.add_node(len32, start_node.copy_count);
-        
+
         // Build consensus from provided sequences
         std::vector<std::string> seqs;
         seqs.reserve(members.size());
@@ -370,10 +372,25 @@ CompactionResult compact_unitigs_with_sequences(
                 seqs.push_back(node_sequences[m]);
             }
         }
-        
+
         if (!seqs.empty()) {
             out.node(new_id).consensus = simple_majority_consensus(seqs);
+        } else {
+            // Finding 4 cascade: empty consensus here means the downstream
+            // write_bed_with_refs path cannot FASTA-dump this node, so
+            // minimap2 never sees it and the BED row falls back to chrom=NA.
+            // Upstream fix is tracked under Finding 1 (unitig collapse);
+            // see feat/compactor-debug. Count-and-warn until then.
+            ++empty_consensus_unitigs;
         }
+    }
+    if (empty_consensus_unitigs > 0) {
+        std::cerr << "BRANCH: graph_compactor produced "
+                  << empty_consensus_unitigs
+                  << " unitigs with empty consensus (no member sequences "
+                     "supplied). Downstream BED rows will have chrom=NA for "
+                     "these. Root cause tracked in Finding 1 (unitig "
+                     "collapse, feat/compactor-debug).\n";
     }
 
     // Emit inter-unitig edges
