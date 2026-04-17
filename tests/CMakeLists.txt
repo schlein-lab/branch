@@ -81,6 +81,16 @@ target_link_libraries(test_write_bed_with_refs PRIVATE branch_graph GTest::gtest
 target_compile_features(test_write_bed_with_refs PRIVATE cxx_std_20)
 gtest_discover_tests(test_write_bed_with_refs)
 
+add_executable(test_write_fasta_consensus test_write_fasta_consensus.cpp)
+target_link_libraries(test_write_fasta_consensus PRIVATE branch_graph GTest::gtest_main)
+target_compile_features(test_write_fasta_consensus PRIVATE cxx_std_20)
+gtest_discover_tests(test_write_fasta_consensus)
+
+add_executable(test_cpu_thread_determinism test_cpu_thread_determinism.cpp)
+target_link_libraries(test_cpu_thread_determinism PRIVATE branch_backend branch_graph GTest::gtest_main)
+target_compile_features(test_cpu_thread_determinism PRIVATE cxx_std_20)
+gtest_discover_tests(test_cpu_thread_determinism)
+
 add_executable(test_graph_compactor test_graph_compactor.cpp)
 target_link_libraries(test_graph_compactor PRIVATE branch_graph GTest::gtest_main)
 target_compile_features(test_graph_compactor PRIVATE cxx_std_20)
