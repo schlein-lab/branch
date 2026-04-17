@@ -120,7 +120,18 @@ std::vector<Bubble> detect_bubbles(
                 auto* large = &rj;
                 if (ri.size() > rj.size()) std::swap(small, large);
 
-                for (const auto& [exit_node, path_i] : *small) {
+                // Deterministic iteration: extract keys, sort, then iterate.
+                // std::unordered_map iteration order is impl-defined and
+                // allocation-order dependent — iterating directly causes
+                // non-deterministic memory-allocation patterns downstream
+                // (peak-RAM varies across runs on identical input).
+                std::vector<NodeId> exits;
+                exits.reserve(small->size());
+                for (const auto& kv : *small) exits.push_back(kv.first);
+                std::sort(exits.begin(), exits.end());
+
+                for (NodeId exit_node : exits) {
+                    const auto& path_i = small->at(exit_node);
                     auto it = large->find(exit_node);
                     if (it == large->end()) continue;
                     if (exit_node == entry) continue;
@@ -154,8 +165,20 @@ std::vector<Bubble> detect_bubbles(
         }
     }
 
+    // Deterministic emission: sort (entry, exit) keys before final pass
+    // so output vector has a stable order independent of hash bucketing.
+    std::vector<EntryExitKey> keys;
+    keys.reserve(bubbles.size());
+    for (const auto& kv : bubbles) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end(),
+              [](const EntryExitKey& a, const EntryExitKey& b) {
+                  if (a.entry != b.entry) return a.entry < b.entry;
+                  return a.exit < b.exit;
+              });
+
     out.reserve(bubbles.size());
-    for (auto& [k, b] : bubbles) {
+    for (const auto& k : keys) {
+        auto& b = bubbles[k];
         // De-duplicate alts (both (i,j) directions may have added same path).
         std::sort(b.alts.begin(), b.alts.end(),
                   [](const AltPath& a, const AltPath& c) { return a.nodes < c.nodes; });
