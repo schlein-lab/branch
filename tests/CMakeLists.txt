@@ -135,6 +135,12 @@ target_link_libraries(test_reference_aligner PRIVATE GTest::gtest_main)
 target_compile_features(test_reference_aligner PRIVATE cxx_std_20)
 gtest_discover_tests(test_reference_aligner)
 
+add_executable(test_linear_mapper test_linear_mapper.cpp)
+target_link_libraries(test_linear_mapper PRIVATE branch_project GTest::gtest_main)
+target_compile_features(test_linear_mapper PRIVATE cxx_std_20)
+target_include_directories(test_linear_mapper PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_linear_mapper)
+
 
 add_executable(test_vpcr test_vpcr.cpp)
 target_link_libraries(test_vpcr PRIVATE branch_vpcr GTest::gtest_main)
