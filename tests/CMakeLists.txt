@@ -135,6 +135,18 @@ target_link_libraries(test_reference_aligner PRIVATE GTest::gtest_main)
 target_compile_features(test_reference_aligner PRIVATE cxx_std_20)
 gtest_discover_tests(test_reference_aligner)
 
+add_executable(test_linear_mapper test_linear_mapper.cpp)
+target_link_libraries(test_linear_mapper PRIVATE branch_project GTest::gtest_main)
+target_compile_features(test_linear_mapper PRIVATE cxx_std_20)
+target_include_directories(test_linear_mapper PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_linear_mapper)
+
+add_executable(test_pangenome_mapper test_pangenome_mapper.cpp)
+target_link_libraries(test_pangenome_mapper PRIVATE branch_project GTest::gtest_main)
+target_compile_features(test_pangenome_mapper PRIVATE cxx_std_20)
+target_include_directories(test_pangenome_mapper PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_pangenome_mapper)
+
 
 add_executable(test_vpcr test_vpcr.cpp)
 target_link_libraries(test_vpcr PRIVATE branch_vpcr GTest::gtest_main)
@@ -157,3 +169,9 @@ target_link_libraries(test_mixed_decomposer PRIVATE branch_classify GTest::gtest
 target_compile_features(test_mixed_decomposer PRIVATE cxx_std_20)
 target_include_directories(test_mixed_decomposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 gtest_discover_tests(test_mixed_decomposer)
+
+add_executable(test_somatic_delta test_somatic_delta.cpp)
+target_link_libraries(test_somatic_delta PRIVATE branch_project GTest::gtest_main)
+target_compile_features(test_somatic_delta PRIVATE cxx_std_20)
+target_include_directories(test_somatic_delta PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_somatic_delta)

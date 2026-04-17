@@ -1,55 +1,50 @@
-// BRANCH v0.4 — Linear reference mapping via minimap2 shell-out.
-//
-// Maps branch consensus sequences to linear references (CHM13, GRCh38)
-// using minimap2 asm20 preset. Results are merged into a single PAF
-// with rf:Z: tags indicating the reference source.
+// BRANCH v0.4 — Linear reference mapper for `branch project`.
+// Shell-out to minimap2 per branch, parse PAF, return mappings.
 
-#pragma once
+#ifndef BRANCH_PROJECT_LINEAR_MAPPER_HPP
+#define BRANCH_PROJECT_LINEAR_MAPPER_HPP
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace branch::project {
 
-/// Represents a linear reference configuration.
+struct LinearMapping {
+    std::string branch_id;    // query name (branch ID from FASTA)
+    std::string ref_name;     // logical name (CHM13, GRCh38, ...)
+    std::string target;       // chrom / contig
+    std::int64_t target_start = 0;
+    std::int64_t target_end = 0;
+    int mapq = 0;
+    char strand = '+';
+    std::int64_t query_len = 0;
+    std::int64_t query_start = 0;
+    std::int64_t query_end = 0;
+};
+
 struct LinearRef {
-    std::string name;      ///< Reference name (e.g., "CHM13", "GRCh38")
-    std::string path;      ///< Path to .mmi or .fasta file
+    std::string name;    // user-tag (CHM13, GRCh38)
+    std::string path;    // .fa or .mmi
 };
 
-/// Result of linear mapping for a single branch.
-struct LinearMapResult {
-    std::string branch_id;
-    std::string ref_name;
-    int mapq{0};
-    double identity{0.0};
-    std::string paf_line;  ///< Raw PAF record
+struct LinearMapOptions {
+    std::string minimap2_path = "minimap2";
+    std::string preset = "asm20";        // HiFi-vs-ref default
+    int threads = 4;
+    int min_mapq = 0;                    // emit all; caller filters UNANNOTATED
 };
 
-/// Configuration for linear mapping.
-struct LinearMapperConfig {
-    std::vector<LinearRef> references;
-    std::string fasta_path;        ///< Branch consensus FASTA
-    std::string output_paf;        ///< Output PAF path
-    int threads{1};
-    std::string minimap2_path{"minimap2"};  ///< Path to minimap2 binary
-};
-
-/// Run minimap2 on all branches against all linear references.
-/// Merges results into a single PAF with rf:Z: tags.
-///
-/// @param config  Mapping configuration
-/// @return true on success, false on error
-///
-/// TODO: Implement in v0.4
-bool run_linear_mapping(const LinearMapperConfig& config);
-
-/// Parse a PAF file and extract per-branch mapping statistics.
-///
-/// @param paf_path  Path to PAF file
-/// @return Vector of mapping results
-///
-/// TODO: Implement in v0.4
-std::vector<LinearMapResult> parse_linear_paf(const std::string& paf_path);
+// Map one branch FASTA against all given linear refs. Returns mappings sorted
+// by (ref_name, query_start). Shell-out to minimap2 preset (asm20) — one call
+// per (branch-FASTA x ref) pair. Caller is responsible for iterating over
+// branches; this maps EVERY branch in fasta_path against EVERY ref.
+std::vector<LinearMapping> map_branches_linear(
+    const std::string& fasta_path,
+    const std::vector<LinearRef>& refs,
+    const LinearMapOptions& opts,
+    std::string* err_out);
 
 }  // namespace branch::project
+
+#endif

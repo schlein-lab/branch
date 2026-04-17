@@ -3,7 +3,7 @@
 # https://github.com/schlein-lab/branch
 
 cmake_minimum_required(VERSION 3.28)
-project(branch VERSION 0.1.0 LANGUAGES CXX)
+project(branch VERSION 0.1.0 LANGUAGES C CXX)
 
 # ------------------------------------------------------------------------------
 # C++ Standard
@@ -82,12 +82,15 @@ target_include_directories(branch_htslib INTERFACE "${BRANCH_HTSLIB_DIR}")
 # into libhts.a from third_party/htslib's bundled htscodecs sources (see
 # `htscodecs_bundled.mk` and the configure output `linking
 # htscodecs_bundled.mk to htscodecs.mk`). libdeflate is autodetected at
-# configure time, so we link it explicitly. zlib + libm + pthread round
-# out the base deps; bz2/lzma/curl/plugins were disabled at configure
-# time so we do not need them.
+# htslib configure time; probe for it here and only link if present so the
+# build works on hosts without libdeflate (e.g. HPC login nodes).
 target_link_libraries(branch_htslib INTERFACE
     "${BRANCH_HTSLIB_DIR}/libhts.a"
-    deflate z m pthread)
+    z m pthread)
+find_library(BRANCH_LIBDEFLATE NAMES deflate)
+if(BRANCH_LIBDEFLATE)
+    target_link_libraries(branch_htslib INTERFACE ${BRANCH_LIBDEFLATE})
+endif()
 
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
@@ -102,9 +105,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minimap2)
 
-# Create interface library for minimap2 headers (-isystem to suppress warnings)
-add_library(branch_minimap2 INTERFACE)
-target_include_directories(branch_minimap2 SYSTEM INTERFACE "${minimap2_SOURCE_DIR}")
+# Create static library for ksw2 alignment (compiled from minimap2 C sources)
+# We need ksw2_extz2_sse.c and kalloc.c for the ksw_extz2_sse function.
+add_library(branch_minimap2 STATIC
+    "${minimap2_SOURCE_DIR}/ksw2_extz2_sse.c"
+    "${minimap2_SOURCE_DIR}/kalloc.c"
+)
+target_include_directories(branch_minimap2 SYSTEM PUBLIC "${minimap2_SOURCE_DIR}")
+# Disable warnings for vendored C code
+target_compile_options(branch_minimap2 PRIVATE -w)
 
 # Subdirectories
 # ------------------------------------------------------------------------------
