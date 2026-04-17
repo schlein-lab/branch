@@ -188,6 +188,8 @@ int run_assemble(int argc, char** argv) {
     }
 
     // 3. Compute overlaps.
+    branch::backend::set_cpu_overlap_threads(
+        static_cast<unsigned int>(a.threads > 0 ? a.threads : 1));
     auto bk = branch::backend::make_cpu_backend();
     std::vector<branch::backend::OverlapPair> overlaps(a.max_overlaps);
     std::size_t n_overlaps = 0;

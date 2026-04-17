@@ -6,11 +6,14 @@
 #include "backend/cpu_backend.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +37,10 @@ struct OverlapConfig {
     // cluster, ≥ this fraction of matches must agree on XOR strand.
     // Mixed clusters (spurious cross-strand collisions) are dropped.
     float strand_majority{0.80f};
+    // Worker threads used to sketch the read batch in parallel.
+    // 0 = single-threaded (legacy behaviour, deterministic ordering of
+    // hits). 1..N = std::thread fan-out over read chunks.
+    unsigned int threads{0};
 };
 
 namespace {
@@ -86,12 +93,51 @@ std::size_t compute_overlaps_impl(
         return 0;
     }
 
-    // Step 1: Sketch all reads
+    // Step 1: Sketch all reads. With cfg.threads > 1 the batch is
+    // partitioned into chunks sketched in parallel; the per-chunk
+    // MinimizerHit vectors are concatenated afterwards, preserving the
+    // per-read hit order (read_id grows monotonically across chunks).
     std::vector<graph::MinimizerHit> all_hits;
     all_hits.reserve(batch.reads.size() * 100);
 
-    for (const auto& read : batch.reads) {
-        graph::sketch_read(read.seq, read.id, all_hits);
+    const unsigned int req_threads =
+        (cfg.threads == 0) ? 1u : cfg.threads;
+    const unsigned int n_threads = std::min<unsigned int>(
+        req_threads, static_cast<unsigned int>(batch.reads.size()));
+
+    if (n_threads <= 1) {
+        for (const auto& read : batch.reads) {
+            graph::sketch_read(read.seq, read.id, all_hits);
+        }
+    } else {
+        const std::size_t n_reads = batch.reads.size();
+        const std::size_t chunk =
+            (n_reads + n_threads - 1) / n_threads;
+
+        std::vector<std::future<std::vector<graph::MinimizerHit>>> futs;
+        futs.reserve(n_threads);
+
+        for (unsigned int t = 0; t < n_threads; ++t) {
+            const std::size_t lo = static_cast<std::size_t>(t) * chunk;
+            const std::size_t hi = std::min(lo + chunk, n_reads);
+            if (lo >= hi) break;
+            futs.push_back(std::async(std::launch::async, [&, lo, hi]() {
+                std::vector<graph::MinimizerHit> local;
+                local.reserve((hi - lo) * 100);
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const auto& r = batch.reads[i];
+                    graph::sketch_read(r.seq, r.id, local);
+                }
+                return local;
+            }));
+        }
+
+        for (auto& f : futs) {
+            auto chunk_hits = f.get();
+            all_hits.insert(all_hits.end(),
+                            std::make_move_iterator(chunk_hits.begin()),
+                            std::make_move_iterator(chunk_hits.end()));
+        }
     }
 
     if (all_hits.empty()) {
@@ -250,6 +296,10 @@ void cpu_destroy(BackendContext ctx) {
     delete static_cast<CpuBackendContext*>(ctx);
 }
 
+// Process-wide tuning knob set by CLI / test harness through
+// set_cpu_overlap_threads(). 0 means single-threaded (deterministic).
+std::atomic<unsigned int> g_cpu_overlap_threads{0};
+
 void cpu_compute_overlaps(BackendContext /*ctx*/,
                           const ReadBatch* batch,
                           std::span<OverlapPair> out_pairs,
@@ -260,6 +310,7 @@ void cpu_compute_overlaps(BackendContext /*ctx*/,
     }
 
     OverlapConfig cfg;
+    cfg.threads = g_cpu_overlap_threads.load(std::memory_order_relaxed);
     *out_count = compute_overlaps_impl(*batch, out_pairs, cfg);
 }
 
@@ -318,6 +369,14 @@ constexpr BackendVTable kCpuVTable{
 Backend make_cpu_backend() {
     auto* ctx = new CpuBackendContext{};
     return Backend(ctx, &kCpuVTable);
+}
+
+void set_cpu_overlap_threads(unsigned int threads) noexcept {
+    g_cpu_overlap_threads.store(threads, std::memory_order_relaxed);
+}
+
+unsigned int get_cpu_overlap_threads() noexcept {
+    return g_cpu_overlap_threads.load(std::memory_order_relaxed);
 }
 
 void cpu_classify_batch_with_graph(

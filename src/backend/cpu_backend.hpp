@@ -10,9 +10,10 @@
 //   - the developmental testbed for new algorithms before they are
 //     ported to CUDA.
 //
-// v0.1 ships with stubs (zero overlaps found, constant VAF estimates).
-// Real implementations follow in v0.2 once graph-construction and
-// overlap-computation modules exist.
+// v0.2+ delivers the full overlap + classify + VAF implementation; see
+// compute_overlaps_impl (minimizer bucketing, offset-consistency and
+// strand-majority filtering) and cpu_estimate_vaf_batch_candidates
+// (Wilson-CI from per-candidate read support).
 
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,13 @@ struct ReadBatch {
 // Construct a CPU-backed Backend. Never returns an empty Backend;
 // context is always allocated. Throws std::bad_alloc on OOM.
 Backend make_cpu_backend();
+
+// Thread-local tuning. `threads` is read by cpu_compute_overlaps() to
+// decide how many worker threads to spawn for read sketching. Setting
+// to 0 keeps the deterministic single-threaded fallback. Changes take
+// effect on the next call to compute_overlaps.
+void set_cpu_overlap_threads(unsigned int threads) noexcept;
+unsigned int get_cpu_overlap_threads() noexcept;
 
 // Identifier constant for logging + registry.
 inline constexpr const char* kCpuBackendName = "cpu-reference";
