@@ -153,6 +153,21 @@ if(TARGET branch)
         BRANCH_BINARY="$<TARGET_FILE:branch>")
     add_dependencies(test_project_smoke branch)
     add_test(NAME ProjectSmoke COMMAND test_project_smoke)
+
+    # P1.3 VAF-band benchmark. Generates the 4-way bubble fixture,
+    # runs branch assemble, parses the GFA, and reports per-band
+    # retrieval metrics with a permissive low-band recall gate.
+    add_executable(test_vaf_band_benchmark test_vaf_band_benchmark.cpp)
+    target_link_libraries(test_vaf_band_benchmark
+        PRIVATE branch_analysis GTest::gtest GTest::gtest_main)
+    target_compile_features(test_vaf_band_benchmark PRIVATE cxx_std_20)
+    target_include_directories(test_vaf_band_benchmark
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(test_vaf_band_benchmark PRIVATE
+        BRANCH_BINARY="$<TARGET_FILE:branch>"
+        GEN_BRANCH_FIXTURE_BINARY="$<TARGET_FILE:generate_branch_fixture>")
+    add_dependencies(test_vaf_band_benchmark branch generate_branch_fixture)
+    add_test(NAME VafBandBenchmark COMMAND test_vaf_band_benchmark)
 endif()
 
 add_executable(test_reference_aligner test_reference_aligner.cpp)
