@@ -66,6 +66,11 @@ target_link_libraries(test_bubble_detector PRIVATE branch_detect GTest::gtest_ma
 target_compile_features(test_bubble_detector PRIVATE cxx_std_20)
 gtest_discover_tests(test_bubble_detector)
 
+add_executable(test_coverage_conservation test_coverage_conservation.cpp)
+target_link_libraries(test_coverage_conservation PRIVATE branch_analysis branch_detect branch_graph GTest::gtest_main)
+target_compile_features(test_coverage_conservation PRIVATE cxx_std_20)
+gtest_discover_tests(test_coverage_conservation)
+
 add_executable(test_cpu_backend test_cpu_backend.cpp)
 target_link_libraries(test_cpu_backend PRIVATE branch_backend GTest::gtest_main)
 target_compile_features(test_cpu_backend PRIVATE cxx_std_20)
