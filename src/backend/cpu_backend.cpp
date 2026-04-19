@@ -176,42 +176,84 @@ std::size_t compute_overlaps_impl(
     // Step 3+4: Collect matches per candidate pair. Reserve to the
     // number of distinct pairs a well-behaved HiFi batch generates
     // (~same scale as buckets.size()) to keep rehash spikes bounded.
+    //
+    // Parallel path: shard bucket_keys across cfg.threads workers.
+    // Each worker builds a thread-local pair_matches map over its
+    // bucket shard, then results merge into the global map. Because
+    // each bucket key is disjoint (no two workers touch the same
+    // bucket), this is lock-free and deterministic: the final output
+    // is the union of all shards, identical regardless of the shard
+    // boundaries or the merge order (sorting at Step 5 normalises).
     std::unordered_map<PairKey, std::vector<MatchInfo>, PairKeyHash> pair_matches;
     pair_matches.reserve(buckets.size());
 
-    for (std::uint64_t hash : bucket_keys) {
-        const auto& entries = buckets[hash];
-        if (entries.size() < 2) continue;
+    auto process_bucket_range =
+        [&](std::size_t lo, std::size_t hi,
+            std::unordered_map<PairKey, std::vector<MatchInfo>, PairKeyHash>& out) {
+        for (std::size_t bi = lo; bi < hi; ++bi) {
+            const auto& entries = buckets[bucket_keys[bi]];
+            if (entries.size() < 2) continue;
+            for (std::size_t i = 0; i < entries.size(); ++i) {
+                for (std::size_t j = i + 1; j < entries.size(); ++j) {
+                    const auto& ea = entries[i];
+                    const auto& eb = entries[j];
+                    if (ea.read_id == eb.read_id) continue;
 
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            for (std::size_t j = i + 1; j < entries.size(); ++j) {
-                const auto& ea = entries[i];
-                const auto& eb = entries[j];
-
-                if (ea.read_id == eb.read_id) continue;
-
-                PairKey key;
-                std::int32_t offset;
-                std::uint32_t pos_a;
-                std::uint32_t pos_b;
-                if (ea.read_id < eb.read_id) {
-                    key = {ea.read_id, eb.read_id};
-                    pos_a = ea.pos;
-                    pos_b = eb.pos;
-                    offset = static_cast<std::int32_t>(ea.pos) -
-                             static_cast<std::int32_t>(eb.pos);
-                } else {
-                    key = {eb.read_id, ea.read_id};
-                    pos_a = eb.pos;
-                    pos_b = ea.pos;
-                    offset = static_cast<std::int32_t>(eb.pos) -
-                             static_cast<std::int32_t>(ea.pos);
+                    PairKey key;
+                    std::int32_t offset;
+                    std::uint32_t pos_a;
+                    std::uint32_t pos_b;
+                    if (ea.read_id < eb.read_id) {
+                        key = {ea.read_id, eb.read_id};
+                        pos_a = ea.pos;
+                        pos_b = eb.pos;
+                        offset = static_cast<std::int32_t>(ea.pos) -
+                                 static_cast<std::int32_t>(eb.pos);
+                    } else {
+                        key = {eb.read_id, ea.read_id};
+                        pos_a = eb.pos;
+                        pos_b = ea.pos;
+                        offset = static_cast<std::int32_t>(eb.pos) -
+                                 static_cast<std::int32_t>(ea.pos);
+                    }
+                    const std::uint8_t pair_strand =
+                        static_cast<std::uint8_t>((ea.strand ^ eb.strand) & 1);
+                    out[key].push_back(
+                        MatchInfo{offset, pos_a, pos_b, pair_strand});
                 }
+            }
+        }
+    };
 
-                const std::uint8_t pair_strand =
-                    static_cast<std::uint8_t>((ea.strand ^ eb.strand) & 1);
-                pair_matches[key].push_back(
-                    MatchInfo{offset, pos_a, pos_b, pair_strand});
+    const unsigned int match_threads = (n_threads <= 1) ? 1u : n_threads;
+    if (match_threads <= 1) {
+        process_bucket_range(0, bucket_keys.size(), pair_matches);
+    } else {
+        const std::size_t total = bucket_keys.size();
+        const std::size_t chunk = (total + match_threads - 1) / match_threads;
+
+        std::vector<std::future<std::unordered_map<PairKey, std::vector<MatchInfo>, PairKeyHash>>> futs;
+        futs.reserve(match_threads);
+
+        for (unsigned int t = 0; t < match_threads; ++t) {
+            const std::size_t lo = static_cast<std::size_t>(t) * chunk;
+            const std::size_t hi = std::min(lo + chunk, total);
+            if (lo >= hi) break;
+            futs.push_back(std::async(std::launch::async, [&, lo, hi]() {
+                std::unordered_map<PairKey, std::vector<MatchInfo>, PairKeyHash> local;
+                local.reserve((hi - lo) * 2);
+                process_bucket_range(lo, hi, local);
+                return local;
+            }));
+        }
+
+        for (auto& f : futs) {
+            auto shard = f.get();
+            for (auto& kv : shard) {
+                auto& sink = pair_matches[kv.first];
+                sink.insert(sink.end(),
+                            std::make_move_iterator(kv.second.begin()),
+                            std::make_move_iterator(kv.second.end()));
             }
         }
     }
