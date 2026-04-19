@@ -195,6 +195,12 @@ target_compile_features(test_mixed_decomposer PRIVATE cxx_std_20)
 target_include_directories(test_mixed_decomposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 gtest_discover_tests(test_mixed_decomposer)
 
+add_executable(test_hierarchical_disambiguator test_hierarchical_disambiguator.cpp)
+target_link_libraries(test_hierarchical_disambiguator PRIVATE branch_classify branch_backend GTest::gtest_main)
+target_compile_features(test_hierarchical_disambiguator PRIVATE cxx_std_20)
+target_include_directories(test_hierarchical_disambiguator PRIVATE ${CMAKE_SOURCE_DIR}/src)
+gtest_discover_tests(test_hierarchical_disambiguator)
+
 add_executable(test_somatic_delta test_somatic_delta.cpp)
 target_link_libraries(test_somatic_delta PRIVATE branch_project GTest::gtest_main)
 target_compile_features(test_somatic_delta PRIVATE cxx_std_20)
