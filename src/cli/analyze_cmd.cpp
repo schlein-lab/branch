@@ -10,7 +10,10 @@
 #include <vector>
 
 #include "analysis/coverage_cn.hpp"
+#include "analysis/coverage_conservation.hpp"
 #include "analysis/repeat_cn.hpp"
+#include "detect/bubble_detector.hpp"
+#include "graph/lossless_graph.hpp"
 #include "io/mosdepth_reader.hpp"
 
 namespace branch::cli {
@@ -174,6 +177,24 @@ int run_analyze(int argc, char** argv) {
                   << " members=" << s.member_count
                   << " total_rel_cn=" << s.total_relative_cn
                   << " mean_per_member=" << s.mean_per_member << "\n";
+    }
+
+    // Coverage-conservation (P1.1). Analyze-command does not yet carry
+    // a loaded LosslessGraph — the solver is a no-op here until the
+    // graph pipeline feeds it. We still run the empty-graph path so
+    // the iteration counter + report summary line stays in the output
+    // contract; the branch assemble-then-analyze pipeline will wire
+    // the real graph in a follow-up.
+    {
+        branch::graph::LosslessGraph graph_stub;
+        std::vector<branch::detect::Bubble> bubble_stub;
+        auto report = branch::analysis::run_conservation(
+            graph_stub, bubble_stub, est);
+        std::cout << "# conservation iterations=" << report.iterations_used
+                  << " converged=" << (report.converged ? 1 : 0)
+                  << " node_violations=" << report.per_node_violations.size()
+                  << " bubble_violations=" << report.per_bubble_violations.size()
+                  << " residual=" << report.final_global_residual << "\n";
     }
 
     // Repeat family CN analysis
