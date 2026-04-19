@@ -7,6 +7,7 @@
 add_library(branch_classify STATIC
     feature_extractor.cpp
     mixed_decomposer.cpp
+    hierarchical_disambiguator.cpp
 )
 target_include_directories(branch_classify PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
