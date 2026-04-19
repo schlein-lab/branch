@@ -23,6 +23,8 @@
 //                           [--ref OUT.fa] [--meta OUT.tsv]
 //                           [--cassette-bp N]            default 2500
 //                           [--vaf-mix V0,V2,V4,V6]      default 0.10,0.50,0.25,0.15
+//                           [--read-len-auto]            override read_len to
+//                                                         flank + max_copies*cassette + flank
 //
 // Meta TSV columns:
 //   allele  copy_count  vaf_target  n_reads_generated  cassette_len_bp
@@ -86,12 +88,13 @@ int main(int argc, char** argv) {
     const std::string out_path = argv[1];
     const std::uint64_t seed = std::strtoull(argv[2], nullptr, 10);
     const std::size_t total_reads = std::strtoull(argv[3], nullptr, 10);
-    const std::size_t read_len = std::strtoull(argv[4], nullptr, 10);
+    std::size_t read_len = std::strtoull(argv[4], nullptr, 10);
 
     std::string ref_out, meta_out;
     std::size_t cassette_bp = 2500;
     std::vector<double> vaf_mix = {0.10, 0.50, 0.25, 0.15};  // 0, 2, 4, 6 copies
     const std::vector<int> copy_counts = {0, 2, 4, 6};
+    bool read_len_auto = false;
 
     for (int i = 5; i < argc; ++i) {
         std::string_view a = argv[i];
@@ -103,6 +106,8 @@ int main(int argc, char** argv) {
             vaf_mix = parse_vafs(argv[++i]);
             if (vaf_mix.size() != copy_counts.size())
                 die("--vaf-mix needs exactly 4 comma-separated values");
+        } else if (a == "--read-len-auto") {
+            read_len_auto = true;
         } else {
             std::cerr << "unknown arg: " << a << '\n';
             return 2;
@@ -110,8 +115,18 @@ int main(int argc, char** argv) {
     }
 
     if (total_reads < 50) die("total_reads must be >= 50 for meaningful coverage");
-    if (read_len < 5000) die("read_len should be >= 5000 to span the bubble");
     if (cassette_bp < 500) die("cassette-bp should be >= 500");
+
+    // --read-len-auto: size reads to flank_L + max_copies*cassette + flank_R
+    // so every read fully spans the largest allele. Computed here because
+    // flank_bp and max_copies are defined in this function body below —
+    // keep in sync.
+    constexpr std::size_t kFlankBp = 2000;
+    constexpr std::size_t kMaxCopies = 6;
+    if (read_len_auto) {
+        read_len = kFlankBp + kMaxCopies * cassette_bp + kFlankBp;
+    }
+    if (read_len < 5000) die("read_len should be >= 5000 to span the bubble");
 
     double vaf_sum = 0.0;
     for (double v : vaf_mix) vaf_sum += v;
@@ -121,9 +136,9 @@ int main(int argc, char** argv) {
 
     // Generate cassette + two flanks with enough length that every read
     // fully spans the bubble (flank_L + max_cassette_block + flank_R).
-    const std::size_t max_copies = 6;
+    const std::size_t max_copies = kMaxCopies;
     const std::size_t max_allele_body = max_copies * cassette_bp;
-    const std::size_t flank_bp = 2000;
+    const std::size_t flank_bp = kFlankBp;
     const std::size_t full_len = flank_bp + max_allele_body + flank_bp;
     if (read_len < full_len) {
         std::cerr << "generate_branch_fixture: read_len ("
