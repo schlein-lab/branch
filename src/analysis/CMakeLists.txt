@@ -2,6 +2,7 @@ add_library(branch_analysis STATIC
     coverage_cn.cpp
     repeat_cn.cpp
     annotation_bed.cpp
+    vaf_band_stats.cpp
 )
 target_include_directories(branch_analysis PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
