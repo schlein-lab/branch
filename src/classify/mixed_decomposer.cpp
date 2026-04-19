@@ -97,4 +97,19 @@ std::vector<SubBubble> decompose_mixed(
     return result;
 }
 
+std::vector<SubBubble> decompose_mixed_with_hook(
+    const std::vector<std::vector<char>>& per_read_snp_vectors,
+    const SubBubbleReclassifyHook& hook,
+    int max_depth,
+    std::size_t min_cluster_size
+) {
+    auto subs = decompose_mixed(per_read_snp_vectors, max_depth, min_cluster_size);
+    if (hook) {
+        for (std::size_t i = 0; i < subs.size(); ++i) {
+            hook(i, subs[i]);
+        }
+    }
+    return subs;
+}
+
 } // namespace branch::classify
