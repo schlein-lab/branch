@@ -133,13 +133,17 @@ if(TARGET branch)
     add_executable(generate_toy_fastq fixtures/generate_toy_fastq.cpp)
     target_compile_features(generate_toy_fastq PRIVATE cxx_std_20)
 
+    add_executable(generate_branch_fixture fixtures/generate_branch_fixture.cpp)
+    target_compile_features(generate_branch_fixture PRIVATE cxx_std_20)
+
     add_executable(test_e2e_assemble test_e2e_assemble.cpp)
     target_link_libraries(test_e2e_assemble PRIVATE GTest::gtest GTest::gtest_main)
     target_compile_features(test_e2e_assemble PRIVATE cxx_std_20)
     target_compile_definitions(test_e2e_assemble PRIVATE
         BRANCH_BINARY="$<TARGET_FILE:branch>"
-        GEN_FASTQ_BINARY="$<TARGET_FILE:generate_toy_fastq>")
-    add_dependencies(test_e2e_assemble branch generate_toy_fastq)
+        GEN_FASTQ_BINARY="$<TARGET_FILE:generate_toy_fastq>"
+        GEN_BRANCH_FIXTURE_BINARY="$<TARGET_FILE:generate_branch_fixture>")
+    add_dependencies(test_e2e_assemble branch generate_toy_fastq generate_branch_fixture)
     add_test(NAME E2E_Assemble COMMAND test_e2e_assemble)
 
     add_executable(test_project_smoke test_project_smoke.cpp)
