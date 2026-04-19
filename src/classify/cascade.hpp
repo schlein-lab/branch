@@ -36,6 +36,13 @@ struct CascadeConfig {
     float depth_ratio_dup_threshold{2.0f};   // stage 2: >=2.0 -> Duplication (FIX 1: biologisch korrekt, Dup ~2x diploid)
     float read_span_branch_threshold{0.5f};  // stage 3: >=0.5 -> Branch-confirm
     float min_confidence_to_emit{0.5f};      // below -> NonSeparable
+    float annotation_prior_threshold{0.5f};  // stage 4: annotation flag > thr -> Duplication prior
+
+    // Mixed-class fallback thresholds (formerly hardcoded at 0.7 / 1.5).
+    // P1.2: surfaced into config so the hierarchical disambiguator and
+    // the cascade share one source of truth.
+    float mixed_flank_lower{0.70f};          // strong but not early-exit flank
+    float mixed_depth_lower{1.50f};          // elevated (not Dup) depth
 
     // Termination guarantees for recursive Mixed decomposition
     std::uint32_t min_bubble_length_bp{500};
@@ -112,14 +119,15 @@ inline StageResult classify_one(const FeatureVector& features,
     float p4_segdup = stage_annotation_prior(features);
     float p4_repeat = stage_repeat_annotation(features);
     float p4 = std::max(p4_segdup, p4_repeat);  // either annotation fires -> Duplication prior
-    if (p4 > 0.5f) {
+    if (p4 > cfg.annotation_prior_threshold) {
         return {branch::backend::BubbleClass::Duplication, p4, 3};
     }
 
     // FIX 5: Mixed-Klasse wenn Diskriminatoren widersprechen
     // Flanken sagen Branch (p1 hoch), aber Depth sagt Duplication (p2 hoch) -> Mixed
-    bool flank_says_branch = (p1 >= 0.7f);  // strong but not early-exit
-    bool depth_says_dup = (p2 >= 1.5f);     // elevated but below threshold
+    // P1.2: thresholds parameterised into CascadeConfig.
+    bool flank_says_branch = (p1 >= cfg.mixed_flank_lower);   // strong but not early-exit
+    bool depth_says_dup    = (p2 >= cfg.mixed_depth_lower);   // elevated but below Dup threshold
     if (flank_says_branch && depth_says_dup) {
         float mixed_conf = std::min(p1, p2 / cfg.depth_ratio_dup_threshold);
         return {branch::backend::BubbleClass::Mixed, mixed_conf, 3};
