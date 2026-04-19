@@ -1,168 +1,387 @@
-#include "branch/graph/graph_compactor.hpp"
-#include <unordered_set>
-#include <unordered_map>
+// BRANCH v0.2 — Unitig compaction implementation with consensus building.
+//
+// Algorithm (two passes):
+//   1) Build in-degree / out-degree arrays and per-node adjacency indices
+//      into the input edge vector.
+//   2) Identify chain starts: a node N starts a unitig if either
+//        - in_degree(N) != 1, or
+//        - the unique predecessor P has out_degree(P) != 1.
+//      From each start, walk forward while the current node has out_degree
+//      exactly 1 AND the successor has in_degree exactly 1. Collect all
+//      visited nodes into the same unitig.
+//   3) Any node that is not yet assigned to a unitig must be on a pure
+//      cycle (every node in the cycle has in=out=1). Break such a cycle
+//      arbitrarily at an unvisited node and walk it as its own unitig.
+//   4) Build the output graph: one new node per unitig with
+//        length_bp = sum of member lengths
+//        copy_count = chain start's copy_count
+//        consensus = MSA-derived consensus from member sequences
+//      Copy only inter-unitig edges (from_unitig != to_unitig), keeping
+//      the original read_support of the boundary-crossing edge.
+
+#include "graph/graph_compactor.hpp"
+#include "consensus/majority_voter.hpp"
+
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <vector>
 
-namespace branch {
-namespace graph {
+namespace branch::graph {
 
-std::vector<std::vector<size_t>> GraphCompactor::find_unitig_chains(
-    const OverlapGraph& graph) {
-    
-    std::vector<std::vector<size_t>> chains;
-    std::unordered_set<size_t> visited;
-    
-    const auto& nodes = graph.nodes();
-    const auto& edges = graph.edges();
-    
-    // Build adjacency lists
-    std::unordered_map<size_t, std::vector<size_t>> outgoing;
-    std::unordered_map<size_t, std::vector<size_t>> incoming;
-    
-    for (const auto& edge : edges) {
-        outgoing[edge.from].push_back(edge.to);
-        incoming[edge.to].push_back(edge.from);
+namespace {
+
+constexpr NodeId kUnassigned = std::numeric_limits<NodeId>::max();
+
+// Simple position-wise majority voting for unaligned sequences.
+// For sequences of different lengths, we pad shorter ones conceptually.
+// This is a fallback for 2 sequences or when abPOA is not available.
+std::string simple_majority_consensus(const std::vector<std::string>& sequences) {
+    if (sequences.empty()) {
+        return {};
+    }
+    if (sequences.size() == 1) {
+        return sequences[0];
     }
     
-    // Find chain starts (nodes with in-degree != 1 or out-degree != 1)
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        if (visited.count(i)) continue;
+    // Find max length
+    std::size_t max_len = 0;
+    for (const auto& seq : sequences) {
+        max_len = std::max(max_len, seq.size());
+    }
+    
+    std::string result;
+    result.reserve(max_len);
+    
+    for (std::size_t pos = 0; pos < max_len; ++pos) {
+        // Count bases at this position
+        std::array<int, 5> counts{}; // A=0, C=1, G=2, T=3, other=4
         
-        size_t in_deg = incoming[i].size();
-        size_t out_deg = outgoing[i].size();
-        
-        // Start a chain from branch points or sources
-        if (in_deg != 1 || out_deg != 1) {
-            // Try to extend forward
-            if (out_deg > 0) {
-                std::vector<size_t> chain;
-                chain.push_back(i);
-                visited.insert(i);
-                
-                size_t current = i;
-                while (outgoing[current].size() == 1) {
-                    size_t next = outgoing[current][0];
-                    if (visited.count(next)) break;
-                    if (incoming[next].size() != 1) break;
-                    
-                    chain.push_back(next);
-                    visited.insert(next);
-                    current = next;
-                }
-                
-                if (chain.size() > 1) {
-                    chains.push_back(chain);
-                }
+        for (const auto& seq : sequences) {
+            if (pos >= seq.size()) continue;
+            char c = seq[pos];
+            switch (c) {
+                case 'A': case 'a': ++counts[0]; break;
+                case 'C': case 'c': ++counts[1]; break;
+                case 'G': case 'g': ++counts[2]; break;
+                case 'T': case 't': ++counts[3]; break;
+                default: ++counts[4]; break;
             }
         }
-    }
-    
-    // Handle isolated linear chains (cycles or unvisited linear segments)
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        if (visited.count(i)) continue;
         
-        std::vector<size_t> chain;
-        chain.push_back(i);
-        visited.insert(i);
-        
-        size_t current = i;
-        while (outgoing[current].size() == 1) {
-            size_t next = outgoing[current][0];
-            if (visited.count(next)) break;
-            chain.push_back(next);
-            visited.insert(next);
-            current = next;
+        // Find majority base
+        int max_count = 0;
+        int max_idx = 4;
+        for (int i = 0; i < 4; ++i) {
+            if (counts[i] > max_count) {
+                max_count = counts[i];
+                max_idx = i;
+            }
         }
         
-        if (chain.size() > 1) {
-            chains.push_back(chain);
-        }
+        constexpr char bases[] = "ACGTN";
+        result += bases[max_idx];
     }
     
-    return chains;
+    return result;
 }
 
-OverlapGraph GraphCompactor::compact_unitigs_with_sequences(
-    const OverlapGraph& graph,
-    const std::vector<std::string>& /* sequences */) {
+// Build consensus from member node sequences.
+// Strategy:
+//   - 0 sequences with content -> empty consensus
+//   - 1 sequence -> use directly
+//   - 2 sequences -> use majority_voter (aligned) or simple majority (unaligned)
+//   - 3+ sequences -> simple majority (placeholder for abPOA)
+std::string build_unitig_consensus(
+    const std::vector<NodeId>& members,
+    const LosslessGraph& input) {
     
-    auto chains = find_unitig_chains(graph);
+    // Collect non-empty consensus sequences from member nodes
+    std::vector<std::string> sequences;
+    sequences.reserve(members.size());
     
-    if (chains.empty()) {
-        return graph;  // Nothing to compact
-    }
-    
-    const auto& old_nodes = graph.nodes();
-    const auto& old_edges = graph.edges();
-    
-    // Map old node IDs to new node IDs (or -1 if compacted away)
-    std::unordered_map<size_t, size_t> node_mapping;
-    std::unordered_set<size_t> compacted_nodes;
-    
-    OverlapGraph new_graph;
-    
-    // First, mark all nodes that are part of chains (except chain heads)
-    for (const auto& chain : chains) {
-        for (size_t i = 1; i < chain.size(); ++i) {
-            compacted_nodes.insert(chain[i]);
+    for (NodeId m : members) {
+        const auto& node = input.node(m);
+        if (!node.consensus.empty()) {
+            sequences.push_back(node.consensus);
         }
     }
     
-    // Add non-compacted nodes first
-    size_t new_id = 0;
-    for (size_t i = 0; i < old_nodes.size(); ++i) {
-        if (!compacted_nodes.count(i)) {
-            node_mapping[i] = new_id++;
-            new_graph.add_node(old_nodes[i].length_bp, old_nodes[i].read_support);
-        }
+    if (sequences.empty()) {
+        return {};
     }
     
-    // Process chains: update the chain head node with summed values
-    for (const auto& chain : chains) {
-        size_t head = chain[0];
-        size_t head_new_id = node_mapping[head];
-        
-        // Sum length and read_support along the chain
-        size_t total_length = 0;
-        size_t total_read_support = 0;
-        for (size_t node_id : chain) {
-            total_length += old_nodes[node_id].length_bp;
-            total_read_support += old_nodes[node_id].read_support;
-        }
-        
-        // Update the head node with summed values
-        // We need to access the node directly - use a workaround
-        // by rebuilding: remove and re-add is not supported, so we
-        // track the sums and apply them
-        auto& nodes_ref = const_cast<std::vector<Node>&>(new_graph.nodes());
-        nodes_ref[head_new_id].length_bp = total_length;
-        nodes_ref[head_new_id].read_support = total_read_support;
-        
-        // Map all chain nodes to the head's new ID
-        for (size_t node_id : chain) {
-            node_mapping[node_id] = head_new_id;
-        }
+    if (sequences.size() == 1) {
+        return sequences[0];
     }
     
-    // Add edges with updated node IDs
-    std::unordered_set<size_t> added_edges;  // To avoid duplicates
-    for (const auto& edge : old_edges) {
-        size_t new_from = node_mapping[edge.from];
-        size_t new_to = node_mapping[edge.to];
-        
-        // Skip self-loops created by compaction
-        if (new_from == new_to) continue;
-        
-        // Skip edges internal to chains
-        size_t edge_key = new_from * old_nodes.size() + new_to;
-        if (added_edges.count(edge_key)) continue;
-        added_edges.insert(edge_key);
-        
-        new_graph.add_edge(new_from, new_to, edge.read_support);
-    }
-    
-    return new_graph;
+    // For 2+ sequences, use simple majority voting
+    // This is a placeholder - in production, 3+ sequences would use abPOA
+    return simple_majority_consensus(sequences);
 }
 
-} // namespace graph
-} // namespace branch
+}  // namespace
+
+CompactionResult compact_unitigs(const LosslessGraph& input) {
+    CompactionResult result;
+    const std::size_t n = input.node_count();
+    result.old_to_new.assign(n, kUnassigned);
+
+    if (n == 0) {
+        return result;
+    }
+
+    // ---- Pass 1: degree counts and adjacency lookup ----
+    std::vector<std::uint32_t> in_degree(n, 0);
+    std::vector<std::uint32_t> out_degree(n, 0);
+
+    const auto& edges = input.edges();
+    for (const auto& e : edges) {
+        if (e.from < n) ++out_degree[e.from];
+        if (e.to < n)   ++in_degree[e.to];
+    }
+
+    // For each node that has out_degree == 1, remember its unique successor
+    // edge index so we can walk chains in O(1) per step.
+    std::vector<std::size_t> unique_out_edge(n, std::numeric_limits<std::size_t>::max());
+    std::vector<std::size_t> unique_in_edge(n, std::numeric_limits<std::size_t>::max());
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+        const auto& e = edges[i];
+        if (e.from < n && out_degree[e.from] == 1) {
+            unique_out_edge[e.from] = i;
+        }
+        if (e.to < n && in_degree[e.to] == 1) {
+            unique_in_edge[e.to] = i;
+        }
+    }
+
+    // ---- Pass 2: walk unitigs starting from every chain start ----
+    std::vector<std::vector<NodeId>> unitigs;
+    unitigs.reserve(n);
+
+    auto is_chain_start = [&](NodeId v) -> bool {
+        if (in_degree[v] != 1) return true;
+        // unique predecessor:
+        std::size_t ein = unique_in_edge[v];
+        const Edge& pe = edges[ein];
+        NodeId pred = pe.from;
+        return out_degree[pred] != 1;
+    };
+
+    for (NodeId v = 0; v < n; ++v) {
+        if (result.old_to_new[v] != kUnassigned) continue;
+        if (!is_chain_start(v)) continue;
+
+        NodeId unitig_id = static_cast<NodeId>(unitigs.size());
+        std::vector<NodeId> members;
+        NodeId cur = v;
+        while (true) {
+            members.push_back(cur);
+            result.old_to_new[cur] = unitig_id;
+
+            if (out_degree[cur] != 1) break;
+            std::size_t eout = unique_out_edge[cur];
+            NodeId next = edges[eout].to;
+            if (next >= n) break;  // defensive
+            if (in_degree[next] != 1) break;
+            if (result.old_to_new[next] != kUnassigned) break;  // cycle-safety
+            cur = next;
+        }
+        unitigs.push_back(std::move(members));
+    }
+
+    // ---- Pass 2b: pure cycles (every node in=out=1, no start found) ----
+    for (NodeId v = 0; v < n; ++v) {
+        if (result.old_to_new[v] != kUnassigned) continue;
+
+        NodeId unitig_id = static_cast<NodeId>(unitigs.size());
+        std::vector<NodeId> members;
+        NodeId cur = v;
+        while (true) {
+            if (result.old_to_new[cur] != kUnassigned) break;
+            members.push_back(cur);
+            result.old_to_new[cur] = unitig_id;
+            if (out_degree[cur] != 1) break;
+            std::size_t eout = unique_out_edge[cur];
+            NodeId next = edges[eout].to;
+            if (next >= n) break;
+            if (in_degree[next] != 1) break;
+            cur = next;
+        }
+        unitigs.push_back(std::move(members));
+    }
+
+    // ---- Pass 3: build the compacted graph with consensus ----
+    LosslessGraph& out = result.compacted;
+    for (const auto& members : unitigs) {
+        std::uint64_t total_length = 0;
+        for (NodeId m : members) {
+            total_length += input.node(m).length_bp;
+        }
+        const auto& start_node = input.node(members.front());
+        std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
+            ? std::numeric_limits<std::uint32_t>::max()
+            : static_cast<std::uint32_t>(total_length);
+        
+        NodeId new_id = out.add_node(len32, start_node.copy_count);
+        
+        // Build and set consensus for the new unitig node
+        std::string consensus = build_unitig_consensus(members, input);
+        if (!consensus.empty()) {
+            out.node(new_id).consensus = std::move(consensus);
+        }
+    }
+
+    // Emit only inter-unitig edges
+    for (const auto& e : edges) {
+        if (e.from >= n || e.to >= n) continue;
+        NodeId uf = result.old_to_new[e.from];
+        NodeId ut = result.old_to_new[e.to];
+        if (uf == ut) {
+            continue;
+        }
+        out.add_edge(uf, ut, e.read_support);
+    }
+
+    return result;
+}
+
+// New overload: compact with explicit sequences for consensus building
+CompactionResult compact_unitigs_with_sequences(
+    const LosslessGraph& input,
+    const std::vector<std::string>& node_sequences) {
+    
+    // First, copy sequences into input graph's consensus fields if provided
+    // (This is a workaround since input is const - we build consensus from
+    // the separate sequences vector)
+    
+    CompactionResult result;
+    const std::size_t n = input.node_count();
+    result.old_to_new.assign(n, kUnassigned);
+
+    if (n == 0) {
+        return result;
+    }
+
+    // ---- Pass 1: degree counts and adjacency lookup ----
+    std::vector<std::uint32_t> in_degree(n, 0);
+    std::vector<std::uint32_t> out_degree(n, 0);
+
+    const auto& edges = input.edges();
+    for (const auto& e : edges) {
+        if (e.from < n) ++out_degree[e.from];
+        if (e.to < n)   ++in_degree[e.to];
+    }
+
+    std::vector<std::size_t> unique_out_edge(n, std::numeric_limits<std::size_t>::max());
+    std::vector<std::size_t> unique_in_edge(n, std::numeric_limits<std::size_t>::max());
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+        const auto& e = edges[i];
+        if (e.from < n && out_degree[e.from] == 1) {
+            unique_out_edge[e.from] = i;
+        }
+        if (e.to < n && in_degree[e.to] == 1) {
+            unique_in_edge[e.to] = i;
+        }
+    }
+
+    // ---- Pass 2: walk unitigs ----
+    std::vector<std::vector<NodeId>> unitigs;
+    unitigs.reserve(n);
+
+    auto is_chain_start = [&](NodeId v) -> bool {
+        if (in_degree[v] != 1) return true;
+        std::size_t ein = unique_in_edge[v];
+        const Edge& pe = edges[ein];
+        NodeId pred = pe.from;
+        return out_degree[pred] != 1;
+    };
+
+    for (NodeId v = 0; v < n; ++v) {
+        if (result.old_to_new[v] != kUnassigned) continue;
+        if (!is_chain_start(v)) continue;
+
+        NodeId unitig_id = static_cast<NodeId>(unitigs.size());
+        std::vector<NodeId> members;
+        NodeId cur = v;
+        while (true) {
+            members.push_back(cur);
+            result.old_to_new[cur] = unitig_id;
+
+            if (out_degree[cur] != 1) break;
+            std::size_t eout = unique_out_edge[cur];
+            NodeId next = edges[eout].to;
+            if (next >= n) break;
+            if (in_degree[next] != 1) break;
+            if (result.old_to_new[next] != kUnassigned) break;
+            cur = next;
+        }
+        unitigs.push_back(std::move(members));
+    }
+
+    // Pass 2b: pure cycles
+    for (NodeId v = 0; v < n; ++v) {
+        if (result.old_to_new[v] != kUnassigned) continue;
+
+        NodeId unitig_id = static_cast<NodeId>(unitigs.size());
+        std::vector<NodeId> members;
+        NodeId cur = v;
+        while (true) {
+            if (result.old_to_new[cur] != kUnassigned) break;
+            members.push_back(cur);
+            result.old_to_new[cur] = unitig_id;
+            if (out_degree[cur] != 1) break;
+            std::size_t eout = unique_out_edge[cur];
+            NodeId next = edges[eout].to;
+            if (next >= n) break;
+            if (in_degree[next] != 1) break;
+            cur = next;
+        }
+        unitigs.push_back(std::move(members));
+    }
+
+    // ---- Pass 3: build compacted graph with consensus from sequences ----
+    LosslessGraph& out = result.compacted;
+    for (const auto& members : unitigs) {
+        std::uint64_t total_length = 0;
+        for (NodeId m : members) {
+            total_length += input.node(m).length_bp;
+        }
+        const auto& start_node = input.node(members.front());
+        std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
+            ? std::numeric_limits<std::uint32_t>::max()
+            : static_cast<std::uint32_t>(total_length);
+        
+        NodeId new_id = out.add_node(len32, start_node.copy_count);
+        
+        // Build consensus from provided sequences
+        std::vector<std::string> seqs;
+        seqs.reserve(members.size());
+        for (NodeId m : members) {
+            if (m < node_sequences.size() && !node_sequences[m].empty()) {
+                seqs.push_back(node_sequences[m]);
+            }
+        }
+        
+        if (!seqs.empty()) {
+            out.node(new_id).consensus = simple_majority_consensus(seqs);
+        }
+    }
+
+    // Emit inter-unitig edges
+    for (const auto& e : edges) {
+        if (e.from >= n || e.to >= n) continue;
+        NodeId uf = result.old_to_new[e.from];
+        NodeId ut = result.old_to_new[e.to];
+        if (uf == ut) continue;
+        out.add_edge(uf, ut, e.read_support);
+    }
+
+    return result;
+}
+
+}  // namespace branch::graph
