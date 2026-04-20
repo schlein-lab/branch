@@ -201,9 +201,38 @@ inline constexpr double kVafMatchTolerance = 0.10;
 // bucket_size in bp. 500 is a sane default: small enough to keep
 // distinct cassette-copy-count alleles apart, large enough to
 // tolerate minor length drift from overlap trimming.
+//
+// Kept as a documented fallback for GFAs where RC:i is missing / all
+// zero (pre-P2.2 outputs). The preferred path is build_calls_from_gfa
+// below, which returns RC:i-driven est_vaf when RC:i is populated.
 [[nodiscard]] std::vector<CalledBubble> aggregate_nodes_by_length(
     const std::vector<CalledBubble>& nodes,
     std::uint32_t bucket_size_bp = 500);
+
+// Which path build_calls_from_gfa took. Reported for test diagnostics
+// so we can assert the RC:i-driven path was chosen in regression tests.
+enum class CalledBubbleSource {
+    kReadSupport,   // RC:i sum > 0 -> per-node VAF derived from RC:i
+    kLengthBucket,  // RC:i all zero / missing -> length-bucket fallback
+};
+
+// Build CalledBubble records from a parsed GFA node list, preferring
+// RC:i (per-node read support) when populated. Logic:
+//
+//   - If any node has RC:i > 0 (and the total RC:i sum > 0), emit one
+//     CalledBubble per node with est_vaf = RC:i / sum(RC:i). This is
+//     the P2.2+ path: every node now carries real read-support so the
+//     per-node VAF is meaningful.
+//   - Otherwise fall back to aggregate_nodes_by_length(bucket_size_bp)
+//     (pre-P2.2 behaviour). Length-bucket est_vaf is "fraction of
+//     graph nodes in this bucket" — a structural proxy that was the
+//     only sane option when every S-line had RC:i:0.
+//
+// `source_out`, if non-null, receives which branch ran.
+[[nodiscard]] std::vector<CalledBubble> build_calls_from_gfa(
+    const std::vector<CalledBubble>& nodes,
+    std::uint32_t bucket_size_bp = 500,
+    CalledBubbleSource* source_out = nullptr);
 
 // Write BandBenchmarkReport as JSON. Hand-rolled, no external deps.
 //

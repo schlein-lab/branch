@@ -62,6 +62,49 @@ TEST(GraphIOTest, Roundtrip_preserves_graph_structure) {
     EXPECT_NEAR(g2.edges()[0].vaf_confidence, 0.88f, 0.01f);
 }
 
+TEST(GraphIOTest, WriteGfa_emits_RC_tag_per_S_line) {
+    // Every S-line must carry RC:i:<node.read_support>.
+    LosslessGraph g;
+    g.add_node(1000);
+    g.add_node(500);
+    g.add_node(250);
+    g.node(0).read_support = 7;
+    g.node(1).read_support = 0;
+    g.node(2).read_support = 123;
+
+    std::ostringstream oss;
+    ASSERT_TRUE(write_gfa(g, oss));
+    const std::string gfa = oss.str();
+
+    // Exact format — node_id followed by sequence placeholder then tags.
+    EXPECT_NE(gfa.find("S\t0\t*\tLN:i:1000\tRC:i:7\t"), std::string::npos);
+    EXPECT_NE(gfa.find("S\t1\t*\tLN:i:500\tRC:i:0\t"),  std::string::npos);
+    EXPECT_NE(gfa.find("S\t2\t*\tLN:i:250\tRC:i:123\t"), std::string::npos);
+}
+
+TEST(GraphIOTest, Roundtrip_preserves_RC_read_support) {
+    // write -> read -> every node's read_support must match.
+    LosslessGraph g;
+    g.add_node(1000);
+    g.add_node(2000);
+    g.add_node(500);
+    g.node(0).read_support = 42;
+    g.node(1).read_support = 0;
+    g.node(2).read_support = 1'000'000;
+
+    std::ostringstream oss;
+    ASSERT_TRUE(write_gfa(g, oss));
+
+    LosslessGraph g2;
+    std::istringstream iss(oss.str());
+    ASSERT_TRUE(read_gfa(g2, iss));
+
+    ASSERT_EQ(g2.node_count(), 3u);
+    EXPECT_EQ(g2.node(0).read_support, 42u);
+    EXPECT_EQ(g2.node(1).read_support, 0u);
+    EXPECT_EQ(g2.node(2).read_support, 1'000'000u);
+}
+
 TEST(GraphIOTest, ReadGfa_skips_unknown_lines_gracefully) {
     std::string gfa = "H\tVN:Z:1.2\n"
                       "# this is a comment\n"

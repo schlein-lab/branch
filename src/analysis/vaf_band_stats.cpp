@@ -326,6 +326,46 @@ std::vector<CalledBubble> aggregate_nodes_by_length(
 }
 
 // ---------------------------------------------------------------------
+// build_calls_from_gfa
+// ---------------------------------------------------------------------
+//
+// Prefers RC:i-driven per-node VAF when any node has RC:i > 0. Before
+// P2.2 every S-line had RC:i:0 and the only workable path was the
+// length-bucket fallback; now that the compactor propagates read
+// support into the unitig node, per-node VAF is a real signal and
+// should drive the benchmark.
+
+std::vector<CalledBubble> build_calls_from_gfa(
+    const std::vector<CalledBubble>& nodes,
+    std::uint32_t bucket_size_bp,
+    CalledBubbleSource* source_out) {
+
+    std::uint64_t rc_sum = 0;
+    for (const auto& n : nodes) {
+        rc_sum += n.read_support;
+    }
+
+    if (rc_sum > 0) {
+        if (source_out) *source_out = CalledBubbleSource::kReadSupport;
+        std::vector<CalledBubble> out;
+        out.reserve(nodes.size());
+        for (const auto& n : nodes) {
+            CalledBubble cb = n;
+            // parse_gfa_nodes already computes this when RC:i is present,
+            // but recompute here so callers that hand-built `nodes` from a
+            // non-GFA source still get a sane est_vaf.
+            cb.est_vaf = static_cast<double>(n.read_support) /
+                         static_cast<double>(rc_sum);
+            out.push_back(std::move(cb));
+        }
+        return out;
+    }
+
+    if (source_out) *source_out = CalledBubbleSource::kLengthBucket;
+    return aggregate_nodes_by_length(nodes, bucket_size_bp);
+}
+
+// ---------------------------------------------------------------------
 // write_report_json
 // ---------------------------------------------------------------------
 

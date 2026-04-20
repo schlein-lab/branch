@@ -522,6 +522,16 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
         const auto& start_node = input.node(members.front());
         NodeId new_id = out.add_node(len32, start_node.copy_count);
 
+        // RC:i on the unitig S-line is the sum of member-node read_support.
+        // Always summed, regardless of how pick_unitig_length chose the length
+        // (chain-sum vs representative-for-twins) — coverage is additive.
+        std::uint64_t total_support = 0;
+        for (NodeId m : members) total_support += input.node(m).read_support;
+        out.node(new_id).read_support =
+            (total_support > std::numeric_limits<std::uint32_t>::max())
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(total_support);
+
         std::string consensus = build_unitig_consensus(members, input);
         if (!consensus.empty()) {
             out.node(new_id).consensus = std::move(consensus);
@@ -583,8 +593,14 @@ CompactionResult compact_unitigs_with_sequences(
     for (std::size_t i = 0; i < u_count; ++i) {
         const auto& members = unitigs[i];
         const std::uint32_t len32 = pick_unitig_length(members, input);
+        std::uint64_t total_support = 0;
+        for (NodeId m : members) total_support += input.node(m).read_support;
         const auto& start_node = input.node(members.front());
         new_ids[i] = out.add_node(len32, start_node.copy_count);
+        out.node(new_ids[i]).read_support =
+            (total_support > std::numeric_limits<std::uint32_t>::max())
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(total_support);
 
         auto& seqs = seqs_per_unitig[i];
         seqs.reserve(members.size());
