@@ -141,6 +141,9 @@ if(TARGET branch)
     add_executable(generate_branch_fixture fixtures/generate_branch_fixture.cpp)
     target_compile_features(generate_branch_fixture PRIVATE cxx_std_20)
 
+    add_executable(generate_branch_complex_fixture fixtures/generate_branch_complex_fixture.cpp)
+    target_compile_features(generate_branch_complex_fixture PRIVATE cxx_std_20)
+
     add_executable(test_e2e_assemble test_e2e_assemble.cpp)
     target_link_libraries(test_e2e_assemble PRIVATE GTest::gtest GTest::gtest_main)
     target_compile_features(test_e2e_assemble PRIVATE cxx_std_20)
