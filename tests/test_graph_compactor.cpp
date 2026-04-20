@@ -160,6 +160,151 @@ TEST(GraphCompactorTest, Single_read_consensus_direct_copy) {
     EXPECT_EQ(r.compacted.node(0).consensus, "ATCGA");
 }
 
+TEST(GraphCompactorTest, Tournament_clique_of_equal_length_nodes_merges_to_one_unitig) {
+    // Regression test for P2.3: the synthetic 4-allele fixture (and real
+    // read-overlap graphs generated from equal-length reads of a single
+    // allele) produces a tournament-shaped subgraph where every pair of
+    // nodes has a directed edge a→b (with a < b, the canonical ordering
+    // emitted by cpu_backend). In a tournament every node has
+    // in_degree>=1 and out_degree>=1, so the linear-chain pass cannot
+    // touch them — each remains its own unitig. Before this fix the
+    // compactor left the clique unchanged (N nodes → N unitigs); now
+    // the closed-twin pass collapses them to a single unitig.
+    //
+    // Guarding criterion: closed neighborhoods (N(v) ∪ {v}) agree across
+    // every member of the clique, AND the members share length_bp (the
+    // "different-allele firewall" that stops a 2-copy and a 6-copy read
+    // from collapsing into the same unitig when they happen to share
+    // neighbors).
+    LosslessGraph g;
+    constexpr std::uint32_t kLen = 19000;
+    constexpr int kCliqueSize = 6;
+    for (int i = 0; i < kCliqueSize; ++i) g.add_node(kLen, 1);
+    // Emit canonical-ordered directed edges for every pair.
+    for (int a = 0; a < kCliqueSize; ++a) {
+        for (int b = a + 1; b < kCliqueSize; ++b) {
+            g.add_edge(static_cast<NodeId>(a), static_cast<NodeId>(b), 1);
+        }
+    }
+
+    CompactionResult r = compact_unitigs(g);
+    EXPECT_EQ(r.compacted.node_count(), 1u)
+        << "closed-twin merge should collapse a tournament of equal-length "
+           "nodes into a single unitig";
+    // No inter-unitig edges: all 15 clique edges are now intra-unitig.
+    EXPECT_EQ(r.compacted.edge_count(), 0u);
+    // The merged unitig takes the representative (shared) length.
+    EXPECT_EQ(r.compacted.node(0).length_bp, kLen);
+    for (int i = 0; i < kCliqueSize; ++i) {
+        EXPECT_EQ(r.old_to_new[i], 0u)
+            << "clique member " << i << " should map to the merged unitig";
+    }
+}
+
+TEST(GraphCompactorTest, Closed_twins_of_different_length_do_not_merge) {
+    // Different-allele firewall. Two nodes that share every neighbor
+    // (closed-twin topology) but have distinct length_bp must remain
+    // separate — otherwise a 9kb k=2 read and a 19kb k=6 read would
+    // collapse into one unitig, destroying the allele distinction.
+    LosslessGraph g;
+    NodeId a = g.add_node(9000, 1);    // different length
+    NodeId b = g.add_node(19000, 1);
+    NodeId c = g.add_node(19000, 1);
+    NodeId d = g.add_node(19000, 1);
+    // a, b, c, d form a complete tournament on 4 equal-length nodes
+    // EXCEPT a has a different length. b,c,d are closed-twins; a is not.
+    g.add_edge(a, b, 1); g.add_edge(a, c, 1); g.add_edge(a, d, 1);
+    g.add_edge(b, c, 1); g.add_edge(b, d, 1);
+    g.add_edge(c, d, 1);
+
+    CompactionResult r = compact_unitigs(g);
+    EXPECT_EQ(r.compacted.node_count(), 2u)
+        << "b,c,d should collapse; a stays separate due to length mismatch";
+    EXPECT_NE(r.old_to_new[a], r.old_to_new[b]);
+    EXPECT_EQ(r.old_to_new[b], r.old_to_new[c]);
+    EXPECT_EQ(r.old_to_new[b], r.old_to_new[d]);
+}
+
+TEST(GraphCompactorTest, Isolated_nodes_merge_by_length_into_orphan_bundles) {
+    // Regression test for P2.3: graph_filter's containment drop
+    // removes every edge touching a contained node but cannot renumber
+    // NodeIds, so the node entries linger with in_degree=0 AND
+    // out_degree=0. Before this fix each isolated node remained its own
+    // singleton unitig, bloating the compacted graph 1:1 with dropped
+    // reads (73 extra unitigs on the 80-read fixture). Now they fold
+    // into one orphan unitig per distinct length_bp — preserving the
+    // coverage signal that length-bucket VAF aggregation reads out,
+    // without the 1:1 node blow-up.
+    LosslessGraph g;
+    // Three reads of length 4000 (k=0 family), five of length 9000
+    // (k=2 family), no edges among them. All eight end up isolated.
+    for (int i = 0; i < 3; ++i) g.add_node(4000, 1);
+    for (int i = 0; i < 5; ++i) g.add_node(9000, 1);
+
+    CompactionResult r = compact_unitigs(g);
+    EXPECT_EQ(r.compacted.node_count(), 2u)
+        << "two distinct isolated-read lengths should yield two orphan bundles";
+
+    // The two orphan bundles carry the representative length of their
+    // members, not the sum.
+    std::vector<std::uint32_t> observed;
+    for (NodeId u = 0; u < r.compacted.node_count(); ++u) {
+        observed.push_back(r.compacted.node(u).length_bp);
+    }
+    std::sort(observed.begin(), observed.end());
+    EXPECT_EQ(observed, (std::vector<std::uint32_t>{4000, 9000}));
+
+    // Members with matching length_bp share a unitig id.
+    EXPECT_EQ(r.old_to_new[0], r.old_to_new[1]);
+    EXPECT_EQ(r.old_to_new[0], r.old_to_new[2]);
+    EXPECT_EQ(r.old_to_new[3], r.old_to_new[4]);
+    EXPECT_EQ(r.old_to_new[3], r.old_to_new[7]);
+    EXPECT_NE(r.old_to_new[0], r.old_to_new[3]);
+}
+
+TEST(GraphCompactorTest, Fourway_synthetic_fixture_collapses_to_small_graph) {
+    // Integration-shaped regression: simulate the topology the
+    // assemble pipeline feeds to the compactor after graph_filter on
+    // the synthetic 4-allele fixture (copies {0,2,4,6}, 80 reads,
+    // cassette 2500bp, read_len 19000):
+    //   - 7 surviving nodes after containment drop, forming a
+    //     tournament: 1 k=2 node (len 9000) with outgoing edges to all
+    //     6 k=6 nodes (len 19000), plus the canonical a<b directed
+    //     edges among the k=6 peers (tournament of 6).
+    //   - 73 isolated nodes (reads dropped by containment but still
+    //     present in the node vector). Split by length to mirror the
+    //     real fixture: 12 × 4000 (k=0), 44 × 9000 (k=2 minus node 0),
+    //     17 × 14000 (k=4).
+    //
+    // Before P2.3 fix: 80 raw nodes → 80 compacted nodes (no-op).
+    // After: the tournament collapses (closed-twin merge, length gates
+    // node-0 out); the isolated nodes fold to 3 orphan bundles by
+    // length. Expected: 5 compacted nodes.
+    LosslessGraph g;
+
+    // Active survivor set: indices [0..6]. Node 0 is k=2 (9000); 1..6 k=6 (19000).
+    const NodeId node0 = g.add_node(9000, 1);
+    std::vector<NodeId> k6;
+    for (int i = 0; i < 6; ++i) k6.push_back(g.add_node(19000, 1));
+    for (NodeId v : k6) g.add_edge(node0, v, 1);
+    for (std::size_t a = 0; a < k6.size(); ++a) {
+        for (std::size_t b = a + 1; b < k6.size(); ++b) {
+            g.add_edge(k6[a], k6[b], 1);
+        }
+    }
+
+    // Isolated pool mirroring the real fixture's containment-dropped set.
+    for (int i = 0; i < 12; ++i) g.add_node(4000, 1);
+    for (int i = 0; i < 44; ++i) g.add_node(9000, 1);
+    for (int i = 0; i < 17; ++i) g.add_node(14000, 1);
+
+    CompactionResult r = compact_unitigs(g);
+    EXPECT_LE(r.compacted.node_count(), 10u)
+        << "fourway fixture should compact to ≤10 nodes (P2.3 deliverable)";
+    EXPECT_EQ(r.compacted.node_count(), 5u)
+        << "expected node-0 + merged-k6-cluster + 3 per-length orphan bundles";
+}
+
 TEST(GraphCompactorTest, Two_reads_consensus_majority) {
     // Two reads with 1 difference
     // Read 1: AAAA
