@@ -160,6 +160,48 @@ TEST(GraphCompactorTest, Single_read_consensus_direct_copy) {
     EXPECT_EQ(r.compacted.node(0).consensus, "ATCGA");
 }
 
+TEST(GraphCompactorTest, Unitig_read_support_sums_across_members) {
+    // Linear chain A->B->C->D with per-node read_support {3, 5, 1, 4}.
+    // The compactor should collapse them into one unitig whose
+    // read_support is 3+5+1+4 = 13, matching the RC:i that will be
+    // emitted on the S-line.
+    LosslessGraph g;
+    NodeId a = g.add_node(10, 1);
+    NodeId b = g.add_node(20, 1);
+    NodeId c = g.add_node(30, 1);
+    NodeId d = g.add_node(40, 1);
+    g.node(a).read_support = 3;
+    g.node(b).read_support = 5;
+    g.node(c).read_support = 1;
+    g.node(d).read_support = 4;
+    g.add_edge(a, b, 1);
+    g.add_edge(b, c, 1);
+    g.add_edge(c, d, 1);
+
+    CompactionResult r = compact_unitigs(g);
+    ASSERT_EQ(r.compacted.node_count(), 1u);
+    EXPECT_EQ(r.compacted.node(0).read_support, 13u);
+}
+
+TEST(GraphCompactorTest, Unitig_read_support_sums_in_with_sequences_overload) {
+    // Same propagation invariant on the parallel overload used by the
+    // CLI. Three-node chain with read_support {2, 2, 2} -> 6.
+    LosslessGraph g;
+    NodeId n0 = g.add_node(5, 1);
+    NodeId n1 = g.add_node(5, 1);
+    NodeId n2 = g.add_node(5, 1);
+    g.node(n0).read_support = 2;
+    g.node(n1).read_support = 2;
+    g.node(n2).read_support = 2;
+    g.add_edge(n0, n1, 1);
+    g.add_edge(n1, n2, 1);
+
+    std::vector<std::string> seqs = {"AAAAA", "AAAAA", "AAAAA"};
+    CompactionResult r = compact_unitigs_with_sequences(g, seqs);
+    ASSERT_EQ(r.compacted.node_count(), 1u);
+    EXPECT_EQ(r.compacted.node(0).read_support, 6u);
+}
+
 TEST(GraphCompactorTest, Two_reads_consensus_majority) {
     // Two reads with 1 difference
     // Read 1: AAAA
