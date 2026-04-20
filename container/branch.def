@@ -1,0 +1,43 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+        ca-certificates \
+        libcurl4-openssl-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        liblzma-dev \
+        pkg-config \
+        ninja-build
+    rm -rf /var/lib/apt/lists/*
+
+    # Build BRANCH from the repo copied in via %files.
+    cd /opt
+    mkdir -p build
+    cd build
+    cmake /opt/branch -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build . -j $(nproc) --target branch generate_branch_fixture generate_branch_complex_fixture
+    install -D /opt/build/src/cli/branch                       /usr/local/bin/branch
+    install -D /opt/build/tests/generate_branch_fixture        /usr/local/bin/generate_branch_fixture
+    install -D /opt/build/tests/generate_branch_complex_fixture /usr/local/bin/generate_branch_complex_fixture
+    rm -rf /opt/build /opt/branch
+
+%files
+    .. /opt/branch
+
+%environment
+    export LC_ALL=C
+
+%runscript
+    exec /usr/local/bin/branch "$@"
+
+%labels
+    Author schlein-lab
+    Version 0.3.0-phase2
