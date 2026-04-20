@@ -223,16 +223,24 @@ CompactionResult compact_unitigs(const LosslessGraph& input) {
     LosslessGraph& out = result.compacted;
     for (const auto& members : unitigs) {
         std::uint64_t total_length = 0;
+        // Sum of per-member read_support; becomes the unitig's RC:i on
+        // S-line emission. Clamp at UINT32_MAX to match the field width.
+        std::uint64_t total_support = 0;
         for (NodeId m : members) {
             total_length += input.node(m).length_bp;
+            total_support += input.node(m).read_support;
         }
         const auto& start_node = input.node(members.front());
         std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
             ? std::numeric_limits<std::uint32_t>::max()
             : static_cast<std::uint32_t>(total_length);
-        
+
         NodeId new_id = out.add_node(len32, start_node.copy_count);
-        
+        out.node(new_id).read_support =
+            (total_support > std::numeric_limits<std::uint32_t>::max())
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(total_support);
+
         // Build and set consensus for the new unitig node
         std::string consensus = build_unitig_consensus(members, input);
         if (!consensus.empty()) {
@@ -367,8 +375,12 @@ CompactionResult compact_unitigs_with_sequences(
     for (std::size_t i = 0; i < u_count; ++i) {
         const auto& members = unitigs[i];
         std::uint64_t total_length = 0;
+        // Propagate read_support: RC:i on the unitig S-line is the sum
+        // of member-node reads. Same clamp as compact_unitigs().
+        std::uint64_t total_support = 0;
         for (NodeId m : members) {
             total_length += input.node(m).length_bp;
+            total_support += input.node(m).read_support;
         }
         const auto& start_node = input.node(members.front());
         std::uint32_t len32 = (total_length > std::numeric_limits<std::uint32_t>::max())
@@ -376,6 +388,10 @@ CompactionResult compact_unitigs_with_sequences(
             : static_cast<std::uint32_t>(total_length);
 
         new_ids[i] = out.add_node(len32, start_node.copy_count);
+        out.node(new_ids[i]).read_support =
+            (total_support > std::numeric_limits<std::uint32_t>::max())
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(total_support);
 
         auto& seqs = seqs_per_unitig[i];
         seqs.reserve(members.size());
