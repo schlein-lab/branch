@@ -162,6 +162,25 @@ if(TARGET branch)
     add_dependencies(test_project_smoke branch)
     add_test(NAME ProjectSmoke COMMAND test_project_smoke)
 
+    # P2.1 assemble->analyze wiring. Exercises the GFA handoff:
+    # `branch assemble` writes a GFA, then `branch analyze --graph`
+    # loads it, detects bubbles, runs conservation, classifies via the
+    # hierarchical disambiguator, and writes per-bubble BED with
+    # confidences. Separate test because bubble detection on real
+    # assemblies is slow (bubble_detector complexity is quadratic in
+    # out-degree); this test uses a hand-crafted minimal bubble graph.
+    add_executable(test_e2e_analyze_wiring test_e2e_analyze_wiring.cpp)
+    target_link_libraries(test_e2e_analyze_wiring
+        PRIVATE branch_graph GTest::gtest GTest::gtest_main)
+    target_compile_features(test_e2e_analyze_wiring PRIVATE cxx_std_20)
+    target_include_directories(test_e2e_analyze_wiring
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(test_e2e_analyze_wiring PRIVATE
+        BRANCH_BINARY="$<TARGET_FILE:branch>"
+        GEN_FASTQ_BINARY="$<TARGET_FILE:generate_toy_fastq>")
+    add_dependencies(test_e2e_analyze_wiring branch generate_toy_fastq)
+    add_test(NAME E2E_AnalyzeWiring COMMAND test_e2e_analyze_wiring)
+
     # P1.3 VAF-band benchmark. Generates the 4-way bubble fixture,
     # runs branch assemble, parses the GFA, and reports per-band
     # retrieval metrics with a permissive low-band recall gate.
