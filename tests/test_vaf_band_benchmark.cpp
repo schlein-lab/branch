@@ -244,14 +244,19 @@ TEST_F(VafBandBenchmark, Benchmark_end_to_end_fourway_bubble) {
     ASSERT_TRUE(err.empty()) << "GFA parse error: " << err;
     ASSERT_GT(nodes.size(), 0u) << "BRANCH produced no nodes";
 
-    // BRANCH v0.2 keeps reads from distinct haplotypes as separate
-    // graph nodes (unitig compaction can't collapse across different
-    // cassette-copy lengths), and does not emit RC:i read support.
-    // Aggregate by length bucket so each haplotype contributes a
-    // single CalledBubble whose est_vaf reflects the fraction of
-    // graph nodes in that bucket.
-    auto calls = branch::analysis::aggregate_nodes_by_length(nodes, 500);
-    ASSERT_GT(calls.size(), 0u) << "no length-buckets after aggregation";
+    // P2.2+: every node carries real RC:i (read support) propagated
+    // from graph_builder (1-per-raw-read) through graph_compactor
+    // (summed across unitig members). build_calls_from_gfa prefers the
+    // RC:i-driven path and falls back to length-bucket aggregation
+    // only when sum(RC:i) == 0 (pre-P2.2 GFAs).
+    branch::analysis::CalledBubbleSource call_source{};
+    auto calls = branch::analysis::build_calls_from_gfa(
+        nodes, /*bucket_size_bp=*/500, &call_source);
+    ASSERT_GT(calls.size(), 0u) << "no calls after build_calls_from_gfa";
+    EXPECT_EQ(call_source, branch::analysis::CalledBubbleSource::kReadSupport)
+        << "RC:i should be populated post-P2.2 — benchmark took the "
+           "length-bucket fallback, which means the compactor didn't "
+           "propagate read_support onto the S-lines.";
 
     // Step 4. Compute per-band stats, write JSON + stdout table.
     auto report = branch::analysis::compute_band_stats(
@@ -311,6 +316,54 @@ TEST(VafBandStats, assign_band_boundaries) {
     EXPECT_EQ(assign_band(0.75), 4u);
     EXPECT_EQ(assign_band(1.0),  4u);
     EXPECT_EQ(assign_band(1.01), kVafBands.size());
+}
+
+// Unit coverage for the P2.2 RC:i preference: when any node has RC:i>0
+// the benchmark must use per-node RC:i-driven VAF, not length buckets.
+TEST(VafBandStats, build_calls_from_gfa_prefers_RC_when_populated) {
+    using branch::analysis::CalledBubble;
+    using branch::analysis::CalledBubbleSource;
+    using branch::analysis::build_calls_from_gfa;
+
+    std::vector<CalledBubble> nodes = {
+        {.node_id = 0, .est_copy_count = 1, .est_vaf = 0.0,
+         .read_support = 10, .length_bp = 500},
+        {.node_id = 1, .est_copy_count = 1, .est_vaf = 0.0,
+         .read_support = 30, .length_bp = 500},
+        {.node_id = 2, .est_copy_count = 1, .est_vaf = 0.0,
+         .read_support = 60, .length_bp = 500},
+    };
+
+    CalledBubbleSource src{};
+    auto calls = build_calls_from_gfa(nodes, 500, &src);
+    EXPECT_EQ(src, CalledBubbleSource::kReadSupport);
+    ASSERT_EQ(calls.size(), 3u);
+    // sum = 100 -> VAFs 0.10, 0.30, 0.60.
+    EXPECT_NEAR(calls[0].est_vaf, 0.10, 1e-9);
+    EXPECT_NEAR(calls[1].est_vaf, 0.30, 1e-9);
+    EXPECT_NEAR(calls[2].est_vaf, 0.60, 1e-9);
+}
+
+TEST(VafBandStats, build_calls_from_gfa_falls_back_to_length_bucket) {
+    using branch::analysis::CalledBubble;
+    using branch::analysis::CalledBubbleSource;
+    using branch::analysis::build_calls_from_gfa;
+
+    // All RC:i zero -> must hit the length-bucket fallback path.
+    std::vector<CalledBubble> nodes = {
+        {.node_id = 0, .est_copy_count = 1, .est_vaf = 0.0,
+         .read_support = 0, .length_bp = 500},
+        {.node_id = 1, .est_copy_count = 1, .est_vaf = 0.0,
+         .read_support = 0, .length_bp = 500},
+        {.node_id = 2, .est_copy_count = 1, .est_vaf = 0.0,
+         .read_support = 0, .length_bp = 1000},
+    };
+
+    CalledBubbleSource src{};
+    auto calls = build_calls_from_gfa(nodes, 500, &src);
+    EXPECT_EQ(src, CalledBubbleSource::kLengthBucket);
+    // Length-bucket aggregation: 2 buckets (500bp and 1000bp).
+    EXPECT_EQ(calls.size(), 2u);
 }
 
 // Unit coverage for compute_band_stats core semantics. No subprocess,
