@@ -21,8 +21,14 @@ BuildResult build_graph(std::span<const ReadMeta> reads,
 
     // Allocate one node per read. Overlap-derived node attributes are
     // filled in later passes (unitig compaction, CN inference).
+    //
+    // read_support starts at 1: every raw-read node is, by definition,
+    // supported by exactly one read (itself). The compactor sums these
+    // across collapsed members so the post-compaction unitig's RC:i
+    // reflects the real number of reads traversing it.
     for (const auto& rm : reads) {
         NodeId nid = r.graph.add_node(rm.length_bp);
+        r.graph.node(nid).read_support = 1;
         r.read_to_node[rm.read_id] = nid;
     }
 
