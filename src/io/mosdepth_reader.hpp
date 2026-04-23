@@ -2,10 +2,10 @@
 
 // BRANCH v0.2 — Minimal mosdepth output reader.
 //
-// Reads an uncompressed mosdepth *.regions.bed file (4-column BED
-// variant: chrom / start / end / name / mean_coverage) into memory.
-// For now we take the uncompressed path; gzip support can be added
-// without changing the public API.
+// Reads a mosdepth regions file into memory. Supports both plain
+// `.bed` and gzip-compressed `.bed.gz` (auto-detected by suffix).
+// Expected layout: 4-column BED (chrom / start / end / mean_coverage)
+// or 5-column (chrom / start / end / name / mean_coverage).
 
 #include <cstddef>
 #include <cstdint>
