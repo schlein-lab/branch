@@ -1,8 +1,10 @@
 # branch_gpu: overlap-kernel skeleton. Compiles differently depending on
-# BRANCH_BUILD_CUDA: a CUDA .cu file when ON, a CPU stub .cpp when OFF.
-# Either way the header branch/gpu/overlap_kernel.cuh is usable.
+# the resolved BRANCH_CUDA_ENABLED flag (set by the root CMakeLists from
+# BRANCH_BUILD_CUDA=AUTO|ON|OFF): a CUDA .cu file when ON, a CPU stub
+# .cpp when OFF. Either way the header branch/gpu/overlap_kernel.cuh
+# stays usable.
 
-if(BRANCH_BUILD_CUDA)
+if(BRANCH_CUDA_ENABLED)
     add_library(branch_gpu STATIC overlap_kernel.cu)
     set_target_properties(branch_gpu PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
