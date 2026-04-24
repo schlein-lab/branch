@@ -309,11 +309,17 @@ int run_analyze(int argc, char** argv) {
         // by mixed_decomposer is not yet wired through assemble->analyze
         // (P2.2 work), so we pass an empty vector — disambiguate_hierarchical
         // degrades to the single-level disambiguate() call in that case.
-        std::vector<branch::analysis::BedEntry> bed_entries;
-        bed_entries.reserve(bubbles.size());
+        //
+        // Each bubble's classification + BedEntry build is independent of
+        // every other bubble's, so we pre-size the output vector and fan
+        // the loop out with OpenMP — writes to distinct indices never
+        // race. Order of output matches input bubbles[] so determinism
+        // is preserved without an explicit sort.
+        std::vector<branch::analysis::BedEntry> bed_entries(bubbles.size());
         const std::vector<std::vector<char>> empty_snp_matrix;
         const branch::classify::DisambiguatorConfig dcfg{};
-        std::size_t n_classified = 0;
+
+        #pragma omp parallel for schedule(dynamic, 64)
         for (std::size_t i = 0; i < bubbles.size(); ++i) {
             const auto& b = bubbles[i];
             auto cand = to_candidate(static_cast<std::uint32_t>(i), b, graph);
@@ -322,7 +328,7 @@ int run_analyze(int argc, char** argv) {
             auto r = branch::classify::disambiguate_hierarchical(
                 cand.features, empty_snp_matrix, dcfg);
 
-            branch::analysis::BedEntry entry;
+            auto& entry = bed_entries[i];
             entry.chrom = "graph";
             entry.name = "bubble_" + std::to_string(i) + "_n" +
                          std::to_string(b.entry) + "_" + std::to_string(b.exit);
@@ -333,10 +339,8 @@ int run_analyze(int argc, char** argv) {
             for (const auto& alt : b.alts) {
                 entry.alt_read_supports.push_back(alt.total_read_support);
             }
-            bed_entries.push_back(std::move(entry));
-            ++n_classified;
         }
-        std::cout << "# bubbles_classified=" << n_classified << "\n";
+        std::cout << "# bubbles_classified=" << bed_entries.size() << "\n";
 
         // Diagnostic: surface min/max/mean confidence so callers can gate
         // without re-parsing the BED. NaN means "no bubbles detected".

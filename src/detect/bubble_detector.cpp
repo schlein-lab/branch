@@ -15,8 +15,11 @@
 #include "detect/bubble_detector.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
+
+#include <omp.h>
 
 namespace branch::detect {
 
@@ -135,86 +138,131 @@ std::vector<Bubble> detect_bubbles(
     };
     std::unordered_map<EntryExitKey, Bubble, EntryExitHash> bubbles;
 
-    std::size_t skipped_high_outdeg = 0;
-    for (NodeId entry = 0; entry < adj.size(); ++entry) {
-        if (adj[entry].size() < 2) continue;
-        if (cfg.max_entry_out_degree > 0 &&
-            adj[entry].size() > cfg.max_entry_out_degree) {
-            // Repeat-hub entries would explode the O(outdeg^2) pair loop.
-            // Skipping them is the correct behaviour — a true biological
-            // bubble has a handful of alternatives, not hundreds.
-            ++skipped_high_outdeg;
-            continue;
-        }
+    // Each entry's work is completely independent of every other entry's
+    // work — per-entry we compute reachability from each successor,
+    // enumerate pairs, and propose (entry, exit) bubbles. The only
+    // shared mutable state is the final `bubbles` map, which we merge
+    // sequentially after the parallel region so per-thread insertions
+    // don't fight for the same bucket under contention. Determinism is
+    // preserved because the alt dedup + (entry, exit) key sort at the
+    // end of this function already collapses any order-of-insertion
+    // difference into a canonical output.
+    using BubbleMap = std::unordered_map<EntryExitKey, Bubble, EntryExitHash>;
+    std::atomic<std::size_t> skipped_high_outdeg{0};
+    const int n_threads = std::max(1, omp_get_max_threads());
+    std::vector<BubbleMap> thread_bubbles(n_threads);
 
-        // Precompute reachability per successor *once* per entry so the
-        // pair loop below is O(outdeg^2) map lookups rather than
-        // O(outdeg^2) BFS calls. On the old code each BFS was recomputed
-        // (outdeg-1) times per successor, which combined with the
-        // unbounded DFS previously in reachable_within produced runtimes
-        // that were effectively quadratic-in-outdeg on top of the
-        // exponential path-copy blow-up.
-        std::vector<std::unordered_map<NodeId, PathRecord>> succ_reach;
-        succ_reach.reserve(adj[entry].size());
-        for (const auto& s : adj[entry]) {
-            succ_reach.emplace_back(reachable_within(s.to, adj,
-                                                      cfg.max_alt_path_length));
-        }
+    #pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        BubbleMap& local = thread_bubbles[tid];
 
-        // For each pair of out-successors, look for a common reachable exit.
-        for (std::size_t i = 0; i < adj[entry].size(); ++i) {
-            for (std::size_t j = i + 1; j < adj[entry].size(); ++j) {
-                const auto& ri = succ_reach[i];
-                const auto& rj = succ_reach[j];
+        #pragma omp for schedule(dynamic, 16)
+        for (NodeId entry = 0; entry < static_cast<NodeId>(adj.size()); ++entry) {
+            if (adj[entry].size() < 2) continue;
+            if (cfg.max_entry_out_degree > 0 &&
+                adj[entry].size() > cfg.max_entry_out_degree) {
+                // Repeat-hub entries would explode the O(outdeg^2) pair loop.
+                // Skipping them is the correct behaviour — a true biological
+                // bubble has a handful of alternatives, not hundreds.
+                skipped_high_outdeg.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
 
-                // Iterate the smaller map, look up in the larger.
-                auto* small = &ri;
-                auto* large = &rj;
-                if (ri.size() > rj.size()) std::swap(small, large);
+            // Precompute reachability per successor *once* per entry so the
+            // pair loop below is O(outdeg^2) map lookups rather than
+            // O(outdeg^2) BFS calls. On the old code each BFS was recomputed
+            // (outdeg-1) times per successor, which combined with the
+            // unbounded DFS previously in reachable_within produced runtimes
+            // that were effectively quadratic-in-outdeg on top of the
+            // exponential path-copy blow-up.
+            std::vector<std::unordered_map<NodeId, PathRecord>> succ_reach;
+            succ_reach.reserve(adj[entry].size());
+            for (const auto& s : adj[entry]) {
+                succ_reach.emplace_back(reachable_within(s.to, adj,
+                                                          cfg.max_alt_path_length));
+            }
 
-                // Deterministic iteration: extract keys, sort, then iterate.
-                // std::unordered_map iteration order is impl-defined and
-                // allocation-order dependent — iterating directly causes
-                // non-deterministic memory-allocation patterns downstream
-                // (peak-RAM varies across runs on identical input).
-                std::vector<NodeId> exits;
-                exits.reserve(small->size());
-                for (const auto& kv : *small) exits.push_back(kv.first);
-                std::sort(exits.begin(), exits.end());
+            // For each pair of out-successors, look for a common reachable exit.
+            for (std::size_t i = 0; i < adj[entry].size(); ++i) {
+                for (std::size_t j = i + 1; j < adj[entry].size(); ++j) {
+                    const auto& ri = succ_reach[i];
+                    const auto& rj = succ_reach[j];
 
-                for (NodeId exit_node : exits) {
-                    const auto& path_i = small->at(exit_node);
-                    auto it = large->find(exit_node);
-                    if (it == large->end()) continue;
-                    if (exit_node == entry) continue;
+                    // Iterate the smaller map, look up in the larger.
+                    auto* small = &ri;
+                    auto* large = &rj;
+                    if (ri.size() > rj.size()) std::swap(small, large);
 
-                    EntryExitKey key{entry, exit_node};
-                    auto [bit, inserted] = bubbles.try_emplace(key);
-                    if (inserted) {
-                        bit->second.entry = entry;
-                        bit->second.exit = exit_node;
+                    // Deterministic iteration: extract keys, sort, then iterate.
+                    // std::unordered_map iteration order is impl-defined and
+                    // allocation-order dependent — iterating directly causes
+                    // non-deterministic memory-allocation patterns downstream
+                    // (peak-RAM varies across runs on identical input).
+                    std::vector<NodeId> exits;
+                    exits.reserve(small->size());
+                    for (const auto& kv : *small) exits.push_back(kv.first);
+                    std::sort(exits.begin(), exits.end());
+
+                    for (NodeId exit_node : exits) {
+                        const auto& path_i = small->at(exit_node);
+                        auto it = large->find(exit_node);
+                        if (it == large->end()) continue;
+                        if (exit_node == entry) continue;
+
+                        EntryExitKey key{entry, exit_node};
+                        auto [bit, inserted] = local.try_emplace(key);
+                        if (inserted) {
+                            bit->second.entry = entry;
+                            bit->second.exit = exit_node;
+                        }
+
+                        // Alt from i
+                        AltPath alt_i;
+                        alt_i.nodes.push_back(adj[entry][i].to);
+                        alt_i.nodes.insert(alt_i.nodes.end(),
+                                           path_i.nodes.begin(), path_i.nodes.end());
+                        alt_i.total_read_support =
+                            adj[entry][i].read_support + path_i.support;
+                        bit->second.alts.push_back(std::move(alt_i));
+
+                        AltPath alt_j;
+                        alt_j.nodes.push_back(adj[entry][j].to);
+                        const auto& pj = it->second;
+                        alt_j.nodes.insert(alt_j.nodes.end(),
+                                           pj.nodes.begin(), pj.nodes.end());
+                        alt_j.total_read_support =
+                            adj[entry][j].read_support + pj.support;
+                        bit->second.alts.push_back(std::move(alt_j));
+                        bit->second.total_read_support =
+                            adj[entry][i].read_support + adj[entry][j].read_support;
                     }
-
-                    // Alt from i
-                    AltPath alt_i;
-                    alt_i.nodes.push_back(adj[entry][i].to);
-                    alt_i.nodes.insert(alt_i.nodes.end(),
-                                       path_i.nodes.begin(), path_i.nodes.end());
-                    alt_i.total_read_support = adj[entry][i].read_support + path_i.support;
-                    bit->second.alts.push_back(std::move(alt_i));
-
-                    AltPath alt_j;
-                    alt_j.nodes.push_back(adj[entry][j].to);
-                    const auto& pj = it->second;
-                    alt_j.nodes.insert(alt_j.nodes.end(),
-                                       pj.nodes.begin(), pj.nodes.end());
-                    alt_j.total_read_support = adj[entry][j].read_support + pj.support;
-                    bit->second.alts.push_back(std::move(alt_j));
-                    bit->second.total_read_support =
-                        adj[entry][i].read_support + adj[entry][j].read_support;
                 }
             }
         }
+    }
+
+    // Sequential merge: fold per-thread maps into the global map. We
+    // iterate threads in index order, and for each shared (entry, exit)
+    // key we concatenate the alts; the final dedup-sort-unique pass
+    // below canonicalises regardless of source-thread order.
+    for (auto& tb : thread_bubbles) {
+        for (auto& kv : tb) {
+            auto [bit, inserted] = bubbles.try_emplace(kv.first);
+            if (inserted) {
+                bit->second = std::move(kv.second);
+            } else {
+                // Merge alts; keep the larger total_read_support as a
+                // conservative aggregate. Alts will be deduped below.
+                for (auto& alt : kv.second.alts) {
+                    bit->second.alts.push_back(std::move(alt));
+                }
+                bit->second.total_read_support = std::max(
+                    bit->second.total_read_support,
+                    kv.second.total_read_support);
+            }
+        }
+        tb.clear();
     }
 
     // Deterministic emission: sort (entry, exit) keys before final pass
