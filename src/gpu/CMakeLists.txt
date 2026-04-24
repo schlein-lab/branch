@@ -17,4 +17,8 @@ target_include_directories(branch_gpu PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
 )
 target_compile_features(branch_gpu PUBLIC cxx_std_20)
-target_link_libraries(branch_gpu PUBLIC branch_backend)
+# branch_gpu only uses branch_backend's backend_vtable.hpp for the
+# OverlapPair struct layout — header-only, no linked symbols — so we
+# do not add branch_backend as a link dependency. This is deliberate:
+# branch_backend links branch_gpu for launch_overlap_kernel, so the
+# opposite link direction would create a cycle.

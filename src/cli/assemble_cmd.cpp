@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include "backend/backend_factory.hpp"
 #include "backend/backend_vtable.hpp"
 #include "backend/cpu_backend.hpp"
 #include "graph/delta_read.hpp"
@@ -51,6 +52,10 @@ void print_assemble_usage(std::ostream& os) {
           "  --ref-linear name=path  Linear reference for BED chrom/start/end (repeatable).\n"
           "  --paf   <path>  Write backend overlap pairs as PAF-12 (pre-graph-build).\n"
           "  --paths <path>  Write per-read graph paths as TSV: read_name\\tnode_ids\\tn_deltas.\n"
+          "\nBackend:\n"
+          "  --backend <mode>  overlap backend to use. auto (default) = prefer GPU,\n"
+          "                    fall back to CPU. cpu = force CPU (deterministic,\n"
+          "                    reference). gpu = require GPU, fail if unavailable.\n"
           "\nv0.2 notes:\n"
           "  - Unitig compaction enabled. No repeat resolution.\n";
 }
@@ -69,6 +74,10 @@ struct Args {
     std::string reference_path;  // Reference FASTA for alignment
     std::vector<std::pair<std::string, std::string>> ref_linear;  // name,path pairs
     int threads{4};
+    // Backend mode for overlap computation. auto = probe for GPU, use
+    // if available, fall back to CPU. cpu = force CPU (reference /
+    // deterministic tests). gpu = require GPU, error out if unavailable.
+    std::string backend_mode{"auto"};
     bool ok{false};
     std::string err;
 };
@@ -106,6 +115,7 @@ Args parse(int argc, char** argv) {
             }
         }
         else if (k == "--threads" || k == "-t") { auto v = needs("--threads"); if (!v) return a; a.threads = std::atoi(v); }
+        else if (k == "--backend") { auto v = needs("--backend"); if (!v) return a; a.backend_mode = v; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -190,7 +200,17 @@ int run_assemble(int argc, char** argv) {
     // 3. Compute overlaps.
     branch::backend::set_cpu_overlap_threads(
         static_cast<unsigned int>(a.threads > 0 ? a.threads : 1));
-    auto bk = branch::backend::make_cpu_backend();
+    std::string be_err;
+    const auto mode = branch::backend::parse_backend_mode(a.backend_mode, &be_err);
+    if (!be_err.empty()) {
+        std::cerr << "[branch assemble] " << be_err << "\n";
+    }
+    auto bk = branch::backend::make_backend(mode);
+    if (bk.empty()) {
+        std::cerr << "[branch assemble] requested backend unavailable (mode='"
+                  << a.backend_mode << "'); aborting.\n";
+        return 4;
+    }
     std::vector<branch::backend::OverlapPair> overlaps(a.max_overlaps);
     std::size_t n_overlaps = 0;
     bk.compute_overlaps(&batch, overlaps, &n_overlaps);

@@ -21,6 +21,11 @@ target_link_libraries(test_backend_vtable PRIVATE branch_backend GTest::gtest_ma
 target_compile_features(test_backend_vtable PRIVATE cxx_std_20)
 gtest_discover_tests(test_backend_vtable)
 
+add_executable(test_backend_factory test_backend_factory.cpp)
+target_link_libraries(test_backend_factory PRIVATE branch_backend GTest::gtest_main)
+target_compile_features(test_backend_factory PRIVATE cxx_std_20)
+gtest_discover_tests(test_backend_factory)
+
 add_executable(test_features test_features.cpp)
 target_link_libraries(test_features PRIVATE branch_classify GTest::gtest_main)
 target_compile_features(test_features PRIVATE cxx_std_20)
