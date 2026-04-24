@@ -41,8 +41,15 @@ std::vector<std::vector<Succ>> build_adjacency(
     return adj;
 }
 
-// Walk forward from `start` up to max_steps, recording every visited
-// node and the path to reach it. Returns a map node→(path, support).
+// Walk forward from `start` up to max_steps, recording every reachable
+// node with the *shortest* path found and its cumulative read support.
+// Returns a map node→(path, support).
+//
+// Implementation: level-BFS with a visited set. Each node is visited at
+// most once, regardless of cycles or graph density, yielding O(V + E)
+// per start — bounded by max_steps layers. Previous DFS-with-path-copy
+// had no visited set and blew up exponentially on dense/cyclic graphs
+// (branching factor^max_steps path copies per entry).
 struct PathRecord {
     std::vector<NodeId> nodes;
     std::uint32_t support{};
@@ -53,30 +60,54 @@ std::unordered_map<NodeId, PathRecord> reachable_within(
     const std::vector<std::vector<Succ>>& adj,
     std::uint32_t max_steps) {
     std::unordered_map<NodeId, PathRecord> out;
-    struct Frame { NodeId node; std::vector<NodeId> path; std::uint32_t support; std::uint32_t steps; };
-    std::vector<Frame> stack;
-    stack.push_back({start, {}, 0, 0});
+    if (start >= adj.size()) return out;
 
-    while (!stack.empty()) {
-        auto f = std::move(stack.back());
-        stack.pop_back();
-        if (f.steps > max_steps) continue;
+    // Use vector-indexed arrays rather than unordered_map: NodeIds are
+    // dense (0..adj.size()-1) so O(1) direct access is faster than
+    // hash-table inserts/lookups by ~10-50x on dense graphs.
+    const std::size_t N = adj.size();
+    std::vector<std::uint8_t> visited(N, 0);
+    std::vector<NodeId> parent(N, 0);
+    std::vector<std::uint32_t> edge_support(N, 0);
 
-        // Record reaching f.node (overwrite is fine; we just need any path).
-        if (f.node != start) {
-            auto [it, inserted] = out.try_emplace(f.node,
-                PathRecord{.nodes = f.path, .support = f.support});
-            (void)it; (void)inserted;
+    // Track nodes touched so we only iterate visited ones at reconstruction
+    // and only clear those slots on drop (not strictly needed here since
+    // `visited` lives for one call, but keeps reconstruction linear).
+    std::vector<NodeId> touched;
+    touched.reserve(128);
+
+    visited[start] = 1;
+    std::vector<NodeId> frontier;
+    frontier.push_back(start);
+    for (std::uint32_t step = 0; step < max_steps && !frontier.empty(); ++step) {
+        std::vector<NodeId> next_frontier;
+        next_frontier.reserve(frontier.size() * 2);
+        for (NodeId u : frontier) {
+            for (const auto& s : adj[u]) {
+                if (s.to >= N || visited[s.to]) continue;
+                visited[s.to] = 1;
+                parent[s.to] = u;
+                edge_support[s.to] = s.read_support;
+                touched.push_back(s.to);
+                next_frontier.push_back(s.to);
+            }
         }
+        frontier = std::move(next_frontier);
+    }
 
-        if (f.node >= adj.size()) continue;
-        for (const auto& s : adj[f.node]) {
-            auto new_path = f.path;
-            new_path.push_back(s.to);
-            stack.push_back({s.to, std::move(new_path),
-                             f.support + s.read_support,
-                             f.steps + 1});
+    // Reconstruct path [first_succ_of_start, ..., target] + cumulative support.
+    out.reserve(touched.size());
+    for (NodeId node : touched) {
+        std::vector<NodeId> rev_path;
+        std::uint32_t total_support = 0;
+        NodeId cur = node;
+        for (std::uint32_t hops = 0; cur != start && hops <= max_steps + 1; ++hops) {
+            rev_path.push_back(cur);
+            total_support += edge_support[cur];
+            cur = parent[cur];
         }
+        std::reverse(rev_path.begin(), rev_path.end());
+        out.emplace(node, PathRecord{.nodes = std::move(rev_path), .support = total_support});
     }
     return out;
 }
@@ -104,16 +135,37 @@ std::vector<Bubble> detect_bubbles(
     };
     std::unordered_map<EntryExitKey, Bubble, EntryExitHash> bubbles;
 
+    std::size_t skipped_high_outdeg = 0;
     for (NodeId entry = 0; entry < adj.size(); ++entry) {
         if (adj[entry].size() < 2) continue;
+        if (cfg.max_entry_out_degree > 0 &&
+            adj[entry].size() > cfg.max_entry_out_degree) {
+            // Repeat-hub entries would explode the O(outdeg^2) pair loop.
+            // Skipping them is the correct behaviour — a true biological
+            // bubble has a handful of alternatives, not hundreds.
+            ++skipped_high_outdeg;
+            continue;
+        }
+
+        // Precompute reachability per successor *once* per entry so the
+        // pair loop below is O(outdeg^2) map lookups rather than
+        // O(outdeg^2) BFS calls. On the old code each BFS was recomputed
+        // (outdeg-1) times per successor, which combined with the
+        // unbounded DFS previously in reachable_within produced runtimes
+        // that were effectively quadratic-in-outdeg on top of the
+        // exponential path-copy blow-up.
+        std::vector<std::unordered_map<NodeId, PathRecord>> succ_reach;
+        succ_reach.reserve(adj[entry].size());
+        for (const auto& s : adj[entry]) {
+            succ_reach.emplace_back(reachable_within(s.to, adj,
+                                                      cfg.max_alt_path_length));
+        }
 
         // For each pair of out-successors, look for a common reachable exit.
         for (std::size_t i = 0; i < adj[entry].size(); ++i) {
             for (std::size_t j = i + 1; j < adj[entry].size(); ++j) {
-                auto ri = reachable_within(adj[entry][i].to, adj,
-                                           cfg.max_alt_path_length);
-                auto rj = reachable_within(adj[entry][j].to, adj,
-                                           cfg.max_alt_path_length);
+                const auto& ri = succ_reach[i];
+                const auto& rj = succ_reach[j];
 
                 // Iterate the smaller map, look up in the larger.
                 auto* small = &ri;
