@@ -25,6 +25,7 @@
 #include "analysis/coverage_cn.hpp"
 #include "analysis/coverage_conservation.hpp"
 #include "analysis/repeat_cn.hpp"
+#include "common/memory.hpp"
 #include "classify/feature_extractor.hpp"
 #include "classify/features.hpp"
 #include "classify/hierarchical_disambiguator.hpp"
@@ -52,7 +53,11 @@ void print_analyze_usage(std::ostream& os) {
           "classifier confidence in column 5.\n"
           "\nMosdepth mode: one of --baseline-cov (explicit haploid baseline) or\n"
           "--baseline-prefix (median of regions whose name begins with prefix)\n"
-          "must be provided.\n";
+          "must be provided.\n"
+          "\nResource caps:\n"
+          "  --max-memory <size>  cap process virtual memory (e.g. 8G, 16GiB,\n"
+          "                       500M). OOM becomes a clean std::bad_alloc exit\n"
+          "                       (code 9) instead of SLURM / kernel SIGKILL.\n";
 }
 
 // Simple flag parser: captures --key value pairs.
@@ -64,6 +69,7 @@ struct Args {
     std::string repeat_bed;
     std::string graph_path;
     std::string out_bed;
+    std::string max_memory;  // e.g. "8G"; applied via setrlimit(RLIMIT_AS)
     bool ok = false;
     std::string err;
 };
@@ -128,6 +134,10 @@ Args parse_args(int argc, char** argv) {
             auto v = needs_val("--out-bed");
             if (!v) return a;
             a.out_bed = v;
+        } else if (k == "--max-memory") {
+            auto v = needs_val("--max-memory");
+            if (!v) return a;
+            a.max_memory = v;
         } else if (k == "--help" || k == "-h") {
             a.err = "HELP";
             return a;
@@ -212,6 +222,22 @@ int run_analyze(int argc, char** argv) {
         std::cerr << "branch analyze: " << a.err << "\n\n";
         print_analyze_usage(std::cerr);
         return 2;
+    }
+
+    if (!a.max_memory.empty()) {
+        auto bytes = branch::common::parse_memory_size(a.max_memory);
+        if (!bytes) {
+            std::cerr << "branch analyze: cannot parse --max-memory '"
+                      << a.max_memory << "'\n";
+            return 2;
+        }
+        if (!branch::common::set_memory_budget(*bytes)) {
+            std::cerr << "branch analyze: setrlimit(RLIMIT_AS) failed; "
+                         "continuing without budget\n";
+        } else {
+            std::cerr << "[branch analyze] memory budget = "
+                      << branch::common::format_bytes(*bytes) << "\n";
+        }
     }
 
     // --- Mosdepth mode ----------------------------------------------------

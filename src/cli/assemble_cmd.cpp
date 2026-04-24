@@ -20,6 +20,7 @@
 #include "backend/backend_factory.hpp"
 #include "backend/backend_vtable.hpp"
 #include "backend/cpu_backend.hpp"
+#include "common/memory.hpp"
 #include "graph/delta_read.hpp"
 #include "graph/graph_builder.hpp"
 #include "graph/graph_io.hpp"
@@ -56,6 +57,10 @@ void print_assemble_usage(std::ostream& os) {
           "  --backend <mode>  overlap backend to use. auto (default) = prefer GPU,\n"
           "                    fall back to CPU. cpu = force CPU (deterministic,\n"
           "                    reference). gpu = require GPU, fail if unavailable.\n"
+          "\nResource caps:\n"
+          "  --max-memory <size>  cap process virtual memory (e.g. 8G, 16GiB,\n"
+          "                       500M). OOM becomes a clean std::bad_alloc exit\n"
+          "                       (code 9) instead of SLURM / kernel SIGKILL.\n"
           "\nv0.2 notes:\n"
           "  - Unitig compaction enabled. No repeat resolution.\n";
 }
@@ -78,6 +83,11 @@ struct Args {
     // if available, fall back to CPU. cpu = force CPU (reference /
     // deterministic tests). gpu = require GPU, error out if unavailable.
     std::string backend_mode{"auto"};
+    // Optional process-wide virtual-memory cap ("--max-memory 8G").
+    // 0 = no cap (default). Applied via setrlimit(RLIMIT_AS) before
+    // any large allocation so OOM fails cleanly with std::bad_alloc
+    // rather than triggering the kernel OOM-killer + SIGKILL.
+    std::string max_memory;
     bool ok{false};
     std::string err;
 };
@@ -116,6 +126,7 @@ Args parse(int argc, char** argv) {
         }
         else if (k == "--threads" || k == "-t") { auto v = needs("--threads"); if (!v) return a; a.threads = std::atoi(v); }
         else if (k == "--backend") { auto v = needs("--backend"); if (!v) return a; a.backend_mode = v; }
+        else if (k == "--max-memory") { auto v = needs("--max-memory"); if (!v) return a; a.max_memory = v; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -147,6 +158,24 @@ int run_assemble(int argc, char** argv) {
         std::cerr << "branch assemble: " << a.err << "\n\n";
         print_assemble_usage(std::cerr);
         return 2;
+    }
+
+    // Apply memory cap BEFORE any large allocation so the first
+    // over-budget allocation throws std::bad_alloc (caught in main).
+    if (!a.max_memory.empty()) {
+        auto bytes = branch::common::parse_memory_size(a.max_memory);
+        if (!bytes) {
+            std::cerr << "branch assemble: cannot parse --max-memory '"
+                      << a.max_memory << "' (try forms like 8G, 16GiB, 500M)\n";
+            return 2;
+        }
+        if (!branch::common::set_memory_budget(*bytes)) {
+            std::cerr << "branch assemble: setrlimit(RLIMIT_AS) failed; "
+                         "continuing without budget\n";
+        } else {
+            std::cerr << "[branch assemble] memory budget = "
+                      << branch::common::format_bytes(*bytes) << "\n";
+        }
     }
 
     auto t0 = std::chrono::steady_clock::now();
