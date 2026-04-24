@@ -124,3 +124,57 @@ TEST(GraphFilterTest, Containment_drops_short_engulfed_leaf) {
     EXPECT_TRUE(saw_mt);
     EXPECT_EQ(g.node_count(), 3u);
 }
+
+TEST(GraphFilterTest, Containment_transfers_read_support_to_coverer) {
+    // When a short node is dropped as contained, its read_support must
+    // be folded onto the absorbing predecessor so downstream VAF /
+    // coverage analysis still sees the right depth.
+    //
+    //   M(5000, rc=3) -> S(500, rc=2)   -- leaf, dropped; rc transfers.
+    //   M -> T(5000, rc=1)              -- same-length sibling, survives.
+    // Expected after filter: M.rc = 3 + 2 = 5; T.rc = 1 unchanged.
+    LosslessGraph g;
+    NodeId m = g.add_node(5000);
+    NodeId s = g.add_node(500);
+    NodeId t = g.add_node(5000);
+    g.node(m).read_support = 3;
+    g.node(s).read_support = 2;
+    g.node(t).read_support = 1;
+    g.add_edge(m, s, 1);
+    g.add_edge(m, t, 1);
+
+    FilterConfig cfg;
+    cfg.drop_contained = true;
+    cfg.reduce_transitive = false;
+
+    FilterStats st = filter_graph(g, cfg);
+
+    EXPECT_EQ(st.nodes_dropped_contained, 1u);
+    EXPECT_EQ(st.rc_transferred, 1u);
+    EXPECT_EQ(g.node(m).read_support, 5u)
+        << "covering predecessor must accumulate dropped node's RC";
+    EXPECT_EQ(g.node(t).read_support, 1u) << "sibling untouched";
+}
+
+TEST(GraphFilterTest, Keep_contained_preserves_all_nodes_and_rc) {
+    // With drop_contained = false, every node survives and no RC is
+    // transferred. Matches --keep-contained CLI path.
+    LosslessGraph g;
+    NodeId m = g.add_node(5000);
+    NodeId s = g.add_node(500);
+    g.node(m).read_support = 3;
+    g.node(s).read_support = 2;
+    g.add_edge(m, s, 1);
+
+    FilterConfig cfg;
+    cfg.drop_contained = false;
+    cfg.reduce_transitive = false;
+
+    FilterStats st = filter_graph(g, cfg);
+
+    EXPECT_EQ(st.nodes_dropped_contained, 0u);
+    EXPECT_EQ(st.rc_transferred, 0u);
+    EXPECT_EQ(g.node(m).read_support, 3u);
+    EXPECT_EQ(g.node(s).read_support, 2u);
+    EXPECT_EQ(g.edge_count(), 1u);
+}
