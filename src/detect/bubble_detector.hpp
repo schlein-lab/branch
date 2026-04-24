@@ -37,6 +37,15 @@ struct BubbleDetectorConfig {
     // are more likely structural variation than true bubbles; v0.2
     // hardcodes a conservative cap so detection stays O(V) per entry.
     std::uint32_t max_alt_path_length{8};
+
+    // Cap on out-degree of entry nodes. A node with out-degree O has
+    // O*(O-1)/2 successor pairs — above ~20 this is almost certainly an
+    // assembly-artefact repeat hub, not a true bubble entry, and the
+    // quadratic pair enumeration becomes the dominant runtime cost on
+    // dense graphs (observed: 200+ outdegree nodes at IGH repeats
+    // produce ~20k pairs each and hours of runtime). Entries exceeding
+    // this cap are skipped. 0 disables the cap.
+    std::uint32_t max_entry_out_degree{20};
 };
 
 // Detect bubbles in the graph. Returns a vector of Bubble records,
