@@ -81,8 +81,13 @@ OutAdjacency build_out_adjacency(std::size_t n,
 // explicit overlap offsets in a later revision, condition (ii) can be
 // tightened to also check offset agreement; the shape of the
 // predicate remains.
+// If coverer_out != nullptr, for every dropped node v the function
+// writes coverer_out->at(v) = the predecessor id that absorbed v (i.e.
+// the first strictly-longer pred satisfying the containment predicate).
+// Non-dropped entries are left as the caller initialised them.
 std::vector<std::uint8_t> mark_contained(const LosslessGraph& g,
-                                         const std::vector<Edge>& edges) {
+                                         const std::vector<Edge>& edges,
+                                         std::vector<NodeId>* coverer_out = nullptr) {
     const std::size_t n = g.node_count();
     std::vector<std::uint8_t> dropped(n, 0);
     if (n == 0) return dropped;
@@ -140,6 +145,7 @@ std::vector<std::uint8_t> mark_contained(const LosslessGraph& g,
             }
             if (covers_all) {
                 dropped[v] = 1;
+                if (coverer_out) (*coverer_out)[v] = pred;
                 break;
             }
         }
@@ -261,11 +267,39 @@ FilterStats filter_graph(LosslessGraph& graph, const FilterConfig& cfg) {
 
     // -------- Pass 1: containment drop --------
     if (cfg.drop_contained) {
-        auto dropped = mark_contained(graph, working);
+        // Capture the absorbing predecessor per dropped node so we can
+        // transfer that node's read_support onto its coverer. Without
+        // this step every node that survives the filter carries RC=1
+        // (the initial value set by graph_builder), which destroys
+        // downstream VAF estimation — a low-VAF alt supported by 2 reads
+        // that happens to be shorter than the major-allele read would
+        // be dropped here and its read count silently lost. Transferring
+        // RC keeps the information usable for post-hoc VAF / coverage
+        // filtering at the analyze stage, which is where thresholds
+        // belong anyway.
+        //
+        // Cascade limitation: single-pass transfer. If v is dropped into
+        // c, and c is itself dropped into c' in the same pass, v's RC
+        // lands on c, not c'. In practice c->c' cascades are rare since
+        // mark_contained requires strictly increasing length at each
+        // step, and the input graph's length distribution has a single
+        // upper tail of long reads.
+        std::vector<NodeId> coverer(graph.node_count(), 0);
+        auto dropped = mark_contained(graph, working, &coverer);
 
         std::size_t drop_count = 0;
-        for (auto flag : dropped) if (flag) ++drop_count;
+        std::size_t rc_transferred = 0;
+        for (NodeId v = 0; v < static_cast<NodeId>(dropped.size()); ++v) {
+            if (!dropped[v]) continue;
+            ++drop_count;
+            const NodeId c = coverer[v];
+            if (c != v && c < graph.node_count() && !dropped[c]) {
+                graph.node(c).read_support += graph.node(v).read_support;
+                ++rc_transferred;
+            }
+        }
         stats.nodes_dropped_contained = drop_count;
+        stats.rc_transferred = rc_transferred;
 
         if (drop_count > 0) {
             std::vector<Edge> kept;

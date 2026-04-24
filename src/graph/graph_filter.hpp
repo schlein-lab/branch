@@ -45,6 +45,10 @@ struct FilterStats {
     std::size_t edges_after{};
     std::size_t nodes_dropped_contained{};
     std::size_t transitive_edges_removed{};
+    // Count of containment-dropped nodes whose read_support was folded
+    // onto their absorbing predecessor. Lets callers verify that RC
+    // accounting survived the filter.
+    std::size_t rc_transferred{};
 };
 
 // Apply containment + transitive-reduction filters to `graph` in place.

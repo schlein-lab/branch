@@ -51,6 +51,12 @@ void print_assemble_usage(std::ostream& os) {
           "  --ref-linear name=path  Linear reference for BED chrom/start/end (repeatable).\n"
           "  --paf   <path>  Write backend overlap pairs as PAF-12 (pre-graph-build).\n"
           "  --paths <path>  Write per-read graph paths as TSV: read_name\\tnode_ids\\tn_deltas.\n"
+          "\nGraph filter:\n"
+          "  --keep-contained  Disable the containment-drop filter. Default: drop contained\n"
+          "                    nodes but transfer their read_support onto the covering\n"
+          "                    predecessor so VAF accounting survives. Enable this when every\n"
+          "                    short read must remain a distinct node (max-sensitivity mosaic\n"
+          "                    analysis); graph will be larger and noisier.\n"
           "\nv0.2 notes:\n"
           "  - Unitig compaction enabled. No repeat resolution.\n";
 }
@@ -69,6 +75,13 @@ struct Args {
     std::string reference_path;  // Reference FASTA for alignment
     std::vector<std::pair<std::string, std::string>> ref_linear;  // name,path pairs
     int threads{4};
+    // Disable the containment drop in filter_graph. Default is to drop
+    // contained reads but transfer their read_support onto the covering
+    // longer read, so VAF can still be estimated downstream. Set true
+    // when every short read must remain a distinct graph node — e.g.
+    // when the contained read carries an SNV that matters for mosaic
+    // analysis at the read-base level rather than the assembly level.
+    bool keep_contained{false};
     bool ok{false};
     std::string err;
 };
@@ -106,6 +119,7 @@ Args parse(int argc, char** argv) {
             }
         }
         else if (k == "--threads" || k == "-t") { auto v = needs("--threads"); if (!v) return a; a.threads = std::atoi(v); }
+        else if (k == "--keep-contained") { a.keep_contained = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -232,10 +246,13 @@ int run_assemble(int argc, char** argv) {
     std::cerr << "[branch assemble] raw_nodes=" << build.graph.node_count()
               << " raw_edges=" << build.graph.edge_count() << "\n";
     // 4a-filter. Apply graph filtering (containment + transitive reduction).
-    auto filter_stats = branch::graph::filter_graph(build.graph);
+    branch::graph::FilterConfig filter_cfg{};
+    filter_cfg.drop_contained = !a.keep_contained;
+    auto filter_stats = branch::graph::filter_graph(build.graph, filter_cfg);
     std::cerr << "[branch assemble] filtered: edges_before=" << filter_stats.edges_before
               << " edges_after=" << filter_stats.edges_after
               << " contained_dropped=" << filter_stats.nodes_dropped_contained
+              << " rc_transferred=" << filter_stats.rc_transferred
               << " transitive_removed=" << filter_stats.transitive_edges_removed << "\n";
 
     // 4b. Compact unitigs (collapse linear chains).
