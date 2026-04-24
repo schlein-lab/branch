@@ -6,10 +6,14 @@
 // Subcommands:
 //   analyze   paralog-aware CN inference from mosdepth regions.bed
 
+#include <exception>
 #include <iostream>
+#include <new>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/memory.hpp"
 
 namespace branch::cli {
 
@@ -35,7 +39,11 @@ void print_usage(std::ostream& os) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// Exit code 9 reserved for "memory budget exhausted" so shell wrappers
+// and SLURM job scripts can distinguish OOM from other failures.
+constexpr int kExitOutOfMemory = 9;
+
+int dispatch(int argc, char** argv) {
     if (argc < 2) {
         print_usage(std::cout);
         return 0;
@@ -61,4 +69,25 @@ int main(int argc, char** argv) {
     std::cerr << "Unknown subcommand: " << sub << "\n\n";
     print_usage(std::cerr);
     return 2;
+}
+
+int main(int argc, char** argv) {
+    branch::common::install_peak_rss_reporter();
+    try {
+        return dispatch(argc, argv);
+    } catch (const std::bad_alloc&) {
+        std::cerr << "\n[branch] FATAL: out of memory (std::bad_alloc). "
+                     "Either raise --max-memory / SLURM --mem, or run on a "
+                     "smaller input region. Peak RSS at abort = "
+                  << branch::common::format_bytes(
+                         branch::common::peak_rss_bytes())
+                  << "\n";
+        return kExitOutOfMemory;
+    } catch (const std::exception& e) {
+        std::cerr << "\n[branch] FATAL: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "\n[branch] FATAL: unknown exception\n";
+        return 1;
+    }
 }
