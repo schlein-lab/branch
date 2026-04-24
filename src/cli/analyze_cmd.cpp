@@ -329,6 +329,10 @@ int run_analyze(int argc, char** argv) {
             entry.start = 0;
             entry.end = cand.bubble_length_bp;
             entry.confidence = r.confidence;
+            entry.alt_read_supports.reserve(b.alts.size());
+            for (const auto& alt : b.alts) {
+                entry.alt_read_supports.push_back(alt.total_read_support);
+            }
             bed_entries.push_back(std::move(entry));
             ++n_classified;
         }
