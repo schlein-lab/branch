@@ -15,16 +15,45 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ------------------------------------------------------------------------------
 # Build Options
 # ------------------------------------------------------------------------------
-option(BRANCH_BUILD_CUDA "Build CUDA backends" OFF)
+# BRANCH_BUILD_CUDA: AUTO = probe for a CUDA toolchain and enable the
+# GPU build when found, silently fall back to CPU-only otherwise.
+# Explicit ON / OFF overrides the probe. Default AUTO so the same build
+# recipe works on GPU login nodes (enables GPU path) and plain CPU
+# workstations / CI (stays CPU-only) without any flag flipping.
+set(BRANCH_BUILD_CUDA "AUTO" CACHE STRING
+    "Build CUDA backends: AUTO (detect), ON (required), OFF (force-disable)")
+set_property(CACHE BRANCH_BUILD_CUDA PROPERTY STRINGS AUTO ON OFF)
+
 option(BRANCH_BUILD_TESTS "Build test suite" ON)
 option(BRANCH_USE_ASAN "Enable AddressSanitizer" OFF)
 option(BRANCH_USE_TSAN "Enable ThreadSanitizer" OFF)
 option(BRANCH_USE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 
 # ------------------------------------------------------------------------------
-# CUDA Configuration (optional)
+# CUDA Configuration
 # ------------------------------------------------------------------------------
-if(BRANCH_BUILD_CUDA)
+# Resolve BRANCH_BUILD_CUDA=AUTO via CUDAToolkit probe. We do the probe
+# in a separate block so the ON / OFF paths below see a boolean value.
+set(BRANCH_CUDA_ENABLED OFF)
+if(BRANCH_BUILD_CUDA STREQUAL "AUTO")
+    # find_package in QUIET mode so missing toolchain is silent on CPU boxes.
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        message(STATUS "BRANCH_BUILD_CUDA=AUTO: CUDA toolchain found (${CMAKE_CUDA_COMPILER}), enabling GPU build")
+        set(BRANCH_CUDA_ENABLED ON)
+    else()
+        message(STATUS "BRANCH_BUILD_CUDA=AUTO: no CUDA toolchain found, GPU build disabled (CPU-only binary)")
+    endif()
+elseif(BRANCH_BUILD_CUDA)
+    # Explicit ON — require CUDA and fail loudly if missing.
+    message(STATUS "BRANCH_BUILD_CUDA=ON: GPU build required")
+    set(BRANCH_CUDA_ENABLED ON)
+else()
+    message(STATUS "BRANCH_BUILD_CUDA=OFF: GPU build force-disabled")
+endif()
+
+if(BRANCH_CUDA_ENABLED)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
