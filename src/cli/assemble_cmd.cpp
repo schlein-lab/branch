@@ -57,6 +57,12 @@ void print_assemble_usage(std::ostream& os) {
           "  --backend <mode>  overlap backend to use. auto (default) = prefer GPU,\n"
           "                    fall back to CPU. cpu = force CPU (deterministic,\n"
           "                    reference). gpu = require GPU, fail if unavailable.\n"
+          "\nGraph filter:\n"
+          "  --keep-contained  Disable the containment-drop filter. Default: drop contained\n"
+          "                    nodes but transfer their read_support onto the covering\n"
+          "                    predecessor so VAF accounting survives. Enable this when every\n"
+          "                    short read must remain a distinct node (max-sensitivity mosaic\n"
+          "                    analysis); graph will be larger and noisier.\n"
           "\nResource caps:\n"
           "  --max-memory <size>  cap process virtual memory (e.g. 8G, 16GiB,\n"
           "                       500M). OOM becomes a clean std::bad_alloc exit\n"
@@ -88,6 +94,13 @@ struct Args {
     // any large allocation so OOM fails cleanly with std::bad_alloc
     // rather than triggering the kernel OOM-killer + SIGKILL.
     std::string max_memory;
+    // Disable the containment drop in filter_graph. Default is to drop
+    // contained reads but transfer their read_support onto the covering
+    // longer read, so VAF can still be estimated downstream. Set true
+    // when every short read must remain a distinct graph node — e.g.
+    // when the contained read carries an SNV that matters for mosaic
+    // analysis at the read-base level rather than the assembly level.
+    bool keep_contained{false};
     bool ok{false};
     std::string err;
 };
@@ -127,6 +140,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--threads" || k == "-t") { auto v = needs("--threads"); if (!v) return a; a.threads = std::atoi(v); }
         else if (k == "--backend") { auto v = needs("--backend"); if (!v) return a; a.backend_mode = v; }
         else if (k == "--max-memory") { auto v = needs("--max-memory"); if (!v) return a; a.max_memory = v; }
+        else if (k == "--keep-contained") { a.keep_contained = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -281,10 +295,13 @@ int run_assemble(int argc, char** argv) {
     std::cerr << "[branch assemble] raw_nodes=" << build.graph.node_count()
               << " raw_edges=" << build.graph.edge_count() << "\n";
     // 4a-filter. Apply graph filtering (containment + transitive reduction).
-    auto filter_stats = branch::graph::filter_graph(build.graph);
+    branch::graph::FilterConfig filter_cfg{};
+    filter_cfg.drop_contained = !a.keep_contained;
+    auto filter_stats = branch::graph::filter_graph(build.graph, filter_cfg);
     std::cerr << "[branch assemble] filtered: edges_before=" << filter_stats.edges_before
               << " edges_after=" << filter_stats.edges_after
               << " contained_dropped=" << filter_stats.nodes_dropped_contained
+              << " rc_transferred=" << filter_stats.rc_transferred
               << " transitive_removed=" << filter_stats.transitive_edges_removed << "\n";
 
     // 4b. Compact unitigs (collapse linear chains).
