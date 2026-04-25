@@ -105,6 +105,34 @@ void write_bed_entry(std::ostream& out, const BedEntry& entry) {
 
         // col 8: total alt support
         out << '\t' << sum;
+
+        // col 9-10: phased per-alt counts + hap_skew. Emitted only
+        // when phasing is available; otherwise the columns are absent
+        // (the BED stays at 8 columns, callers that don't expect 9-10
+        // see no surprise).
+        if (!entry.alt_read_supports_phased.empty() &&
+            entry.alt_read_supports_phased.size() == entry.alt_read_supports.size()) {
+            out << '\t';
+            std::uint64_t total_phased = 0;
+            std::uint32_t max_skew_abs = 0;
+            for (std::size_t i = 0; i < entry.alt_read_supports_phased.size(); ++i) {
+                if (i) out << ',';
+                const auto h0 = entry.alt_read_supports_phased[i][0];
+                const auto h1 = entry.alt_read_supports_phased[i][1];
+                out << h0 << '|' << h1;
+                total_phased += h0 + h1;
+                const std::uint32_t diff = h0 > h1 ? h0 - h1 : h1 - h0;
+                if (diff > max_skew_abs) max_skew_abs = diff;
+            }
+            if (total_phased >= 2) {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(4)
+                   << (static_cast<double>(max_skew_abs) / static_cast<double>(total_phased));
+                out << '\t' << ss.str();
+            } else {
+                out << "\t.";
+            }
+        }
     }
     out << '\n';
 }

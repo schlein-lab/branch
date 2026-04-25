@@ -27,6 +27,7 @@
 #include "analysis/repeat_cn.hpp"
 #include "common/memory.hpp"
 #include "graph/read_db.hpp"
+#include "phase/snv_phaser.hpp"
 #include "classify/feature_extractor.hpp"
 #include "classify/features.hpp"
 #include "classify/hierarchical_disambiguator.hpp"
@@ -358,6 +359,30 @@ int run_analyze(int argc, char** argv) {
         }
         std::cerr << "[branch analyze] bubbles=" << bubbles.size() << "\n";
 
+        // Build SNV phase blocks from the ReadDB so per-bubble alt
+        // counts can be split by haplotype. This requires per-read
+        // deltas in the GAF; when deltas are absent the phaser
+        // returns no blocks and downstream emission falls back to
+        // unphased columns. Layered on top — never blocks the
+        // pipeline.
+        std::vector<branch::phase::PhaseBlock> phase_blocks;
+        std::unordered_map<branch::graph::ReadId, std::uint8_t> read_to_hap;
+        if (reads_gaf_loaded) {
+            auto snvs = branch::phase::find_informative_snvs(read_db);
+            phase_blocks = branch::phase::build_phase_blocks(snvs);
+            std::size_t phased_reads = 0;
+            for (const auto& blk : phase_blocks) {
+                for (const auto& [rid, hap] : blk.read_haplotype) {
+                    if (hap == 255) continue;
+                    read_to_hap[rid] = hap;
+                    ++phased_reads;
+                }
+            }
+            std::cerr << "[branch analyze] phased: snvs=" << snvs.size()
+                      << " blocks=" << phase_blocks.size()
+                      << " reads_assigned=" << phased_reads << "\n";
+        }
+
         // Run the real solver on the loaded graph.
         auto report = branch::analysis::run_conservation(graph, bubbles, est);
         std::cout << "# conservation iterations=" << report.iterations_used
@@ -398,6 +423,10 @@ int run_analyze(int argc, char** argv) {
             entry.end = cand.bubble_length_bp;
             entry.confidence = r.confidence;
             entry.alt_read_supports.reserve(b.alts.size());
+            const bool fill_phased = !read_to_hap.empty()
+                                      && !b.alts.empty()
+                                      && !b.alts.front().reads_traversing.empty();
+            if (fill_phased) entry.alt_read_supports_phased.reserve(b.alts.size());
             for (const auto& alt : b.alts) {
                 // When --reads was passed, alt.reads_traversing was
                 // populated by detect_bubbles_with_reads with the
@@ -408,6 +437,16 @@ int run_analyze(int argc, char** argv) {
                     ? static_cast<std::uint32_t>(alt.reads_traversing.size())
                     : alt.total_read_support;
                 entry.alt_read_supports.push_back(support);
+
+                if (fill_phased) {
+                    std::array<std::uint32_t, 2> per_hap{0u, 0u};
+                    for (auto rid : alt.reads_traversing) {
+                        auto it = read_to_hap.find(rid);
+                        if (it == read_to_hap.end()) continue;
+                        if (it->second < 2) ++per_hap[it->second];
+                    }
+                    entry.alt_read_supports_phased.push_back(per_hap);
+                }
             }
         }
         std::cout << "# bubbles_classified=" << bed_entries.size() << "\n";
