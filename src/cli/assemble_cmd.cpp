@@ -22,6 +22,7 @@
 #include "backend/cpu_backend.hpp"
 #include "common/memory.hpp"
 #include "graph/delta_read.hpp"
+#include "graph/read_db.hpp"
 #include "graph/graph_builder.hpp"
 #include "graph/graph_io.hpp"
 #include "graph/graph_filter.hpp"
@@ -53,6 +54,12 @@ void print_assemble_usage(std::ostream& os) {
           "  --ref-linear name=path  Linear reference for BED chrom/start/end (repeatable).\n"
           "  --paf   <path>  Write backend overlap pairs as PAF-12 (pre-graph-build).\n"
           "  --paths <path>  Write per-read graph paths as TSV: read_name\\tnode_ids\\tn_deltas.\n"
+          "  --out-reads <path>  Write a lossless ReadDB to GAF (Graph Alignment Format).\n"
+          "                      Companion .unmapped.fastq is written next to it carrying\n"
+          "                      reads with no overlap evidence — these are never silently\n"
+          "                      dropped (could be contamination, could be dark genome).\n"
+          "                      Pass the GAF to `branch analyze --reads <path.gaf>` for\n"
+          "                      quantitative bubble VAF based on real read traversal.\n"
           "\nBackend:\n"
           "  --backend <mode>  overlap backend to use. auto (default) = prefer GPU,\n"
           "                    fall back to CPU. cpu = force CPU (deterministic,\n"
@@ -82,6 +89,11 @@ struct Args {
     std::string bed_path;
     std::string paf_path;
     std::string paths_path;
+    // Path for the lossless ReadDB output as GAF (Graph Alignment
+    // Format). Companion .unmapped.fastq is written automatically
+    // next to it carrying the no-overlap and filtered reads — those
+    // are never silently dropped.
+    std::string gaf_path;
     std::string reference_path;  // Reference FASTA for alignment
     std::vector<std::pair<std::string, std::string>> ref_linear;  // name,path pairs
     int threads{4};
@@ -123,6 +135,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--bed")      { auto v = needs("--bed");           if (!v) return a; a.bed_path = v; }
         else if (k == "--paf")      { auto v = needs("--paf");           if (!v) return a; a.paf_path = v; }
         else if (k == "--paths")    { auto v = needs("--paths");         if (!v) return a; a.paths_path = v; }
+        else if (k == "--out-reads"){ auto v = needs("--out-reads");     if (!v) return a; a.gaf_path = v; }
         else if (k == "--reference"){ auto v = needs("--reference");     if (!v) return a; a.reference_path = v; }
         else if (k == "--ref-linear"){ auto v = needs("--ref-linear");   if (!v) return a;
             std::string spec(v);
@@ -413,6 +426,59 @@ int run_assemble(int argc, char** argv) {
             }
             std::cerr << "[branch assemble] wrote paths TSV " << a.paths_path
                       << " (" << paths.size() << " rows)\n";
+        }
+
+        // 5d. Lossless ReadDB → GAF (Graph Alignment Format).
+        // Every input read becomes one ReadEntry: mapped reads with
+        // their unitig path, unmapped reads with their original
+        // sequence preserved (written to a companion .unmapped.fastq
+        // next to the GAF). Containment-dropped reads survive here
+        // because they carry the same path as their absorber. This
+        // is the single most important guarantee the user asked for:
+        // "kein read darf vollständig gelöscht werden".
+        if (!a.gaf_path.empty()) {
+            branch::graph::ReadDB db;
+            for (std::size_t i = 0; i < paths.size(); ++i) {
+                const auto& p = paths[i];
+                const std::string& name =
+                    (p.read_id < store.names.size())
+                        ? store.names[p.read_id]
+                        : ("read_" + std::to_string(p.read_id));
+                const std::string& seq =
+                    (p.read_id < store.sequences.size())
+                        ? store.sequences[p.read_id]
+                        : std::string{};
+
+                std::vector<branch::graph::PathStep> path_steps;
+                path_steps.reserve(p.path.size());
+                for (auto nid : p.path) {
+                    branch::graph::PathStep s{nid, 0,
+                        nid < final_graph.node_count() ? final_graph.node(nid).length_bp : 0u,
+                        false};
+                    path_steps.push_back(s);
+                }
+                const branch::graph::ReadBucket bucket =
+                    p.path.empty() ? branch::graph::ReadBucket::UnmappedNoOverlap
+                                   : branch::graph::ReadBucket::Mapped;
+                db.add(name, p.read_length, bucket,
+                       p.path.empty() ? seq : std::string{},
+                       std::move(path_steps), {});
+            }
+
+            const auto bc = db.bucket_counts();
+            std::cerr << "[branch assemble] read_db mapped=" << bc.mapped
+                      << " unmapped=" << bc.unmapped_no_overlap
+                      << " filtered=" << bc.filtered << "\n";
+
+            if (!db.write_gaf(a.gaf_path, final_graph)) {
+                std::cerr << "branch assemble: failed to write GAF "
+                          << a.gaf_path << "\n";
+                return 9;
+            }
+            std::cerr << "[branch assemble] wrote GAF " << a.gaf_path
+                      << " (" << bc.mapped << " mapped paths) + "
+                      << a.gaf_path << ".unmapped.fastq ("
+                      << (bc.unmapped_no_overlap + bc.filtered) << " reads)\n";
         }
     }
 

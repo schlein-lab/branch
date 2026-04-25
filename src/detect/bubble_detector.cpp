@@ -21,6 +21,8 @@
 
 #include <omp.h>
 
+#include "graph/read_db.hpp"
+
 namespace branch::detect {
 
 namespace {
@@ -291,6 +293,74 @@ std::vector<Bubble> detect_bubbles(
         out.push_back(std::move(b));
     }
     return out;
+}
+
+namespace {
+
+// Returns true iff the read's path contains entry, then the ordered
+// sequence of `alt_nodes`, all in order — possibly with other unitigs
+// between them, but never out-of-order. The detector emits alt_nodes
+// as [first_successor, ..., exit], so the exit is the last element
+// of alt_nodes; checking `alt_nodes` alone covers the whole bubble
+// span. Strand is ignored: a bubble alt is identified by
+// node-id-sequence and reads on either strand are equally valid
+// evidence.
+bool path_traverses(std::span<const branch::graph::PathStep> path,
+                    branch::graph::NodeId entry,
+                    std::span<const branch::graph::NodeId> alt_nodes) {
+    if (alt_nodes.empty()) return false;
+    auto it = path.begin();
+    const auto end = path.end();
+    while (it != end && it->unitig != entry) ++it;
+    if (it == end) return false;
+    ++it;
+    for (auto an : alt_nodes) {
+        while (it != end && it->unitig != an) ++it;
+        if (it == end) return false;
+        ++it;
+    }
+    return true;
+}
+
+void populate_reads_per_alt(std::vector<Bubble>& bubbles,
+                            const branch::graph::ReadDB& db) {
+    // For each bubble: count reads whose path goes
+    //   entry -> ... -> alt_nodes (in order) -> ... -> exit
+    // We iterate the read DB once per bubble. Per-bubble cost is
+    // O(reads_in_DB × path_length × alt_count). With OpenMP we share
+    // the bubble vector across threads (each writes to its own bubble
+    // index, no contention).
+    const auto& entries = db.all();
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (std::size_t bi = 0; bi < bubbles.size(); ++bi) {
+        auto& b = bubbles[bi];
+        std::unordered_set<branch::graph::ReadId> total_set;
+        total_set.reserve(64);
+        for (auto& alt : b.alts) {
+            alt.reads_traversing.clear();
+            for (const auto& e : entries) {
+                if (e.bucket != branch::graph::ReadBucket::Mapped) continue;
+                if (e.path.empty()) continue;
+                if (path_traverses(e.path, b.entry, alt.nodes)) {
+                    alt.reads_traversing.push_back(e.id);
+                    total_set.insert(e.id);
+                }
+            }
+            std::sort(alt.reads_traversing.begin(), alt.reads_traversing.end());
+        }
+        b.total_reads_traversing = static_cast<std::uint32_t>(total_set.size());
+    }
+}
+
+}  // namespace
+
+std::vector<Bubble> detect_bubbles_with_reads(
+    const branch::graph::LosslessGraph& graph,
+    const branch::graph::ReadDB& reads,
+    const BubbleDetectorConfig& cfg) {
+    auto bubbles = detect_bubbles(graph, cfg);
+    populate_reads_per_alt(bubbles, reads);
+    return bubbles;
 }
 
 }  // namespace branch::detect

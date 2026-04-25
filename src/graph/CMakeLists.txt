@@ -6,6 +6,7 @@ add_library(branch_graph STATIC
     graph_compactor.cpp
     graph_filter.cpp
     delta_read.cpp
+    read_db.cpp
 )
 target_include_directories(branch_graph PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
