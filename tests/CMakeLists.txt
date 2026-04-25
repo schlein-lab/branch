@@ -31,6 +31,16 @@ target_link_libraries(test_memory PRIVATE branch_common GTest::gtest_main)
 target_compile_features(test_memory PRIVATE cxx_std_20)
 gtest_discover_tests(test_memory)
 
+add_executable(test_read_db test_read_db.cpp)
+target_link_libraries(test_read_db PRIVATE branch_graph GTest::gtest_main)
+target_compile_features(test_read_db PRIVATE cxx_std_20)
+gtest_discover_tests(test_read_db)
+
+add_executable(test_snv_phaser test_snv_phaser.cpp)
+target_link_libraries(test_snv_phaser PRIVATE branch_phase branch_graph GTest::gtest_main)
+target_compile_features(test_snv_phaser PRIVATE cxx_std_20)
+gtest_discover_tests(test_snv_phaser)
+
 add_executable(test_features test_features.cpp)
 target_link_libraries(test_features PRIVATE branch_classify GTest::gtest_main)
 target_compile_features(test_features PRIVATE cxx_std_20)

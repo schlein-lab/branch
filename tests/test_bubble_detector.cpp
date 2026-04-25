@@ -6,11 +6,13 @@
 
 #include "detect/bubble_detector.hpp"
 #include "graph/lossless_graph.hpp"
+#include "graph/read_db.hpp"
 
 using branch::detect::AltPath;
 using branch::detect::Bubble;
 using branch::detect::BubbleDetectorConfig;
 using branch::detect::detect_bubbles;
+using branch::detect::detect_bubbles_with_reads;
 using branch::graph::LosslessGraph;
 using branch::graph::NodeId;
 
@@ -112,6 +114,73 @@ TEST(BubbleDetectorTest, Parallel_output_matches_serial_across_thread_counts) {
     EXPECT_EQ(ref.size(), ends.size());
     EXPECT_EQ(ref, p4);
     EXPECT_EQ(ref, p16);
+}
+
+// detect_bubbles_with_reads MUST report the actual number of reads
+// that traverse each alt — this is the quantity downstream VAF
+// analysis depends on. The legacy `total_read_support` field
+// approximates support by summing edge overlap counts, which
+// saturates at very low values; the new `reads_traversing` vector
+// counts reads via path-intersection and is exact.
+TEST(BubbleDetectorTest, detect_bubbles_with_reads_counts_real_reads_per_alt) {
+    using branch::graph::PathStep;
+    using branch::graph::ReadBucket;
+    using branch::graph::ReadDB;
+
+    // Topology: entry --> mid1 --> exit
+    //                 `-> mid2 --'
+    LosslessGraph g;
+    NodeId entry = g.add_node(100);
+    NodeId mid1  = g.add_node(100);
+    NodeId mid2  = g.add_node(100);
+    NodeId exit  = g.add_node(100);
+    g.add_edge(entry, mid1, 1);
+    g.add_edge(entry, mid2, 1);
+    g.add_edge(mid1, exit, 1);
+    g.add_edge(mid2, exit, 1);
+
+    // Read DB: 7 reads through alt1 (mid1), 3 reads through alt2 (mid2),
+    // 2 reads landing only on entry (don't span the bubble — should not
+    // be counted).
+    ReadDB db;
+    auto add_read = [&](const char* name,
+                        std::vector<PathStep> path,
+                        ReadBucket bucket = ReadBucket::Mapped) {
+        db.add(name, 300, bucket, "", std::move(path), {});
+    };
+    for (int i = 0; i < 7; ++i) {
+        add_read("alt1_read",
+                 {{entry, 0, 100, false}, {mid1, 0, 100, false}, {exit, 0, 100, false}});
+    }
+    for (int i = 0; i < 3; ++i) {
+        add_read("alt2_read",
+                 {{entry, 0, 100, false}, {mid2, 0, 100, false}, {exit, 0, 100, false}});
+    }
+    for (int i = 0; i < 2; ++i) {
+        add_read("partial_read", {{entry, 0, 100, false}});
+    }
+
+    auto bubbles = detect_bubbles_with_reads(g, db);
+    ASSERT_EQ(bubbles.size(), 1u);
+    const auto& b = bubbles[0];
+
+    EXPECT_EQ(b.total_reads_traversing, 10u)
+        << "10 reads span entry->exit via either alt; the 2 partials "
+           "must not be counted.";
+
+    ASSERT_EQ(b.alts.size(), 2u);
+    // alt.nodes is [first_successor, ..., exit] so for our linear
+    // mid bubbles it is {mid_x, exit} of size 2.
+    std::size_t alt1_count = 0, alt2_count = 0;
+    for (const auto& alt : b.alts) {
+        if (!alt.nodes.empty() && alt.nodes.front() == mid1) {
+            alt1_count = alt.reads_traversing.size();
+        } else if (!alt.nodes.empty() && alt.nodes.front() == mid2) {
+            alt2_count = alt.reads_traversing.size();
+        }
+    }
+    EXPECT_EQ(alt1_count, 7u);
+    EXPECT_EQ(alt2_count, 3u);
 }
 
 TEST(BubbleDetectorTest, Max_alt_path_length_caps_detection) {

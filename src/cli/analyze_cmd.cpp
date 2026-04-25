@@ -26,6 +26,7 @@
 #include "analysis/coverage_conservation.hpp"
 #include "analysis/repeat_cn.hpp"
 #include "common/memory.hpp"
+#include "graph/read_db.hpp"
 #include "classify/feature_extractor.hpp"
 #include "classify/features.hpp"
 #include "classify/hierarchical_disambiguator.hpp"
@@ -57,7 +58,13 @@ void print_analyze_usage(std::ostream& os) {
           "\nResource caps:\n"
           "  --max-memory <size>  cap process virtual memory (e.g. 8G, 16GiB,\n"
           "                       500M). OOM becomes a clean std::bad_alloc exit\n"
-          "                       (code 9) instead of SLURM / kernel SIGKILL.\n";
+          "                       (code 9) instead of SLURM / kernel SIGKILL.\n"
+          "\nQuantitative VAF (lossless ReadDB):\n"
+          "  --reads <path.gaf>   GAF file emitted by `branch assemble` describing\n"
+          "                       per-read paths through the graph. When given,\n"
+          "                       per-bubble alt support is computed by counting\n"
+          "                       reads whose path traverses each alt — quantitative\n"
+          "                       VAF rather than the legacy edge-overlap-sum proxy.\n";
 }
 
 // Simple flag parser: captures --key value pairs.
@@ -70,6 +77,10 @@ struct Args {
     std::string graph_path;
     std::string out_bed;
     std::string max_memory;  // e.g. "8G"; applied via setrlimit(RLIMIT_AS)
+    // Optional path to a GAF file (produced by `branch assemble`) so
+    // bubble VAFs can be computed from real read-path intersection
+    // instead of the legacy edge-overlap-sum proxy.
+    std::string reads_gaf;
     bool ok = false;
     std::string err;
 };
@@ -138,6 +149,10 @@ Args parse_args(int argc, char** argv) {
             auto v = needs_val("--max-memory");
             if (!v) return a;
             a.max_memory = v;
+        } else if (k == "--reads") {
+            auto v = needs_val("--reads");
+            if (!v) return a;
+            a.reads_gaf = v;
         } else if (k == "--help" || k == "-h") {
             a.err = "HELP";
             return a;
@@ -319,7 +334,28 @@ int run_analyze(int argc, char** argv) {
                   << "\n";
 
         // Structural bubble enumeration. Empty on linear assemblies.
-        auto bubbles = branch::detect::detect_bubbles(graph);
+        // If --reads <gaf> was passed, additionally count real reads
+        // per alt by intersecting bubble paths with the ReadDB; this
+        // populates AltPath::reads_traversing for downstream
+        // quantitative VAF.
+        std::vector<branch::detect::Bubble> bubbles;
+        bool reads_gaf_loaded = false;
+        branch::graph::ReadDB read_db;
+        if (!a.reads_gaf.empty()) {
+            if (!read_db.read_gaf(a.reads_gaf, graph)) {
+                std::cerr << "branch analyze: cannot read GAF " << a.reads_gaf
+                          << "; falling back to topological VAF\n";
+            } else {
+                reads_gaf_loaded = true;
+                std::cerr << "[branch analyze] loaded " << read_db.size()
+                          << " read paths from " << a.reads_gaf << "\n";
+            }
+        }
+        if (reads_gaf_loaded) {
+            bubbles = branch::detect::detect_bubbles_with_reads(graph, read_db);
+        } else {
+            bubbles = branch::detect::detect_bubbles(graph);
+        }
         std::cerr << "[branch analyze] bubbles=" << bubbles.size() << "\n";
 
         // Run the real solver on the loaded graph.
@@ -363,7 +399,15 @@ int run_analyze(int argc, char** argv) {
             entry.confidence = r.confidence;
             entry.alt_read_supports.reserve(b.alts.size());
             for (const auto& alt : b.alts) {
-                entry.alt_read_supports.push_back(alt.total_read_support);
+                // When --reads was passed, alt.reads_traversing was
+                // populated by detect_bubbles_with_reads with the
+                // exact set of reads whose path traverses this alt.
+                // That is the quantity we want for VAF; fall back to
+                // the legacy edge-sum proxy when no GAF was provided.
+                const std::uint32_t support = !alt.reads_traversing.empty()
+                    ? static_cast<std::uint32_t>(alt.reads_traversing.size())
+                    : alt.total_read_support;
+                entry.alt_read_supports.push_back(support);
             }
         }
         std::cout << "# bubbles_classified=" << bed_entries.size() << "\n";

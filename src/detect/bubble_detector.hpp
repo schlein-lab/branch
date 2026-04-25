@@ -18,11 +18,24 @@
 
 #include "graph/lossless_graph.hpp"
 
+namespace branch::graph { class ReadDB; }
+
 namespace branch::detect {
 
 struct AltPath {
     std::vector<branch::graph::NodeId> nodes;  // intermediate nodes between entry and exit
+    // Topological support: cumulative edge `read_support` along this alt
+    // path (the legacy v0.2 metric — saturates at very low values
+    // because edge supports are overlap-pair counts, not read counts).
+    // Kept for backward-compat callers; use `reads_traversing` when a
+    // ReadDB is available to count reads exactly.
     std::uint32_t total_read_support{};
+    // Per-alt read count: number of reads in the supplied ReadDB whose
+    // path contains the bubble entry, this alt's intermediate nodes
+    // (in order), and the bubble exit. Empty / zero when detect_bubbles
+    // was called without a ReadDB. This is the quantity downstream VAF
+    // analysis should use: it counts reads, not topology events.
+    std::vector<branch::graph::ReadId> reads_traversing;
 };
 
 struct Bubble {
@@ -30,6 +43,11 @@ struct Bubble {
     branch::graph::NodeId exit;
     std::vector<AltPath> alts;
     std::uint32_t total_read_support{};
+    // Total reads (union over all alts, deduplicated) that traverse
+    // this bubble entry → exit. Filled when detect_bubbles is given a
+    // ReadDB; left at 0 otherwise. Use this as the denominator when
+    // computing per-alt VAF from `alts[i].reads_traversing.size()`.
+    std::uint32_t total_reads_traversing{};
 };
 
 struct BubbleDetectorConfig {
@@ -53,6 +71,18 @@ struct BubbleDetectorConfig {
 // between them.
 [[nodiscard]] std::vector<Bubble> detect_bubbles(
     const branch::graph::LosslessGraph& graph,
+    const BubbleDetectorConfig& cfg = {});
+
+// Same, but additionally counts reads traversing each alt by
+// intersecting with the supplied ReadDB. After this call every
+// AltPath has `reads_traversing` populated with the read IDs whose
+// graph path contains the entry, the alt's intermediate nodes (in
+// order), and the exit. Use AltPath::reads_traversing.size() as the
+// per-alt support for downstream VAF (denominator =
+// Bubble::total_reads_traversing).
+[[nodiscard]] std::vector<Bubble> detect_bubbles_with_reads(
+    const branch::graph::LosslessGraph& graph,
+    const branch::graph::ReadDB& reads,
     const BubbleDetectorConfig& cfg = {});
 
 }  // namespace branch::detect
