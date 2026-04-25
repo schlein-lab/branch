@@ -25,9 +25,9 @@ TEST(AnnotationBed, LoadBed) {
 
 TEST(AnnotationBed, IntervalIndexQuery) {
     std::vector<BedEntry> entries = {
-        {"chr1", "seg1", 100, 200, std::nullopt, {}},
-        {"chr1", "seg2", 300, 400, std::nullopt, {}},
-        {"chr2", "seg3", 500, 600, std::nullopt, {}}
+        {"chr1", "seg1", 100, 200, std::nullopt, {}, {}},
+        {"chr1", "seg2", 300, 400, std::nullopt, {}, {}},
+        {"chr2", "seg3", 500, 600, std::nullopt, {}, {}}
     };
     IntervalIndex idx(entries);
     
@@ -62,8 +62,8 @@ TEST(AnnotationBed, ConfidenceColumnRoundTrip) {
     const char* tmp = "/tmp/test_annot_conf.bed";
     {
         std::ofstream f(tmp);
-        BedEntry with_conf{"chr1", "bubble_1", 100, 200, 0.873f, {}};
-        BedEntry without_conf{"chr1", "bubble_2", 300, 400, std::nullopt, {}};
+        BedEntry with_conf{"chr1", "bubble_1", 100, 200, 0.873f, {}, {}};
+        BedEntry without_conf{"chr1", "bubble_2", 300, 400, std::nullopt, {}, {}};
         write_bed_entry(f, with_conf);
         write_bed_entry(f, without_conf);
     }
@@ -81,9 +81,9 @@ TEST(AnnotationBed, AltReadSupportColumnRoundTrip) {
     const char* tmp = "/tmp/test_annot_vaf.bed";
     {
         std::ofstream f(tmp);
-        BedEntry two_alts{"graph", "bubble_1", 0, 50000, 0.9f, {45u, 3u}};
-        BedEntry three_alts{"graph", "bubble_2", 0, 12000, 0.5f, {100u, 10u, 2u}};
-        BedEntry no_alts{"graph", "bubble_3", 0, 100, 0.1f, {}};
+        BedEntry two_alts{"graph", "bubble_1", 0, 50000, 0.9f, {45u, 3u}, {}};
+        BedEntry three_alts{"graph", "bubble_2", 0, 12000, 0.5f, {100u, 10u, 2u}, {}};
+        BedEntry no_alts{"graph", "bubble_3", 0, 100, 0.1f, {}, {}};
         write_bed_entry(f, two_alts);
         write_bed_entry(f, three_alts);
         write_bed_entry(f, no_alts);
@@ -102,8 +102,8 @@ TEST(AnnotationBed, AltReadSupportColumnRoundTrip) {
 // P2.4: serialised output columns are exactly 8 with alts, 5 without.
 TEST(AnnotationBed, AltSupportSerialisedColumnCounts) {
     std::ostringstream os_with, os_without;
-    BedEntry with_alts{"graph", "b1", 0, 1000, 0.8f, {40u, 10u}};
-    BedEntry without_alts{"chr1", "b2", 100, 200, 0.5f, {}};
+    BedEntry with_alts{"graph", "b1", 0, 1000, 0.8f, {40u, 10u}, {}};
+    BedEntry without_alts{"chr1", "b2", 100, 200, 0.5f, {}, {}};
     write_bed_entry(os_with, with_alts);
     write_bed_entry(os_without, without_alts);
 
@@ -126,7 +126,7 @@ TEST(AnnotationBed, AltSupportSerialisedColumnCounts) {
 // P2.4: min_vaf is "." when fewer than 2 alts.
 TEST(AnnotationBed, AltSupportSingleAltHasNoVaf) {
     std::ostringstream os;
-    BedEntry one_alt{"graph", "b1", 0, 100, std::nullopt, {17u}};
+    BedEntry one_alt{"graph", "b1", 0, 100, std::nullopt, {17u}, {}};
     write_bed_entry(os, one_alt);
     // Expected tail: "\t17\t.\t17\n"
     EXPECT_NE(os.str().find("\t17\t.\t17\n"), std::string::npos);
