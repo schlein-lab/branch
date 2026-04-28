@@ -1,5 +1,9 @@
 # BRANCH — Lossless Assembly Graph for Low-Frequency CNV Discovery
 
+🌐 [branch-assembler.com](https://branch-assembler.com) ·
+🔬 Companion viewer: [VariantPaths](https://github.com/schlein-lab/variantpaths)
+([variantpaths.com](https://variantpaths.com))
+
 ## Overview
 BRANCH is a HiFi-read genome assembler built to be state-of-the-art at low-frequency copy-number variants. It produces a lossless, CN-aware assembly graph where branches are graph bifurcations (not tumor clones). Every variant call carries VAF evidence from reads, in-silico PCR, and k-mer counts.
 
@@ -21,6 +25,33 @@ reader → graph_build → graph_compactor → graph_filter → assemble
 - Consensus FASTA per branch.
 - VAF evidence channels: supporting reads, primer-bracketed in-silico PCR amplicons, k-mer counts on read sequence.
 - Genome-wide repeat CN for main path and every branch, normalised against single-copy reference amplicons.
+
+## Visualizing BRANCH output
+
+[**VariantPaths**](https://github.com/schlein-lab/variantpaths) is the
+companion standalone viewer. It reads `.vpf` (topology + VAF + dbVar
+match) and `.vpz` (alt-path nucleotide sequences) files, both built
+from BRANCH outputs:
+
+```sh
+# 1. BRANCH produces bubble BED + GFA per sample
+branch assemble  --fastq sample.fq  --out sample.gfa  --out-reads sample.gaf
+branch analyze   --graph sample.gfa --reads sample.gaf --out-bed sample.bubbles.bed
+
+# 2. Aggregate + classify across samples (dbVar overlap, recurrence, VAF)
+python3 phase_d/scripts/11_branch_atlas.py \
+    --inputs "sampleA.bubbles.bed:sampleA,sampleB.bubbles.bed:sampleB" \
+    --out per_bubble_master.tsv
+
+# 3. Convert to portable .vpf (topology) + .vpz (sequences)
+#    schlein-lab/variantpaths/build_vpf.py
+#    schlein-lab/variantpaths/build_vpz.py
+
+# 4. Open in VariantPaths
+variantpaths sample.vpf sample.vpz reference.fa
+```
+
+See [variantpaths.com](https://variantpaths.com) for full feature docs.
 
 ## Build
 ```
