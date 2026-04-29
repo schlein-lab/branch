@@ -93,4 +93,20 @@ void sketch_read(std::string_view seq,
                  ReadId read_id,
                  std::vector<MinimizerHit>& out) noexcept;
 
+// Overload that takes an explicit MinimizerProfile. Used by the overlap
+// backends when the user has selected a non-HiFi `--read-tech`. The
+// no-profile overload above stays as a thin wrapper that calls this
+// one with the global current_profile() (kProfileHiFi by default), so
+// existing call sites keep building unchanged.
+void sketch_read(std::string_view seq,
+                 ReadId read_id,
+                 std::vector<MinimizerHit>& out,
+                 const MinimizerProfile& profile) noexcept;
+
+// Process-wide getter/setter for the active MinimizerProfile. Mirrors
+// the set_cpu_overlap_threads() pattern. Set once early in
+// `branch assemble`, before backend dispatch.
+const MinimizerProfile& current_profile() noexcept;
+void set_current_profile(const MinimizerProfile& p) noexcept;
+
 }  // namespace branch::graph

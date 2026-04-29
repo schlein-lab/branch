@@ -12,9 +12,10 @@ namespace branch::graph {
 
 void sketch_read(std::string_view seq,
                  ReadId read_id,
-                 std::vector<MinimizerHit>& out) noexcept {
-    const std::size_t k = kMinimizerK;
-    const std::size_t w = kMinimizerW;
+                 std::vector<MinimizerHit>& out,
+                 const MinimizerProfile& profile) noexcept {
+    const std::size_t k = profile.k;
+    const std::size_t w = profile.w;
 
     if (seq.size() < k) {
         return;
@@ -90,6 +91,26 @@ void sketch_read(std::string_view seq,
             flush_if_new_minimum(kmer_start);
         }
     }
+}
+
+// ----- Process-wide profile -----
+namespace {
+    // Default HiFi unless the CLI overrides it via set_current_profile().
+    // Held by-value (constexpr profile is small and copy-cheap).
+    MinimizerProfile g_profile = kProfileHiFi;
+}
+
+const MinimizerProfile& current_profile() noexcept { return g_profile; }
+void set_current_profile(const MinimizerProfile& p) noexcept { g_profile = p; }
+
+// Back-compat overload — delegates to the profile-aware version using
+// the active global profile. This keeps existing call sites in
+// cpu_backend.cpp / gpu_backend.cpp building unchanged when they
+// haven't been migrated to pass a profile explicitly.
+void sketch_read(std::string_view seq,
+                 ReadId read_id,
+                 std::vector<MinimizerHit>& out) noexcept {
+    sketch_read(seq, read_id, out, current_profile());
 }
 
 }  // namespace branch::graph

@@ -14,6 +14,7 @@
 #include <limits>
 #include <string_view>
 #include <thread>
+#include <iostream>
 #include <unordered_map>
 #include <vector>
 
@@ -146,6 +147,11 @@ std::size_t compute_overlaps_impl(
         return 0;
     }
 
+    // Read-tech profile drives bucket-cap behaviour (ONT preset caps
+    // hash multiplicity to suppress error-driven minimizer explosions).
+    const auto& profile = ::branch::graph::current_profile();
+    const std::size_t bucket_cap = profile.max_bucket_size;
+
     // Step 2: Build hash buckets. Sized for the number of *unique*
     // hashes rather than total hits to avoid a wasteful over-reserve
     // (all_hits >> unique hashes when reads share many k-mers). An
@@ -168,6 +174,30 @@ std::size_t compute_overlaps_impl(
     // input can iterate buckets in different orders (hash seed, load
     // factor) and emit OverlapPairs in shuffled positions, making
     // output files irreproducible.
+    // Drop hash-buckets that exceed the profile cap (ONT preset only).
+    // High-multiplicity buckets are almost always either repetitive
+    // genomic content or basecaller-error artefacts — keeping them
+    // creates O(B^2) candidate pairs per bucket of size B, which is
+    // exactly the OOM mode observed on R10.4.1 SUP basecalls.
+    std::size_t n_dropped_buckets = 0, n_dropped_hits = 0;
+    if (bucket_cap > 0) {
+        for (auto it = buckets.begin(); it != buckets.end(); ) {
+            if (it->second.size() > bucket_cap) {
+                n_dropped_hits += it->second.size();
+                ++n_dropped_buckets;
+                it = buckets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (n_dropped_buckets > 0) {
+            std::cerr << "[branch overlap] " << profile.name
+                      << " profile dropped " << n_dropped_buckets
+                      << " high-multiplicity buckets (>" << bucket_cap
+                      << " hits each, " << n_dropped_hits << " hits total)\n";
+        }
+    }
+
     std::vector<std::uint64_t> bucket_keys;
     bucket_keys.reserve(buckets.size());
     for (const auto& kv : buckets) bucket_keys.push_back(kv.first);
@@ -349,7 +379,7 @@ std::size_t compute_overlaps_impl(
         const std::uint32_t span_b = max_pos_b - min_pos_b;
         const std::uint32_t overlap_len =
             std::max(span_a, span_b) +
-            static_cast<std::uint32_t>(graph::kMinimizerK);
+            static_cast<std::uint32_t>(::branch::graph::current_profile().k);
 
         out_pairs[out_idx] = OverlapPair{
             .read_a = pair.a,

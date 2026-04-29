@@ -29,6 +29,38 @@ namespace branch::graph {
 inline constexpr std::size_t kMinimizerK = 21;
 inline constexpr std::size_t kMinimizerW = 19;
 
+// ---------------------------------------------------------------------------
+// MinimizerProfile — read-tech tunable knobs for sketch + overlap.
+//
+// `kMinimizerK` / `kMinimizerW` constants above stay valid as the HiFi
+// defaults (still consumed by GFA/BED writers as cosmetic ref-window-K).
+// The actual overlap path now takes a runtime profile so ONT-tuned
+// values can be plugged in via the assemble-CLI `--read-tech ont` flag.
+//
+// Why these defaults:
+//   HiFi  — k=21, w=19 from minimap2/HiCanu HiFi presets. ~0.1% error
+//           tolerates a long minimizer; bucket cap unnecessary because
+//           HiFi minimizers are highly informative.
+//   ONT   — k=15, w=10 from minimap2 `map-ont` preset. R10.4.1 SUP at
+//           ~1-2% error rate produces many wrong minimizers at k=21,
+//           and the resulting bucket explosion was the documented OOM
+//           failure mode (peak RSS 26 GiB on 37 Mbp HG002 IGH chunk).
+//           bucket_cap=64 drops the high-multiplicity hashes before
+//           they detonate the all-pairs match table; min_qual reserved
+//           for a future Q-score mask once ReadBatch carries qualities.
+struct MinimizerProfile {
+    std::size_t k             = 21;   // HiFi default
+    std::size_t w             = 19;   // HiFi default
+    std::size_t max_bucket_size = 0;  // 0 = no cap; cap drops over-replicated minimizers
+    int         min_qual      = 0;    // Q-score floor; 0 = no filter (reserved)
+    const char* name          = "hifi";
+};
+
+inline constexpr MinimizerProfile kProfileHiFi{21, 19, 0,  0, "hifi"};
+inline constexpr MinimizerProfile kProfileONT {15, 10, 64, 0, "ont"};
+
+
+
 // Minimizer hit — one minimizer from one read.
 //
 // v0.2 adds a strand bit so the overlap backend can tell same-strand

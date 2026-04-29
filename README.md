@@ -4,7 +4,7 @@
 BRANCH is a HiFi-read genome assembler built to be state-of-the-art at low-frequency copy-number variants. It produces a lossless, CN-aware assembly graph where branches are graph bifurcations (not tumor clones). Every variant call carries VAF evidence from reads, in-silico PCR, and k-mer counts.
 
 ## Status
-Phase 0 end-to-end pipeline is working on HiFi samples. Known gaps: unitig collapse not yet final, RAM consumption not fully deterministic, CPU utilisation low (single-threaded overlap), per-contig chromosome projection pending (see `branch project` below).
+Phase 0 end-to-end pipeline is working on both HiFi and ONT R10.4.1 samples (`--read-tech ont`, see [`docs/ont-support.md`](docs/ont-support.md)). Known gaps: unitig collapse not yet final, RAM consumption not fully deterministic, CPU utilisation low (single-threaded overlap), per-contig chromosome projection pending (see `branch project` below).
 
 ## Pipeline
 ```

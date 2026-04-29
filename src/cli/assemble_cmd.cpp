@@ -20,6 +20,8 @@
 #include "backend/backend_factory.hpp"
 #include "backend/backend_vtable.hpp"
 #include "backend/cpu_backend.hpp"
+#include "graph/kmer_sketch.hpp"
+#include "graph/minimizer_sketcher.hpp"
 #include "common/memory.hpp"
 #include "graph/delta_read.hpp"
 #include "graph/read_db.hpp"
@@ -60,6 +62,12 @@ void print_assemble_usage(std::ostream& os) {
           "                      dropped (could be contamination, could be dark genome).\n"
           "                      Pass the GAF to `branch analyze --reads <path.gaf>` for\n"
           "                      quantitative bubble VAF based on real read traversal.\n"
+          "\nRead-technology preset:\n"
+          "  --read-tech <tech>  hifi (default) keeps the long-k=21 sketch optimised for\n"
+          "                      PacBio HiFi (~0.1%% error). ont switches to k=15, w=10\n"
+          "                      and caps minimizer-bucket multiplicity to 64 — required\n"
+          "                      for ONT R10.4.1 SUP / DUPLEX reads (~1-2%% residual error)\n"
+          "                      where the HiFi preset triggers an OOM bucket explosion.\n"
           "\nBackend:\n"
           "  --backend <mode>  overlap backend to use. auto (default) = prefer GPU,\n"
           "                    fall back to CPU. cpu = force CPU (deterministic,\n"
@@ -112,6 +120,11 @@ struct Args {
     // when every short read must remain a distinct graph node — e.g.
     // when the contained read carries an SNV that matters for mosaic
     // analysis at the read-base level rather than the assembly level.
+    // Read technology preset for the minimizer sketch + overlap stage.
+    // hifi (default) keeps the original k=21, w=19 behaviour. ont selects
+    // k=15, w=10 + a hash-bucket cap of 64 to keep the all-pairs match
+    // table from blowing up on basecaller-error noise.
+    std::string read_tech{"hifi"};
     bool keep_contained{false};
     bool ok{false};
     std::string err;
@@ -153,6 +166,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--threads" || k == "-t") { auto v = needs("--threads"); if (!v) return a; a.threads = std::atoi(v); }
         else if (k == "--backend") { auto v = needs("--backend"); if (!v) return a; a.backend_mode = v; }
         else if (k == "--max-memory") { auto v = needs("--max-memory"); if (!v) return a; a.max_memory = v; }
+        else if (k == "--read-tech") { auto v = needs("--read-tech"); if (!v) return a; a.read_tech = v; }
         else if (k == "--keep-contained") { a.keep_contained = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
@@ -254,6 +268,19 @@ int run_assemble(int argc, char** argv) {
     }
 
     // 3. Compute overlaps.
+    // Resolve --read-tech to a MinimizerProfile and set the process-wide
+    // active profile so both CPU and GPU backends pick it up.
+    if (a.read_tech == "hifi") {
+        ::branch::graph::set_current_profile(::branch::graph::kProfileHiFi);
+    } else if (a.read_tech == "ont") {
+        ::branch::graph::set_current_profile(::branch::graph::kProfileONT);
+        std::cerr << "[branch assemble] read-tech=ont (k=15, w=10, bucket-cap=64)\n";
+    } else {
+        std::cerr << "branch assemble: unknown --read-tech '" << a.read_tech
+                  << "' (supported: hifi, ont)\n";
+        return 2;
+    }
+
     branch::backend::set_cpu_overlap_threads(
         static_cast<unsigned int>(a.threads > 0 ? a.threads : 1));
     std::string be_err;
