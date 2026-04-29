@@ -8,6 +8,25 @@ variants that diverge from known population haplotypes.
 
 **Version target**: v0.4 (scaffold in v0.3)
 
+## Status — v0.4.3
+
+All three layers are wired into `branch project` and produce per-branch
+output in the JSON report:
+
+| Layer            | CLI flag                | Backend       | JSON field             |
+|------------------|-------------------------|---------------|------------------------|
+| Linear           | `--ref-linear name=p`   | minimap2 asm20| `linear_mappings[]`    |
+| Pangenome        | `--ref-pangenome name=p`| GraphAligner / minigraph | `pangenome_mappings[]` |
+| Somatic delta    | `--ref-fasta name=p`    | ksw2          | `somatic_deltas[]`     |
+
+Smoke-tested on the HG002 ONT IGH assembly (1899 contigs from the ONT
+R10.4.1 SUP test slice — see `docs/ont-support.md`):
+linear layer alone resolves 1899 branches against full GRCh38 in 43 s
+(8 threads) producing 4 581 mappings; 1 475 contigs remain
+`unannotated` — these are the candidate novel sequences. The
+somatic-delta layer adds CIGAR + identity per branch against the
+matched ref window.
+
 ## Motivation
 
 Standard variant calling assumes diploid genomes with variants present at ~50% or ~100%

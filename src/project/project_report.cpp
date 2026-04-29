@@ -106,6 +106,46 @@ void write_branch_json(std::ostream& os, const BranchEntry& b, int indent) {
         }
         os << pad2 << "]";
     }
+    os << ",\n";
+
+    // pangenome_mappings (v0.4.2)
+    os << pad2 << "\"pangenome_mappings\": [";
+    if (b.pangenome_mappings.empty()) {
+        os << "]";
+    } else {
+        for (std::size_t i = 0; i < b.pangenome_mappings.size(); ++i) {
+            const auto& m = b.pangenome_mappings[i];
+            os << (i == 0 ? "\n" : ",\n") << pad2 << "    {"
+               << "\"ref_name\": \"" << json_escape(m.ref_name) << "\", "
+               << "\"path\": \"" << json_escape(m.path_names) << "\", "
+               << "\"path_start\": " << m.path_start << ", "
+               << "\"path_end\": " << m.path_end << ", "
+               << "\"mapq\": " << m.mapq << ", "
+               << "\"identity\": " << m.identity
+               << "}";
+        }
+        os << "\n" << pad2 << "]";
+    }
+    os << ",\n";
+
+    // somatic_deltas (v0.4.3)
+    os << pad2 << "\"somatic_deltas\": [";
+    if (b.somatic_deltas.empty()) {
+        os << "]";
+    } else {
+        for (std::size_t i = 0; i < b.somatic_deltas.size(); ++i) {
+            const auto& d = b.somatic_deltas[i];
+            os << (i == 0 ? "\n" : ",\n") << pad2 << "    {"
+               << "\"ref_name\": \"" << json_escape(d.ref_name) << "\", "
+               << "\"edit_distance\": " << d.edit_distance << ", "
+               << "\"identity\": " << d.identity << ", "
+               << "\"aligned_query_len\": " << d.aligned_query_len << ", "
+               << "\"aligned_ref_len\": " << d.aligned_ref_len << ", "
+               << "\"cigar\": \"" << json_escape(d.cigar) << "\""
+               << "}";
+        }
+        os << "\n" << pad2 << "]";
+    }
     os << "\n";
     os << pad << "}";
 }
@@ -136,7 +176,7 @@ bool write_branch_report_json(
 
     os << "{\n";
     os << "  \"sample\": "; write_json_string(os, sample_name); os << ",\n";
-    os << "  \"version\": \"0.4.1\",\n";
+    os << "  \"version\": \"0.4.3\",\n";
     os << "  \"branch_count\": " << branches.size() << ",\n";
     os << "  \"unannotated_count\": " << unannotated_count << ",\n";
     os << "  \"branches\": [";

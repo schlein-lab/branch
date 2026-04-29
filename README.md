@@ -18,7 +18,7 @@ reader → graph_build → graph_compactor → graph_filter → assemble
 ## Subcommands
 - `branch assemble` — reads → minimizer overlap → lossless graph → GFA + FASTA + PAF + BED.
 - `branch analyze` — mosdepth regions → copy-number inference with paralog awareness.
-- `branch project` *(v0.4, scaffolded)* — three-layer reference projection: linear (CHM13 + GRCh38 via minimap2), pangenome (HPRC v1.1 via minigraph / GraphAligner), somatic delta vs. nearest pangenome path. See `docs/branch-project-design.md`.
+- `branch project` *(v0.4.3)* — three-layer reference projection: linear (CHM13 + GRCh38 via minimap2), pangenome (HPRC v1.1 via minigraph / GraphAligner), somatic delta vs. nearest pangenome path. _Map in, comparison out_ — every branch is matched against the standard human genome and a public collection of known DNA variation, the residual edit distance to the closest known sequence is reported, brand-new changes are flagged. See [`docs/branch-project-design.md`](docs/branch-project-design.md).
 
 ## Output contract
 - BED: branch intervals (chrom, start, end, branch_id, VAF, CN).

@@ -30,6 +30,16 @@ struct SomaticDeltaOptions {
     int gap_open{4};        ///< Gap open penalty
     int gap_extend{2};      ///< Gap extend penalty
     int threads{4};         ///< Number of threads (for future parallelization)
+    /// Skip branches longer than this against ref windows that are also
+    /// long. ksw2 in plain DP mode allocates O(query × target) memory;
+    /// running it on multi-megabase pairs blows past 50 GiB RSS without
+    /// returning anything biologically meaningful (the cost is dominated
+    /// by gaps, identity collapses to ~length-ratio). Default 5 000 bp
+    /// keeps the typical bubble-resolution branches in scope and skips
+    /// the long span-contigs — those are already covered by the
+    /// linear+pangenome layers above.
+    /// 0 disables the cap.
+    int max_branch_len_bp{5000};
 };
 
 /// Compute somatic deltas for all branches against reference paths.
