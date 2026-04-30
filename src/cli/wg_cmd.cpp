@@ -14,6 +14,7 @@
 #include "wg/orphan_clusterer.hpp"
 #include "wg/vpf_writer.hpp"
 #include "graph/kmer_sketch.hpp"
+#include "gpu/wg_kernels.cuh"
 
 #include <chrono>
 #include <cstdio>
@@ -52,6 +53,7 @@ struct WgArgs {
     int expected_coverage = 0;       // 0 → auto-detect
     bool do_vpcr = true;
     bool do_ref = true;
+    bool no_gpu = false;          // --no-gpu forces CPU-only Phase 3
     std::vector<int> phases = {0, 1, 2, 3, 4, 5};
     bool ok = false;
     std::string err;
@@ -72,6 +74,7 @@ WgArgs parse_wg_args(int argc, char** argv) {
         else if (k == "--expected-coverage") { auto v = need("--expected-coverage"); if (!v) return a; a.expected_coverage = std::atoi(v); }
         else if (k == "--no-vpcr")    { a.do_vpcr = false; }
         else if (k == "--no-ref-annotation") { a.do_ref = false; }
+        else if (k == "--no-gpu")     { a.no_gpu = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -270,12 +273,14 @@ int run_wg(int argc, char** argv) {
     out.phase_log.emplace_back("2",
         std::chrono::duration<double>(clock::now() - t0).count());
 
-    // ---------- Phase 3: two-stage vPCR ----------
+    // ---------- Phase 3: two-stage vPCR (GPU-first, CPU fallback) ----------
     //   Stage 1 — cheap whole-genome k-mer-coverage screen (no coding
     //   bias, multi-window, OR'd signals). Output: candidate regions +
     //   per-window coverage track (emitted to <prefix>.cov.bed).
     //   Stage 2 — design 1-N primer pairs per candidate region, then
     //   count via k-mer-seed indexed scan.
+    bool use_gpu = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
+    std::cerr << "[wg] gpu=" << (use_gpu ? "available, will use" : "off") << "\n";
     if (args.do_vpcr) {
         t0 = clock::now();
         std::cerr << "[wg] Phase 3 Stage 1: cheap k-mer-coverage screen\n";
@@ -285,13 +290,51 @@ int run_wg(int argc, char** argv) {
         std::cerr << "[wg]   loaded " << p0_counter.size()
                   << " recurrent k-mers from " << p0_path << "\n";
 
+        // Pre-flatten counter for GPU launcher (sorted ascending).
+        std::vector<std::uint64_t> p0_keys_sorted;
+        std::vector<std::uint32_t> p0_cnts_sorted;
+        if (use_gpu) {
+            p0_keys_sorted.reserve(p0_counter.size());
+            p0_cnts_sorted.reserve(p0_counter.size());
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> pairs(
+                p0_counter.begin(), p0_counter.end());
+            std::sort(pairs.begin(), pairs.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& kv : pairs) {
+                p0_keys_sorted.push_back(kv.first);
+                p0_cnts_sorted.push_back(kv.second);
+            }
+            std::cerr << "[wg]   flattened counter for GPU ("
+                      << p0_keys_sorted.size() << " entries)\n";
+        }
+
         branch::wg::Stage1Screener screener(profile);
         std::vector<branch::wg::Stage1Window> all_windows;
         std::vector<branch::wg::CandidateRegion> all_regions;
         for (std::size_t h = 0; h < out.haplotype_seqs.size(); ++h) {
             std::vector<branch::wg::Stage1Window> wins;
-            screener.screen_haplotype(static_cast<std::uint32_t>(h),
-                                      out.haplotype_seqs[h], p0_counter, wins);
+            bool gpu_ok = false;
+            if (use_gpu) {
+                gpu_ok = branch::gpu::wg_kernels::launch_stage1(
+                    static_cast<std::uint32_t>(h),
+                    out.haplotype_seqs[h],
+                    p0_keys_sorted, p0_cnts_sorted,
+                    profile.minimizer_k, profile.minimizer_w,
+                    branch::wg::kStage1ZThreshold,
+                    branch::wg::kStage1RepEntropy,
+                    branch::wg::kStage1MinDensityZ,
+                    wins);
+                if (gpu_ok) {
+                    std::cerr << "[wg]   hap" << (h+1) << " stage1 on GPU: "
+                              << wins.size() << " windows\n";
+                }
+            }
+            if (!gpu_ok) {
+                screener.screen_haplotype(static_cast<std::uint32_t>(h),
+                                          out.haplotype_seqs[h], p0_counter, wins);
+                std::cerr << "[wg]   hap" << (h+1) << " stage1 on CPU: "
+                          << wins.size() << " windows\n";
+            }
             all_windows.insert(all_windows.end(), wins.begin(), wins.end());
         }
         screener.merge_into_regions(all_windows, all_regions);
@@ -324,7 +367,20 @@ int run_wg(int argc, char** argv) {
                   /*n_per_region=*/3);
         std::cerr << "[wg]   designed " << out.vpcr_amplicons.size()
                   << " amplicons\n";
-        vp.count(out.vpcr_amplicons, reads, expected_cov);
+
+        bool stage2_gpu_ok = false;
+        const int amp_min = 200;
+        const int amp_max = (profile.name && profile.name[0] == 'h') ? 1500 : 3000;
+        if (use_gpu) {
+            stage2_gpu_ok = branch::gpu::wg_kernels::launch_stage2(
+                out.vpcr_amplicons, reads,
+                /*max_mm=*/2, amp_min, amp_max, expected_cov);
+            if (stage2_gpu_ok) std::cerr << "[wg]   stage2 counted on GPU\n";
+        }
+        if (!stage2_gpu_ok) {
+            vp.count(out.vpcr_amplicons, reads, expected_cov);
+            std::cerr << "[wg]   stage2 counted on CPU\n";
+        }
         out.phase_log.emplace_back("3",
             std::chrono::duration<double>(clock::now() - t0).count());
     }
