@@ -226,4 +226,40 @@ void KmerHistBuilder::write_to(const std::string& path,
     f.close();
 }
 
+void load_kmer_counter_dump(
+    const std::string& path,
+    std::unordered_map<std::uint64_t, std::uint32_t>& out_counter) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open Phase 0 dump: " + path);
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, "KHIST05", 7) != 0)
+        throw std::runtime_error("bad magic in Phase 0 file: " + path);
+
+    std::uint64_t n_recurrent = 0, n_reads = 0, n_bases = 0;
+    std::int32_t cov = 0, het = 0;
+    double z = 0;
+    std::uint32_t k = 0;
+    f.read(reinterpret_cast<char*>(&n_recurrent), sizeof(n_recurrent));
+    f.read(reinterpret_cast<char*>(&n_reads), sizeof(n_reads));
+    f.read(reinterpret_cast<char*>(&n_bases), sizeof(n_bases));
+    f.read(reinterpret_cast<char*>(&cov), sizeof(cov));
+    f.read(reinterpret_cast<char*>(&het), sizeof(het));
+    f.read(reinterpret_cast<char*>(&z), sizeof(z));
+    f.read(reinterpret_cast<char*>(&k), sizeof(k));
+
+    std::uint32_t hist_n = 0;
+    f.read(reinterpret_cast<char*>(&hist_n), sizeof(hist_n));
+    f.seekg(sizeof(std::uint64_t) * hist_n, std::ios::cur);
+
+    out_counter.reserve(static_cast<std::size_t>(n_recurrent));
+    for (std::uint64_t i = 0; i < n_recurrent; ++i) {
+        std::uint64_t key = 0;
+        std::uint32_t cnt = 0;
+        f.read(reinterpret_cast<char*>(&key), sizeof(key));
+        f.read(reinterpret_cast<char*>(&cnt), sizeof(cnt));
+        out_counter.emplace(key, cnt);
+    }
+}
+
 }  // namespace branch::wg

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "graph/kmer_sketch.hpp"
@@ -106,5 +107,12 @@ private:
 /// Inverse of the bit-packing used in scan_kmers_: rebuild the ATCG sequence
 /// from k-mer bits. ('A','C','G','T' for codes 0..3.)
 void kmer_bits_to_seq(std::uint64_t bits, std::size_t k, char* out) noexcept;
+
+/// Load the (canonical_kmer_bits, count) table from a Phase 0 .bin dump.
+/// Used by Phase 3 Stage 1 (cheap whole-genome screen) without going
+/// through the HaplotypeRouter — a lightweight reader.
+void load_kmer_counter_dump(
+    const std::string& path,
+    std::unordered_map<std::uint64_t, std::uint32_t>& out_counter);
 
 }  // namespace branch::wg

@@ -9,6 +9,7 @@
 #include "wg/master_tiler.hpp"
 #include "wg/master_curator.hpp"
 #include "wg/branch_attacher.hpp"
+#include "wg/stage1_screen.hpp"
 #include "wg/vpcr_wg.hpp"
 #include "wg/orphan_clusterer.hpp"
 #include "wg/vpf_writer.hpp"
@@ -269,12 +270,58 @@ int run_wg(int argc, char** argv) {
     out.phase_log.emplace_back("2",
         std::chrono::duration<double>(clock::now() - t0).count());
 
-    // ---------- Phase 3: vPCR ----------
+    // ---------- Phase 3: two-stage vPCR ----------
+    //   Stage 1 — cheap whole-genome k-mer-coverage screen (no coding
+    //   bias, multi-window, OR'd signals). Output: candidate regions +
+    //   per-window coverage track (emitted to <prefix>.cov.bed).
+    //   Stage 2 — design 1-N primer pairs per candidate region, then
+    //   count via k-mer-seed indexed scan.
     if (args.do_vpcr) {
         t0 = clock::now();
-        std::cerr << "[wg] Phase 3: vPCR auto-design + counting\n";
+        std::cerr << "[wg] Phase 3 Stage 1: cheap k-mer-coverage screen\n";
+        // Reload Phase 0 counter (was freed by router after Phase 1.1).
+        std::unordered_map<std::uint64_t, std::uint32_t> p0_counter;
+        branch::wg::load_kmer_counter_dump(p0_path, p0_counter);
+        std::cerr << "[wg]   loaded " << p0_counter.size()
+                  << " recurrent k-mers from " << p0_path << "\n";
+
+        branch::wg::Stage1Screener screener(profile);
+        std::vector<branch::wg::Stage1Window> all_windows;
+        std::vector<branch::wg::CandidateRegion> all_regions;
+        for (std::size_t h = 0; h < out.haplotype_seqs.size(); ++h) {
+            std::vector<branch::wg::Stage1Window> wins;
+            screener.screen_haplotype(static_cast<std::uint32_t>(h),
+                                      out.haplotype_seqs[h], p0_counter, wins);
+            all_windows.insert(all_windows.end(), wins.begin(), wins.end());
+        }
+        screener.merge_into_regions(all_windows, all_regions);
+        std::cerr << "[wg]   stage1: " << all_windows.size()
+                  << " windows, " << all_regions.size()
+                  << " candidate regions flagged\n";
+
+        // Emit Stage-1 coverage track as a separate BED next to the main one.
+        std::string cov_bed_path = args.out_prefix + ".cov.bed";
+        std::ofstream cov(cov_bed_path);
+        if (cov) {
+            for (const auto& w : all_windows) {
+                cov << "hap" << (w.hap_idx + 1) << '\t'
+                    << w.start_bp << '\t' << (w.start_bp + w.length_bp) << '\t'
+                    << "win"
+                    << '\t' << w.mean_kmer_count
+                    << '\t' << w.distinct_kmer_count
+                    << '\t' << w.dimer_entropy
+                    << '\t' << w.minimizer_density
+                    << '\t' << w.z_mean
+                    << '\t' << static_cast<int>(w.flags) << '\n';
+            }
+            std::cerr << "[wg]   wrote " << cov_bed_path << "\n";
+        }
+
+        std::cerr << "[wg] Phase 3 Stage 2: design + count amplicons in "
+                  << all_regions.size() << " regions\n";
         branch::wg::VpcrAutoDesigner vp(profile);
-        vp.design(out.haplotype_seqs, out.vpcr_amplicons);
+        vp.design(out.haplotype_seqs, all_regions, out.vpcr_amplicons,
+                  /*n_per_region=*/3);
         std::cerr << "[wg]   designed " << out.vpcr_amplicons.size()
                   << " amplicons\n";
         vp.count(out.vpcr_amplicons, reads, expected_cov);

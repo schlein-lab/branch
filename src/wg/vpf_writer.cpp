@@ -60,9 +60,14 @@ void VpfWriter::write(const WgOutputs& out) {
               << b.confidence << "\t.\n";
         }
         for (const auto& a : out.vpcr_amplicons) {
-            f << "vpcr\t0\t" << a.expected_size_bp << '\t'
+            f << "hap" << (a.hap_idx + 1) << '\t'
+              << a.start_bp << '\t'
+              << (a.start_bp + a.expected_size_bp) << '\t'
               << a.amplicon_name << '\t'
-              << a.cn_estimate << "\t.\n";
+              << a.cn_estimate << "\t.\t"
+              << a.read_count << '\t'
+              << a.ci_low << '\t' << a.ci_high << '\t'
+              << static_cast<int>(a.region_flags) << '\n';
         }
     }
 

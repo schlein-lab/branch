@@ -7,6 +7,7 @@ add_library(branch_wg STATIC
     master_tiler.cpp
     master_curator.cpp
     branch_attacher.cpp
+    stage1_screen.cpp
     vpcr_wg.cpp
     orphan_clusterer.cpp
     vpf_writer.cpp
