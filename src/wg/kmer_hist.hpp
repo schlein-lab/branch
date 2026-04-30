@@ -93,7 +93,18 @@ private:
     void scan_kmers_(std::string_view seq, bool pass2) noexcept;
 };
 
-/// Compute canonical k-mer hash (forward / reverse complement, smaller).
+/// Compute canonical k-mer hash (forward / reverse complement, smaller hash).
+/// Used by tests + bloom filter; not used as counter key (see canonical_kmer_bits).
 [[nodiscard]] std::uint64_t canonical_kmer_hash(std::uint64_t kmer, std::size_t k) noexcept;
+
+/// Canonical k-mer bits = min(forward_bits, rc_bits). Unique per canonical
+/// k-mer (no hash collision) so it's safe to use directly as the counter
+/// key. Phase 1.1 reads the bits straight back from the dumped counter
+/// table to enumerate 1-bp variants for het-pair detection.
+[[nodiscard]] std::uint64_t canonical_kmer_bits(std::uint64_t kmer, std::size_t k) noexcept;
+
+/// Inverse of the bit-packing used in scan_kmers_: rebuild the ATCG sequence
+/// from k-mer bits. ('A','C','G','T' for codes 0..3.)
+void kmer_bits_to_seq(std::uint64_t bits, std::size_t k, char* out) noexcept;
 
 }  // namespace branch::wg

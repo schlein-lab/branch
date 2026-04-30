@@ -1,7 +1,21 @@
 // BRANCH v0.5 — Phase 1.1 implementation.
+//
+// Pipeline:
+//   1. load (canonical_bits, count) table from Phase 0 dump
+//   2. find_het_pairs(): for each k-mer K with count in the het window,
+//      enumerate the 3*k 1-bp-substitution variants, look up their
+//      canonical forms in the counter, and emit a het-pair when both
+//      counts plus their sum fit the expected diploid pattern.
+//      Allele labels (0/1) are assigned deterministically — the
+//      lex-smaller canonical bits get label 0.
+//   3. set_anchor_from_reads(): pick the read with the highest het-pair
+//      hit-count from a bounded scan; that read's local allele pattern
+//      is stamped onto hap1_pattern_.
+//   4. route_read(): match k-mers against the het-pair table; count
+//      hap1-pattern matches vs mismatches; assign Hap1/Hap2/Ambig.
 
 #include "wg/haplotype_router.hpp"
-#include "wg/kmer_hist.hpp"  // for canonical_kmer_hash
+#include "wg/kmer_hist.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -13,12 +27,6 @@ namespace branch::wg {
 
 namespace {
 
-constexpr std::uint64_t splitmix64(std::uint64_t z) noexcept {
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
-}
-
 inline std::uint8_t encode_base(char c) noexcept {
     switch (c) {
         case 'A': case 'a': return 0;
@@ -27,15 +35,6 @@ inline std::uint8_t encode_base(char c) noexcept {
         case 'T': case 't': return 3;
         default: return 4;
     }
-}
-
-inline std::uint64_t rc_kmer(std::uint64_t kmer, std::size_t k) noexcept {
-    std::uint64_t rc = 0;
-    for (std::size_t i = 0; i < k; ++i) {
-        rc = (rc << 2) | ((~kmer) & 3ULL);
-        kmer >>= 2;
-    }
-    return rc;
 }
 
 }  // namespace
@@ -79,123 +78,155 @@ void HaplotypeRouter::load_counter_(const std::string& path) {
     f.read(reinterpret_cast<char*>(&hist_n), sizeof(hist_n));
     f.seekg(sizeof(std::uint64_t) * hist_n, std::ios::cur);
 
-    ckeys_.reserve(static_cast<std::size_t>(n_recurrent));
-    ccounts_.reserve(static_cast<std::size_t>(n_recurrent));
+    counter_.reserve(static_cast<std::size_t>(n_recurrent));
     for (std::uint64_t i = 0; i < n_recurrent; ++i) {
         std::uint64_t key = 0;
         std::uint32_t cnt = 0;
         f.read(reinterpret_cast<char*>(&key), sizeof(key));
         f.read(reinterpret_cast<char*>(&cnt), sizeof(cnt));
-        ckeys_.push_back(key);
-        ccounts_.push_back(cnt);
+        counter_.emplace(key, cnt);
     }
 }
 
-std::uint32_t HaplotypeRouter::lookup_count_(std::uint64_t hash) const noexcept {
-    // Binary search would be fastest; ckeys_ are not sorted on disk. We
-    // build a small hash-side index lazily on first use.
-    static thread_local std::unordered_map<std::uint64_t, std::uint32_t> idx;
-    if (idx.empty() && !ckeys_.empty()) {
-        idx.reserve(ckeys_.size());
-        for (std::size_t i = 0; i < ckeys_.size(); ++i) idx[ckeys_[i]] = ccounts_[i];
+void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac,
+                                     double sum_frac_lo, double sum_frac_hi) {
+    het_.clear();
+    n_het_pairs_ = 0;
+    if (expected_coverage_ <= 0 || counter_.empty()) return;
+
+    const std::size_t k = profile_.minimizer_k;
+    const std::uint32_t lo = static_cast<std::uint32_t>(expected_coverage_ * low_frac);
+    const std::uint32_t hi = static_cast<std::uint32_t>(expected_coverage_ * high_frac);
+    const std::uint32_t sum_lo = static_cast<std::uint32_t>(expected_coverage_ * sum_frac_lo);
+    const std::uint32_t sum_hi = static_cast<std::uint32_t>(expected_coverage_ * sum_frac_hi);
+    if (lo == 0 || hi == 0) return;
+
+    std::uint32_t pair_id = 0;
+    for (const auto& [bits_a, count_a] : counter_) {
+        if (count_a < lo || count_a > hi) continue;
+        if (het_.find(bits_a) != het_.end()) continue;
+
+        // Try all 3*k 1-bp-substitution variants; record the FIRST that
+        // satisfies the het-frequency + diploid-sum constraints.
+        bool paired = false;
+        for (std::size_t pos = 0; pos < k && !paired; ++pos) {
+            std::uint64_t old_base = (bits_a >> (2 * pos)) & 3ULL;
+            std::uint64_t cleared = bits_a & ~(3ULL << (2 * pos));
+            for (std::uint64_t alt = 0; alt < 4 && !paired; ++alt) {
+                if (alt == old_base) continue;
+                std::uint64_t fwd_bits = cleared | (alt << (2 * pos));
+                std::uint64_t alt_canon = canonical_kmer_bits(fwd_bits, k);
+                if (alt_canon == bits_a) continue;
+                auto it = counter_.find(alt_canon);
+                if (it == counter_.end()) continue;
+                std::uint32_t count_b = it->second;
+                if (count_b < lo || count_b > hi) continue;
+                std::uint32_t sum = count_a + count_b;
+                if (sum < sum_lo || sum > sum_hi) continue;
+                if (het_.find(alt_canon) != het_.end()) continue;
+
+                // Deterministic allele label: lex-smaller bits = 0.
+                std::uint8_t label_a = (bits_a < alt_canon) ? 0 : 1;
+                std::uint8_t label_b = label_a ^ 1;
+                het_[bits_a]    = HetEntry{pair_id, label_a};
+                het_[alt_canon] = HetEntry{pair_id, label_b};
+                ++pair_id;
+                paired = true;
+            }
+        }
     }
-    auto it = idx.find(hash);
-    return it == idx.end() ? 0u : it->second;
+    n_het_pairs_ = pair_id;
 }
 
-void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac) {
-    if (expected_coverage_ <= 0) return;
-    int lo = static_cast<int>(expected_coverage_ * low_frac);
-    int hi = static_cast<int>(expected_coverage_ * high_frac);
-    // int sum_lo = ... (reserved for full het-pair impl)
-    // int sum_hi = ... (reserved for full het-pair impl)
-
-    // Build hash-set view of all recurrent keys + their counts for fast
-    // lookup.
-    std::unordered_map<std::uint64_t, std::uint32_t> map;
-    map.reserve(ckeys_.size());
-    for (std::size_t i = 0; i < ckeys_.size(); ++i) map[ckeys_[i]] = ccounts_[i];
+void HaplotypeRouter::set_anchor_from_reads(
+    const std::vector<std::pair<std::string, std::string>>& reads,
+    std::size_t max_scan) {
+    hap1_pattern_.clear();
+    if (het_.empty() || reads.empty()) return;
 
     const std::size_t k = profile_.minimizer_k;
     const std::uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
 
-    // For every het-allele candidate K (count in [lo, hi]), enumerate
-    // all 1-bp variants of K (3*k of them), check if any is also a
-    // het-allele candidate and if their counts sum to ~ expected_coverage.
-    std::size_t pairs = 0;
-    for (std::size_t i = 0; i < ckeys_.size(); ++i) {
-        std::uint32_t c = ccounts_[i];
-        if (c < static_cast<std::uint32_t>(lo) || c > static_cast<std::uint32_t>(hi)) continue;
-        std::uint64_t hash_a = ckeys_[i];
-
-        // We need the actual k-mer bits to enumerate variants — but we
-        // only stored the canonical *hash*. Without the original k-mer
-        // we cannot directly produce 1-bp variants. Workaround: at this
-        // scale, the right design is to store k-mer bits alongside hash
-        // in Phase 0. For this first cut we approximate by detecting
-        // het-pairs through *frequency only* (count near expected/2,
-        // partner count near expected/2). A future commit will extend
-        // Phase 0 to dump (kmer_bits, count) pairs so this routine can
-        // do exact 1-bp-variant pairing.
-        //
-        // For now: skip the strict pairing step. find_het_pairs becomes
-        // a no-op until Phase 0 is augmented. The route_read fallback
-        // (below) uses sketch-jaccard against per-haplotype reference
-        // reads instead.
-        (void)hash_a; (void)mask;
-        ++pairs;
-        if (pairs > 1000) break;  // sentinel only; real work happens later
+    // Pass 1: find the read with the most het-pair hits within max_scan.
+    std::size_t best_idx = 0;
+    std::size_t best_hits = 0;
+    std::size_t scanned = std::min(reads.size(), max_scan);
+    for (std::size_t r = 0; r < scanned; ++r) {
+        const auto& seq = reads[r].second;
+        if (seq.size() < k) continue;
+        std::uint64_t kmer = 0;
+        std::size_t filled = 0;
+        std::size_t hits = 0;
+        for (char c : seq) {
+            std::uint8_t b = encode_base(c);
+            if (b > 3) { filled = 0; kmer = 0; continue; }
+            kmer = ((kmer << 2) | b) & mask;
+            ++filled;
+            if (filled < k) continue;
+            std::uint64_t cb = canonical_kmer_bits(kmer, k);
+            if (het_.find(cb) != het_.end()) ++hits;
+        }
+        if (hits > best_hits) { best_hits = hits; best_idx = r; }
     }
-    het_pair_count_ = 0;  // explicit: no pairs registered in this first cut
+    if (best_hits == 0) return;
+
+    // Pass 2: stamp the anchor read's local allele pattern onto hap1.
+    // For each het-pair hit, record the observed allele as the hap1 label.
+    const auto& seq = reads[best_idx].second;
+    std::uint64_t kmer = 0;
+    std::size_t filled = 0;
+    for (char c : seq) {
+        std::uint8_t b = encode_base(c);
+        if (b > 3) { filled = 0; kmer = 0; continue; }
+        kmer = ((kmer << 2) | b) & mask;
+        ++filled;
+        if (filled < k) continue;
+        std::uint64_t cb = canonical_kmer_bits(kmer, k);
+        auto it = het_.find(cb);
+        if (it == het_.end()) continue;
+        // Only set the first observation per pair (avoid noise from
+        // sequencing errors flipping interpretation later in the read).
+        hap1_pattern_.try_emplace(it->second.pair_id, it->second.allele);
+    }
 }
 
 ReadRouting HaplotypeRouter::route_read(std::string_view seq) const noexcept {
-    // First-cut implementation: count how many recurrent het-frequency
-    // k-mers (count in [exp_cov * 0.3, exp_cov * 0.7]) appear in this
-    // read. Reads with many such k-mers are SNP-rich (informative);
-    // reads with few are uninformative → Ambig.
-    //
-    // Allele assignment requires the het-pair table (find_het_pairs);
-    // until that is wired (pending Phase 0 enhancement that stores
-    // k-mer bits, not just hashes), every read gets an "informative
-    // count" but no allele vote, so all reads route to Ambig. The
-    // module's contract + downstream consumer plumbing is in place;
-    // only the inner het-pair lookup is pending.
     ReadRouting r;
-    if (expected_coverage_ <= 0) return r;
-
+    if (het_.empty() || hap1_pattern_.empty()) return r;
     const std::size_t k = profile_.minimizer_k;
     if (seq.size() < k) return r;
-
-    int lo = static_cast<int>(expected_coverage_ * 0.3);
-    int hi = static_cast<int>(expected_coverage_ * 0.7);
 
     const std::uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
     std::uint64_t kmer = 0;
     std::size_t filled = 0;
+    std::uint32_t match = 0, mismatch = 0;
 
-    std::uint32_t het_kmers_seen = 0;
     for (std::size_t i = 0; i < seq.size(); ++i) {
         std::uint8_t b = encode_base(seq[i]);
         if (b > 3) { filled = 0; kmer = 0; continue; }
         kmer = ((kmer << 2) | b) & mask;
         ++filled;
         if (filled < k) continue;
-
-        std::uint64_t h = canonical_kmer_hash(kmer, k);
-        std::uint32_t cnt = lookup_count_(h);
-        if (cnt >= static_cast<std::uint32_t>(lo) &&
-            cnt <= static_cast<std::uint32_t>(hi)) {
-            ++het_kmers_seen;
-        }
+        std::uint64_t cb = canonical_kmer_bits(kmer, k);
+        auto eit = het_.find(cb);
+        if (eit == het_.end()) continue;
+        auto pit = hap1_pattern_.find(eit->second.pair_id);
+        if (pit == hap1_pattern_.end()) continue;
+        if (pit->second == eit->second.allele) ++match;
+        else                                   ++mismatch;
     }
-    // Until the het-pair table is wired, just attribute het-rich reads
-    // to Hap1 by convention so downstream phases can be exercised. Any
-    // real run with the future complete Phase 0 will overwrite this
-    // logic; the function signature stays stable.
-    r.votes_hap1 = het_kmers_seen;
-    r.votes_hap2 = 0;
-    r.hap = (het_kmers_seen > 0) ? Haplotype::Hap1 : Haplotype::Ambig;
+
+    r.votes_hap1 = match;
+    r.votes_hap2 = mismatch;
+    if (match == 0 && mismatch == 0) {
+        r.hap = Haplotype::Ambig;
+    } else if (match > mismatch) {
+        r.hap = Haplotype::Hap1;
+    } else if (mismatch > match) {
+        r.hap = Haplotype::Hap2;
+    } else {
+        r.hap = Haplotype::Ambig;
+    }
     return r;
 }
 
@@ -223,9 +254,9 @@ void HaplotypeRouter::write_assignments_tsv(
 }
 
 std::size_t HaplotypeRouter::bytes() const noexcept {
-    return ckeys_.size() * sizeof(std::uint64_t)
-         + ccounts_.size() * sizeof(std::uint32_t)
-         + het_.size() * (sizeof(std::uint64_t) + sizeof(HetEntry));
+    return counter_.size() * (sizeof(std::uint64_t) + sizeof(std::uint32_t))
+         + het_.size() * (sizeof(std::uint64_t) + sizeof(HetEntry))
+         + hap1_pattern_.size() * (sizeof(std::uint32_t) + sizeof(std::uint8_t));
 }
 
 }  // namespace branch::wg

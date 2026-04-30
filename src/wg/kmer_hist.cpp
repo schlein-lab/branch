@@ -46,6 +46,19 @@ std::uint64_t canonical_kmer_hash(std::uint64_t kmer, std::size_t k) noexcept {
     return hf < hr ? hf : hr;
 }
 
+std::uint64_t canonical_kmer_bits(std::uint64_t kmer, std::size_t k) noexcept {
+    auto rc = rc_kmer(kmer, k);
+    return kmer < rc ? kmer : rc;
+}
+
+void kmer_bits_to_seq(std::uint64_t bits, std::size_t k, char* out) noexcept {
+    static const char kBases[4] = {'A', 'C', 'G', 'T'};
+    for (std::size_t i = 0; i < k; ++i) {
+        out[k - 1 - i] = kBases[bits & 3ULL];
+        bits >>= 2;
+    }
+}
+
 KmerHistBuilder::KmerHistBuilder(const ::branch::graph::TechProfile& profile,
                                  std::size_t expected_n_distinct_kmers)
     : profile_(profile),
@@ -71,11 +84,15 @@ void KmerHistBuilder::scan_kmers_(std::string_view seq, bool pass2) noexcept {
         ++filled;
         if (filled < k) continue;
 
-        std::uint64_t h = canonical_kmer_hash(kmer, k);
+        // Counter key = canonical kmer-bits. Bloom uses the same key
+        // and hashes it internally — no semantic difference, but downstream
+        // consumers (haplotype_router) can decode the bits directly to
+        // enumerate 1-bp variants for het-pair detection.
+        std::uint64_t cbits = canonical_kmer_bits(kmer, k);
         if (pass2) {
-            if (bloom_.maybe_contains(h)) counter_.add(h, 1);
+            if (bloom_.maybe_contains(cbits)) counter_.add(cbits, 1);
         } else {
-            bloom_.add(h);
+            bloom_.add(cbits);
         }
     }
 }

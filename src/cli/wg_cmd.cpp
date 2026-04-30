@@ -1,9 +1,6 @@
 // BRANCH v0.5 — `branch wg` orchestrator subcommand.
 //
-// Runs phases 0 → 5 in order, writing to <out-prefix>.{fa,bed,gfa}.
-// Each phase is also a separately invocable subcommand
-// (branch wg-kmer-hist, branch wg-haplotype, etc.) that reads/writes
-// the same file family so manual re-runs work too.
+// Runs phases 0 → 5 in order and writes <out-prefix>.{fa,bed,gfa}.
 
 #include "wg_cmd.hpp"
 
@@ -147,7 +144,7 @@ int run_wg(int argc, char** argv) {
     int expected_cov = args.expected_coverage > 0 ? args.expected_coverage
                                                   : profile.expected_coverage;
 
-    // Stream reads into RAM for first-cut. Future commit: streaming.
+    // Stream reads into RAM (first cut). Future commit: streaming + per-phase shards.
     std::cerr << "[wg] loading reads from " << args.reads << "\n";
     std::vector<std::pair<std::string, std::string>> reads;
     if (!stream_fastq_gz(args.reads, reads)) {
@@ -160,10 +157,17 @@ int run_wg(int argc, char** argv) {
     out.meta.input_bases = total_bp;
     std::cerr << "[wg] loaded " << reads.size() << " reads, " << total_bp << " bp\n";
 
-    // ---------- Phase 0: k-mer histogram ----------
+    // ---------- Phase 0 ----------
     auto t0 = clock::now();
     std::cerr << "[wg] Phase 0: k-mer histogram + bimodality detection\n";
-    branch::wg::KmerHistBuilder kh(profile, /*expected_distinct=*/100'000'000ULL);
+    // Size the bloom filter for expected distinct k-mers. For chr14
+    // (~100 Mbp) at k=15 ONT preset there are ~50M distinct k-mers; for
+    // a full WG ~20G. Cap at 1G to keep bloom RSS under control on a
+    // single node — over-saturation just costs FP rate, not correctness.
+    std::size_t expected_distinct = std::min<std::size_t>(
+        std::max<std::size_t>(total_bp / 4, 100'000'000ULL),
+        1'000'000'000ULL);
+    branch::wg::KmerHistBuilder kh(profile, expected_distinct);
     for (const auto& [_, seq] : reads) kh.pass1_add_read(seq);
     kh.switch_to_pass2();
     for (const auto& [_, seq] : reads) kh.pass2_add_read(seq);
@@ -175,50 +179,93 @@ int run_wg(int argc, char** argv) {
     kh.write_to(p0_path, khr);
     out.phase_log.emplace_back("0",
         std::chrono::duration<double>(clock::now() - t0).count());
-    std::cerr << "[wg] Phase 0 done. recurrent k-mers=" << khr.n_recurrent_kmers
-              << " detected_coverage=" << khr.detected_coverage
-              << " detected_het=" << khr.detected_het_coverage << "\n";
+    std::cerr << "[wg] Phase 0 done. recurrent_kmers=" << khr.n_recurrent_kmers
+              << " detected_cov=" << khr.detected_coverage
+              << " detected_het=" << khr.detected_het_coverage
+              << " bimodality_z=" << khr.bimodality_z << "\n";
 
-    // ---------- Phase 1: haplotype routing + master tiling + curation ----------
+    // ---------- Phase 1.1: routing ----------
     t0 = clock::now();
-    std::cerr << "[wg] Phase 1: haplotype routing\n";
-    branch::wg::HaplotypeRouter router(profile, p0_path,
-        khr.detected_coverage > 0 ? khr.detected_coverage : expected_cov);
+    std::cerr << "[wg] Phase 1.1: haplotype routing\n";
+    int route_cov = khr.detected_coverage > 0 ? khr.detected_coverage : expected_cov;
+    branch::wg::HaplotypeRouter router(profile, p0_path, route_cov);
     router.find_het_pairs();
-    std::string disp_tsv = args.out_prefix + ".phase1.tsv";
-    router.write_assignments_tsv(reads, disp_tsv);
+    router.set_anchor_from_reads(reads);
+    std::cerr << "[wg]   het_pairs=" << router.n_het_pairs()
+              << " anchor=" << (router.has_anchor() ? "ok" : "none") << "\n";
+
+    // Bin reads to hap1/hap2/ambig and stamp #disp records.
+    std::vector<std::pair<std::string, std::string>> hap1_reads, hap2_reads, ambig_reads;
+    hap1_reads.reserve(reads.size() / 2);
+    hap2_reads.reserve(reads.size() / 2);
     for (const auto& [id, seq] : reads) {
         auto rr = router.route_read(seq);
         const char* label = "ambig";
+        bool routed = false;
         if (rr.confidence() >= 0.6) {
             switch (rr.hap) {
-                case branch::wg::Haplotype::Hap1: label = "hap1"; break;
-                case branch::wg::Haplotype::Hap2: label = "hap2"; break;
+                case branch::wg::Haplotype::Hap1:
+                    label = "hap1"; hap1_reads.emplace_back(id, seq); routed = true; break;
+                case branch::wg::Haplotype::Hap2:
+                    label = "hap2"; hap2_reads.emplace_back(id, seq); routed = true; break;
                 default: break;
             }
         }
+        if (!routed) ambig_reads.emplace_back(id, seq);
         std::ostringstream info;
         info << "phase=1 outcome=" << label
              << " votes_h1=" << rr.votes_hap1
              << " votes_h2=" << rr.votes_hap2;
         out.read_disposition.emplace_back(id, info.str());
     }
+    std::cerr << "[wg]   bin: hap1=" << hap1_reads.size()
+              << " hap2=" << hap2_reads.size()
+              << " ambig=" << ambig_reads.size() << "\n";
 
-    // First-cut: master_tiler / curator skipped (require per-hap GFAs that
-    // we'd produce by recursing into branch assemble — wired separately).
-    out.haplotype_seqs = {"", ""};
+    // ---------- Phase 1.3: master tiling ----------
+    std::cerr << "[wg] Phase 1.3: master tiling per haplotype\n";
+    branch::wg::MasterTiler tiler(profile);
     out.haplotype_tiles.assign(2, {});
+    out.haplotype_seqs.assign(2, std::string());
+    tiler.build_tiling(hap1_reads, out.haplotype_tiles[0]);
+    tiler.build_tiling(hap2_reads, out.haplotype_tiles[1]);
+    out.haplotype_seqs[0] = tiler.render_haplotype_seq(out.haplotype_tiles[0], hap1_reads);
+    out.haplotype_seqs[1] = tiler.render_haplotype_seq(out.haplotype_tiles[1], hap2_reads);
+    std::cerr << "[wg]   hap1: tiles=" << out.haplotype_tiles[0].size()
+              << " bp=" << out.haplotype_seqs[0].size() << "\n";
+    std::cerr << "[wg]   hap2: tiles=" << out.haplotype_tiles[1].size()
+              << " bp=" << out.haplotype_seqs[1].size() << "\n";
+
+    // ---------- Phase 1.5: curation ----------
+    std::cerr << "[wg] Phase 1.5: master curation\n";
+    branch::wg::MasterCurator curator(profile);
+    std::vector<branch::wg::CurationEvent> ev1, ev2;
+    std::vector<branch::wg::BranchCandidate> bc1, bc2;
+    curator.curate(0, out.haplotype_tiles[0], out.haplotype_seqs[0],
+                   hap1_reads, ev1, bc1);
+    curator.curate(1, out.haplotype_tiles[1], out.haplotype_seqs[1],
+                   hap2_reads, ev2, bc2);
+    out.curation_events = std::move(ev1);
+    out.curation_events.insert(out.curation_events.end(),
+                               ev2.begin(), ev2.end());
+    std::vector<branch::wg::BranchCandidate> all_candidates;
+    all_candidates.reserve(bc1.size() + bc2.size());
+    all_candidates.insert(all_candidates.end(), bc1.begin(), bc1.end());
+    all_candidates.insert(all_candidates.end(), bc2.begin(), bc2.end());
+    std::cerr << "[wg]   curation_events=" << out.curation_events.size()
+              << " branch_candidates=" << all_candidates.size() << "\n";
     out.phase_log.emplace_back("1",
         std::chrono::duration<double>(clock::now() - t0).count());
-    std::cerr << "[wg] Phase 1 done\n";
 
     // ---------- Phase 2: branch attachment ----------
     t0 = clock::now();
     std::cerr << "[wg] Phase 2: branch attachment\n";
-    std::vector<branch::wg::BranchCandidate> branch_cands;
     branch::wg::BranchAttacher att(profile);
     std::vector<branch::wg::OrphanRead> orphans;
-    att.attach(branch_cands, /*ambig=*/{}, out.branches, orphans);
+    att.attach(out.haplotype_seqs, all_candidates, ambig_reads,
+               out.branches, orphans);
+    std::cerr << "[wg]   attached=" << out.branches.size()
+              << " orphans=" << orphans.size() << "\n";
     out.phase_log.emplace_back("2",
         std::chrono::duration<double>(clock::now() - t0).count());
 
@@ -228,15 +275,19 @@ int run_wg(int argc, char** argv) {
         std::cerr << "[wg] Phase 3: vPCR auto-design + counting\n";
         branch::wg::VpcrAutoDesigner vp(profile);
         vp.design(out.haplotype_seqs, out.vpcr_amplicons);
+        std::cerr << "[wg]   designed " << out.vpcr_amplicons.size()
+                  << " amplicons\n";
         vp.count(out.vpcr_amplicons, reads, expected_cov);
         out.phase_log.emplace_back("3",
             std::chrono::duration<double>(clock::now() - t0).count());
     }
 
-    // ---------- Phase 4: ref annotation (delegated to branch project) ----------
+    // ---------- Phase 4: ref annotation ----------
     if (args.do_ref) {
-        std::cerr << "[wg] Phase 4: ref annotation skipped in first-cut "
-                     "(delegate to `branch project` follows)\n";
+        std::cerr << "[wg] Phase 4: ref annotation deferred to `branch project`\n";
+        // The existing `branch project` subcommand can be invoked
+        // separately on the FASTA output. Wiring it inline is a v0.5.1
+        // follow-up — for now the emitted FASTA is project-ready.
     }
 
     // ---------- Phase 5: orphan clustering ----------
@@ -244,6 +295,7 @@ int run_wg(int argc, char** argv) {
     std::cerr << "[wg] Phase 5: orphan re-clustering\n";
     branch::wg::OrphanClusterer oc(profile);
     oc.cluster(orphans, out.orphan_clusters);
+    std::cerr << "[wg]   orphan_clusters=" << out.orphan_clusters.size() << "\n";
     out.phase_log.emplace_back("5",
         std::chrono::duration<double>(clock::now() - t0).count());
 

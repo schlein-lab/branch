@@ -92,7 +92,7 @@ void VpfWriter::write(const WgOutputs& out) {
                    << " tile=" << t
                    << " start=" << tt.start_bp
                    << " len=" << tt.length_bp
-                   << " master=read_" << tt.master_read_id
+                   << " master=read_" << tt.master_read_idx
                    << " qmean=" << (tt.q_mean_x10 / 10.0) << '\n';
             }
         }
