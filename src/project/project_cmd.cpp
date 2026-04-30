@@ -11,6 +11,8 @@
 
 #include "project_cmd.hpp"
 #include "project/linear_mapper.hpp"
+#include "project/pangenome_mapper.hpp"
+#include "project/somatic_delta.hpp"
 #include "project/project_report.hpp"
 
 #include <algorithm>
@@ -29,9 +31,16 @@ namespace branch::cli {
 namespace {
 
 void print_project_usage(std::ostream& os) {
-    os << "branch project — linear reference projection (v0.4.1)\n"
+    os << "branch project — three-layer reference projection (v0.4.3)\n"
+          "\n"
+          "Map in, comparison out: every branch is matched against the standard\n"
+          "human genome (linear), against a public collection of known DNA variation\n"
+          "(HPRC pangenome), and the residual edit distance to the closest known\n"
+          "sequence is reported — so a brand-new change is flagged as new.\n"
           "\nUsage:\n"
           "  branch project --fasta <path.fasta> --ref-linear <name=path>\n"
+          "                 [--ref-pangenome <name=path.gbz>]\n"
+          "                 [--ref-fasta <name=path.fa>] [--no-somatic-delta]\n"
           "                 --out-prefix <path> [--threads <N>] [--min-mapq <N>]\n"
           "\nRequired:\n"
           "  --fasta <path>         Branch consensus FASTA (from branch assemble)\n"
@@ -51,16 +60,28 @@ void print_project_usage(std::ostream& os) {
           "                 --ref-linear GRCh38=/refs/grch38.mmi \\\n"
           "                 --out-prefix output/sample1 \\\n"
           "                 --threads 8 --min-mapq 20\n"
-          "\nNote: Pangenome layer and somatic delta will be added in v0.4.2/v0.4.3.\n";
+          "\nFlags:\n"
+          "  --ref-pangenome <s>  HPRC graph (name=path.gbz, repeatable). Aligned via\n"
+          "                       GraphAligner (default) or minigraph; results in\n"
+          "                       pangenome_mappings[] in the JSON.\n"
+          "  --ref-fasta <spec>   Linear ref FASTA (name=path), repeatable. Drives the\n"
+          "                       v0.4.3 somatic-delta edit-distance computation.\n"
+          "  --no-somatic-delta   Skip the somatic-delta layer.\n"
+          "  --pangenome-tool <t> GraphAligner (default) | minigraph.\n";
 }
 
 /// Parsed arguments for branch project.
 struct ProjectArgs {
     std::string fasta;
-    std::vector<std::pair<std::string, std::string>> ref_linear;  // name, path
+    std::vector<std::pair<std::string, std::string>> ref_linear;     // name, .mmi/.fa
+    std::vector<std::pair<std::string, std::string>> ref_pangenome;  // name, .gbz / .gfa
+    std::vector<std::pair<std::string, std::string>> ref_fasta;      // name, .fa  (somatic delta)
     std::string out_prefix;
+    std::string pangenome_tool{"GraphAligner"};
     int threads{4};
     int min_mapq{0};
+    bool somatic_delta{true};
+    int  somatic_max_len{5000};   // bp; 0 = no cap
     bool ok{false};
     std::string err;
 };
@@ -101,6 +122,24 @@ ProjectArgs parse_project_args(int argc, char** argv) {
             auto v = needs_val("--ref-linear");
             if (!v) return a;
             a.ref_linear.push_back(parse_ref_spec(v));
+        } else if (k == "--ref-pangenome") {
+            auto v = needs_val("--ref-pangenome");
+            if (!v) return a;
+            a.ref_pangenome.push_back(parse_ref_spec(v));
+        } else if (k == "--ref-fasta") {
+            auto v = needs_val("--ref-fasta");
+            if (!v) return a;
+            a.ref_fasta.push_back(parse_ref_spec(v));
+        } else if (k == "--no-somatic-delta") {
+            a.somatic_delta = false;
+        } else if (k == "--somatic-max-len") {
+            auto v = needs_val("--somatic-max-len");
+            if (!v) return a;
+            a.somatic_max_len = std::stoi(v);
+        } else if (k == "--pangenome-tool") {
+            auto v = needs_val("--pangenome-tool");
+            if (!v) return a;
+            a.pangenome_tool = v;
         } else if (k == "--out-prefix") {
             auto v = needs_val("--out-prefix");
             if (!v) return a;
@@ -258,6 +297,63 @@ int run_project(int argc, char** argv) {
         mappings_by_branch[m.branch_id].push_back(std::move(m));
     }
 
+    // 3b. Pangenome layer (v0.4.2)
+    std::map<std::string, std::vector<project::PangenomeMapping>> pangenome_by_branch;
+    if (!args.ref_pangenome.empty()) {
+        std::vector<project::PangenomeRef> pgs;
+        for (const auto& [name, path] : args.ref_pangenome) {
+            pgs.push_back({name, path});
+        }
+        project::PangenomeMapOptions pgo;
+        pgo.threads = args.threads;
+        pgo.tool = args.pangenome_tool;
+        pgo.tool_path = args.pangenome_tool;
+        std::string pg_err;
+        auto pg_mappings = project::map_branches_pangenome(args.fasta, pgs, pgo, &pg_err);
+        if (!pg_err.empty()) {
+            std::cerr << "[branch project] pangenome layer warning: "
+                      << pg_err << " — continuing without pangenome annotation\n";
+        }
+        for (auto& m : pg_mappings) {
+            pangenome_by_branch[m.branch_id].push_back(std::move(m));
+        }
+        std::cerr << "[branch project] pangenome: "
+                  << pangenome_by_branch.size() << " branches mapped across "
+                  << pgs.size() << " graph(s)\n";
+    }
+
+    // 3c. Somatic-delta layer (v0.4.3) — branch ↔ closest known sequence
+    std::map<std::string, std::vector<project::SomaticDelta>> somatic_by_branch;
+    if (args.somatic_delta) {
+        std::vector<std::pair<std::string, std::string>> ref_fa = args.ref_fasta;
+        if (ref_fa.empty()) {
+            for (const auto& [name, path] : args.ref_linear) {
+                if (path.size() >= 4 && path.substr(path.size()-4) == ".mmi") continue;
+                ref_fa.emplace_back(name, path);
+            }
+        }
+        if (ref_fa.empty()) {
+            std::cerr << "[branch project] somatic-delta: no FASTA refs available "
+                         "(passed --ref-linear with .mmi only). Pass --ref-fasta or "
+                         "--no-somatic-delta to silence.\n";
+        } else {
+            project::SomaticDeltaOptions sdo;
+            sdo.threads = args.threads;
+            sdo.max_branch_len_bp = args.somatic_max_len;
+            std::string sd_err;
+            auto deltas = project::compute_somatic_deltas(args.fasta, ref_fa, sdo, &sd_err);
+            if (!sd_err.empty()) {
+                std::cerr << "[branch project] somatic-delta warning: " << sd_err << "\n";
+            }
+            for (auto& d : deltas) {
+                somatic_by_branch[d.branch_id].push_back(std::move(d));
+            }
+            std::cerr << "[branch project] somatic-delta: "
+                      << somatic_by_branch.size() << " branches scored against "
+                      << ref_fa.size() << " ref(s)\n";
+        }
+    }
+
     // 4. Build BranchEntry for each branch
     std::vector<project::BranchEntry> branches;
     branches.reserve(fasta_entries.size());
@@ -274,6 +370,14 @@ int run_project(int argc, char** argv) {
         auto it = mappings_by_branch.find(branch_id);
         if (it != mappings_by_branch.end()) {
             entry.linear_mappings = std::move(it->second);
+        }
+        if (auto pit = pangenome_by_branch.find(branch_id);
+            pit != pangenome_by_branch.end()) {
+            entry.pangenome_mappings = std::move(pit->second);
+        }
+        if (auto sit = somatic_by_branch.find(branch_id);
+            sit != somatic_by_branch.end()) {
+            entry.somatic_deltas = std::move(sit->second);
         }
 
         // Check if unannotated: no mapping with mapq >= min_mapq

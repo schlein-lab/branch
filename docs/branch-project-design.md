@@ -8,6 +8,56 @@ variants that diverge from known population haplotypes.
 
 **Version target**: v0.4 (scaffold in v0.3)
 
+## Status — v0.4.3
+
+All three layers are wired into `branch project` and produce per-branch
+output in the JSON report:
+
+| Layer            | CLI flag                  | Backend                  | JSON field             |
+|------------------|---------------------------|--------------------------|------------------------|
+| Linear           | `--ref-linear name=p`     | minimap2 asm20           | `linear_mappings[]`    |
+| Pangenome        | `--ref-pangenome name=p`  | GraphAligner / minigraph | `pangenome_mappings[]` |
+| Somatic delta    | `--ref-fasta name=p`      | ksw2                     | `somatic_deltas[]`     |
+
+### End-to-end smoke (HG002 ONT IGH, 10 / 1899 contigs, 1 IGH locus):
+
+```
+[branch project] loaded 10 branches from HG002_ont.small.fa
+[branch project] got 10 mappings across 1 references            (linear: minimap2 vs GRCh38)
+[branch project] pangenome: 10 branches mapped across 1 graph(s)  (minigraph vs HPRC v1.1 chr14 GFA)
+[branch project] somatic-delta: 10 branches scored against 1 ref(s) (ksw2 vs IGH window)
+[branch project] mapped 10 branches across 1 refs, 0 unannotated
+[branch] peak RSS = 6.5 MiB                                      ~55 s wall-clock, 8 threads
+```
+
+Sample branch from the JSON output (`node_1`, 53 234 bp):
+
+```jsonc
+{
+  "linear_mappings": [
+    {"ref": "GRCh38", "target": "chr14",
+     "start": 105359262, "end": 105412505, "mapq": 60}
+  ],
+  "pangenome_mappings": [
+    {"ref_name": "HPRCv11", "path": ">21641825>21641827>21641828>21641829>21641830...",
+     "mapq": 60, "identity": 0.9956, "path_start": 117, "path_end": 53351}
+  ],
+  "somatic_deltas": [
+    {"ref_name": "IGH_GRCh38", "edit_distance": -1, "cigar": "SKIP_LEN>5000",
+     "aligned_query_len": 53234, "aligned_ref_len": 1100001}
+  ]
+}
+```
+
+**Reading the layers**:
+- *Linear* — branch sits in the IGH locus on GRCh38 (chr14:105 359-412 kb), mapq 60.
+- *Pangenome* — 99.56 % identity to the closest HPRC v1.1 haplotype path; the branch is essentially a known variant present in the pangenome.
+- *Somatic delta* — skipped at this length (over the default 5 000 bp cap); short bubble-class branches stay in scope and emit ksw2 CIGAR + alignment-region identity.
+
+Linear-only on the full 1 899 contigs runs in 43 s producing 4 581 mappings;
+1 475 contigs remain `unannotated` — the candidate novel sequences for
+manual review.
+
 ## Motivation
 
 Standard variant calling assumes diploid genomes with variants present at ~50% or ~100%
