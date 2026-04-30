@@ -132,10 +132,14 @@ KmerHistResult KmerHistBuilder::finalize(int expected_coverage,
         ++r.histogram[bin];
     });
 
-    // Find peaks. We only look in [4, 4*expected_coverage] because
-    // counts of 2-3 are mostly Q-error survivors that the bloom let
-    // through, not informative signal.
-    int lo = 4;
+    // Find peaks. Start search above the bloom-saturation noise floor:
+    // when the bloom saturates (which it does for whole-genome ONT at
+    // any reasonable bloom size), the histogram is dominated by spurious
+    // count-1/2/3 entries that mask the real single-copy peak. Starting
+    // at ~expected_coverage/3 skips the noise band and reveals the true
+    // single-copy peak. Falls back to lo=4 only when expected_coverage is
+    // unset / very small.
+    int lo = std::max(4, expected_coverage / 3);
     int hi = std::min<int>(static_cast<int>(HIST_MAX) - 1, expected_coverage * 4);
     if (lo >= hi) return r;
 

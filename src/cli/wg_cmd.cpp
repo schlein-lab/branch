@@ -240,15 +240,39 @@ int run_wg(int argc, char** argv) {
     std::cerr << "[wg]   hap2: tiles=" << out.haplotype_tiles[1].size()
               << " bp=" << out.haplotype_seqs[1].size() << "\n";
 
-    // ---------- Phase 1.5: curation ----------
+    // ---------- Phase 1.5: curation (GPU-first, CPU fallback) ----------
     std::cerr << "[wg] Phase 1.5: master curation\n";
+    bool use_gpu_p15 = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
     branch::wg::MasterCurator curator(profile);
     std::vector<branch::wg::CurationEvent> ev1, ev2;
     std::vector<branch::wg::BranchCandidate> bc1, bc2;
-    curator.curate(0, out.haplotype_tiles[0], out.haplotype_seqs[0],
-                   hap1_reads, ev1, bc1);
-    curator.curate(1, out.haplotype_tiles[1], out.haplotype_seqs[1],
-                   hap2_reads, ev2, bc2);
+    int default_q = (profile.name && profile.name[0] == 'h') ? 30 : 18;
+    auto curate_one = [&](std::uint32_t h_idx,
+                          const std::string& seq,
+                          const std::vector<std::pair<std::string, std::string>>& reads_h,
+                          std::vector<branch::wg::CurationEvent>& evout,
+                          std::vector<branch::wg::BranchCandidate>& bcout) {
+        bool ok = false;
+        if (use_gpu_p15) {
+            ok = branch::gpu::wg_kernels::launch_phase15_curation(
+                h_idx, seq, reads_h,
+                profile.minimizer_k, profile.minimizer_w,
+                profile.min_coverage_branch,
+                profile.min_base_agreement,
+                default_q, evout, bcout);
+            if (ok) std::cerr << "[wg]   hap" << (h_idx+1)
+                              << " curate on GPU: events=" << evout.size()
+                              << " branches=" << bcout.size() << "\n";
+        }
+        if (!ok) {
+            curator.curate(h_idx, out.haplotype_tiles[h_idx], seq, reads_h, evout, bcout);
+            std::cerr << "[wg]   hap" << (h_idx+1)
+                      << " curate on CPU: events=" << evout.size()
+                      << " branches=" << bcout.size() << "\n";
+        }
+    };
+    curate_one(0, out.haplotype_seqs[0], hap1_reads, ev1, bc1);
+    curate_one(1, out.haplotype_seqs[1], hap2_reads, ev2, bc2);
     out.curation_events = std::move(ev1);
     out.curation_events.insert(out.curation_events.end(),
                                ev2.begin(), ev2.end());

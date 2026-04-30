@@ -883,15 +883,421 @@ bool launch_stage2(
 }
 
 // ===========================================================================
-// Stretch-goal launchers — return false to force CPU fallback
+// Phase 1.5 — master-tile pile-up curation kernel
 // ===========================================================================
+//
+// Per-read minimizer anchoring + offset estimation + base-walk pileup.
+// One thread per read. For each read:
+//   1. Slide a (k, w) minimizer window
+//   2. For each unique-anchor minimizer (one position in hap), record
+//      (read_pos, hap_pos)
+//   3. Median offset = median(hap_pos - read_pos) over collected anchors
+//   4. Walk read bases at offset, atomicAdd into d_counts[hp][base]
+//
+// Output: d_counts[hap_pos] holds per-base 4-counter for each hap
+// position. Host post-pass scans these to emit CurationEvent (master
+// disagreement) + BranchCandidate (alt-base count >= min_coverage).
+//
+// Memory budget on chr14 hap2 (510 Mbp):
+//   d_hap_seq:           510 MB (uint8_t per base)
+//   d_counts:            8.16 GB (4 × uint32_t per base, atomic-incrementable)
+//   d_reads concat:      ~12 GB
+//   hap_minz seed table: ~1 GB
+//   Total: ~22 GB on H100 80 GB.
+//
+// Anchors stored in thread-local arrays bounded at kMaxAnchors=64
+// per read; with k=15/w=10 ONT preset over a 18 kbp read this covers
+// ~99 % of reads without overflow.
+
+namespace {
+
+constexpr int kCurMaxAnchors = 64;
+constexpr int kCurMinAnchors = 5;
+
+struct PileupAtomic {
+    unsigned int counts[4];   // A, C, G, T — atomically incrementable
+};
+
+__global__ void k_phase15_pileup(
+    const uint8_t*  __restrict__ d_hap_seq,
+    uint64_t        hap_len,
+    // hap minimizer index (open addressing): canonical_min_bits ->
+    // single hap position (UINT32_MAX for ambiguous / multi-pos).
+    const uint64_t* __restrict__ d_hap_min_keys,
+    const uint32_t* __restrict__ d_hap_min_pos,
+    uint32_t        n_hap_min_slots,
+    uint64_t        hap_min_mask,
+    // reads
+    const char*     __restrict__ d_reads_buf,
+    const uint64_t* __restrict__ d_read_off,
+    const uint32_t* __restrict__ d_read_len,
+    uint64_t        n_reads,
+    int             k_bp,
+    int             w_bp,
+    // output: per-position 4-counter
+    PileupAtomic*   __restrict__ d_counts) {
+    uint64_t r = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (r >= n_reads) return;
+
+    uint64_t off = d_read_off[r];
+    uint32_t len = d_read_len[r];
+    if (len < static_cast<uint32_t>(k_bp + w_bp)) return;
+    const char* seq = d_reads_buf + off;
+    const uint64_t kmask = (k_bp >= 32) ? ~0ULL : ((1ULL << (2 * k_bp)) - 1ULL);
+
+    // 1. Walk sliding minimizer window over the read; for each new minimum,
+    //    look up in hap minimizer index. If single-position match, record
+    //    offset = hap_pos - read_pos. Use a small in-register buffer.
+    int64_t offsets[kCurMaxAnchors];
+    int n_anchors = 0;
+
+    // Sliding-window state held in registers.
+    uint64_t kmer = 0;
+    int filled = 0;
+    // For w-window minimum tracking we use a small ring buffer (size w)
+    // of (canon_bits, read_pos) pairs. With w<=64 this fits in registers
+    // for typical configurations.
+    uint64_t wbits[64];
+    uint32_t wpos[64];
+    int wn = 0;
+    uint64_t prev_min = ~0ULL;
+
+    auto seed_lookup = [&](uint64_t key) -> uint32_t {
+        constexpr uint64_t kEmpty = ~0ULL;
+        uint64_t i = d_splitmix64(key) & hap_min_mask;
+        for (uint32_t probes = 0; probes < n_hap_min_slots; ++probes) {
+            uint64_t k_at = d_hap_min_keys[i];
+            if (k_at == kEmpty) return 0xFFFFFFFFu;
+            if (k_at == key)    return d_hap_min_pos[i];
+            i = (i + 1) & hap_min_mask;
+        }
+        return 0xFFFFFFFFu;
+    };
+
+    for (uint32_t i = 0; i < len && n_anchors < kCurMaxAnchors; ++i) {
+        uint8_t b = d_encode_base(seq[i]);
+        if (b > 3) {
+            filled = 0; kmer = 0; wn = 0; prev_min = ~0ULL;
+            continue;
+        }
+        kmer = ((kmer << 2) | b) & kmask;
+        ++filled;
+        if (filled < k_bp) continue;
+
+        uint64_t cb = d_canon(kmer, k_bp);
+        uint32_t pos = i + 1 - k_bp;
+
+        if (wn < w_bp) {
+            wbits[wn] = cb;
+            wpos[wn]  = pos;
+            ++wn;
+        } else {
+            // Shift the buffer left by one (drop oldest).
+            for (int j = 0; j < w_bp - 1; ++j) {
+                wbits[j] = wbits[j + 1];
+                wpos[j]  = wpos[j + 1];
+            }
+            wbits[w_bp - 1] = cb;
+            wpos[w_bp - 1]  = pos;
+        }
+
+        if (wn < w_bp) continue;
+
+        // Find min in window.
+        uint64_t mn_b = wbits[0];
+        uint32_t mn_p = wpos[0];
+        for (int j = 1; j < w_bp; ++j) {
+            if (wbits[j] < mn_b) { mn_b = wbits[j]; mn_p = wpos[j]; }
+        }
+        if (mn_b == prev_min) continue;
+        prev_min = mn_b;
+
+        // Hap index lookup.
+        uint32_t hap_pos = seed_lookup(mn_b);
+        if (hap_pos == 0xFFFFFFFFu) continue;
+
+        offsets[n_anchors++] = static_cast<int64_t>(hap_pos)
+                             - static_cast<int64_t>(mn_p);
+    }
+
+    if (n_anchors < kCurMinAnchors) return;
+
+    // 2. Median offset (in-place selection sort up to N <= 64).
+    for (int i = 0; i < n_anchors; ++i) {
+        int min_j = i;
+        for (int j = i + 1; j < n_anchors; ++j)
+            if (offsets[j] < offsets[min_j]) min_j = j;
+        int64_t tmp = offsets[i]; offsets[i] = offsets[min_j]; offsets[min_j] = tmp;
+    }
+    int64_t med_off = offsets[n_anchors / 2];
+
+    // 3. Walk read at `med_off`, atomic-increment per-position counters.
+    for (uint32_t i = 0; i < len; ++i) {
+        int64_t hp = static_cast<int64_t>(i) + med_off;
+        if (hp < 0 || hp >= static_cast<int64_t>(hap_len)) continue;
+        uint8_t b = d_encode_base(seq[i]);
+        if (b > 3) continue;
+        atomicAdd(&d_counts[hp].counts[b], 1u);
+    }
+}
+
+// Build hap-minimizer single-position index on host.
+//   - Walk the haplotype with (k, w) sliding-min
+//   - For each unique canonical minimum position, store
+//     map[canonical_bits] = first hap position; if a second occurrence,
+//     mark as ambiguous (UINT32_MAX) so reads don't anchor on it.
+//   - Pack into open-addressing table for the device.
+void build_hap_minz_table_host(
+    const std::string& hap_seq,
+    std::size_t k,
+    std::size_t w,
+    std::vector<std::uint64_t>& out_keys,
+    std::vector<std::uint32_t>& out_pos) {
+    constexpr std::uint64_t kEmpty = ~0ULL;
+    constexpr std::uint32_t kAmbig = 0xFFFFFFFFu;
+
+    std::unordered_map<std::uint64_t, std::uint32_t> raw;
+    if (hap_seq.size() < k) {
+        out_keys.assign(16, kEmpty);
+        out_pos.assign(16, 0);
+        return;
+    }
+    const std::uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
+    std::vector<std::pair<std::uint64_t, std::size_t>> wbuf;
+    wbuf.reserve(w);
+    std::uint64_t kmer = 0;
+    std::size_t filled = 0;
+    std::uint64_t prev = ~0ULL;
+    for (std::size_t i = 0; i < hap_seq.size(); ++i) {
+        std::uint8_t b;
+        switch (hap_seq[i]) {
+            case 'A': case 'a': b = 0; break;
+            case 'C': case 'c': b = 1; break;
+            case 'G': case 'g': b = 2; break;
+            case 'T': case 't': b = 3; break;
+            default: filled = 0; kmer = 0; wbuf.clear(); prev = ~0ULL; continue;
+        }
+        kmer = ((kmer << 2) | b) & mask;
+        ++filled;
+        if (filled < k) continue;
+        // Canonical bits.
+        std::uint64_t fwd = kmer;
+        std::uint64_t rev = 0; std::uint64_t tmp = fwd;
+        for (std::size_t j = 0; j < k; ++j) {
+            rev = (rev << 2) | ((~tmp) & 3ULL);
+            tmp >>= 2;
+        }
+        std::uint64_t cb = fwd < rev ? fwd : rev;
+        std::uint32_t pos = static_cast<std::uint32_t>(i + 1 - k);
+        wbuf.emplace_back(cb, pos);
+        if (wbuf.size() > w) wbuf.erase(wbuf.begin());
+        if (wbuf.size() < w) continue;
+        auto mn = wbuf[0];
+        for (std::size_t j = 1; j < wbuf.size(); ++j)
+            if (wbuf[j].first < mn.first) mn = wbuf[j];
+        if (mn.first == prev) continue;
+        prev = mn.first;
+        auto it = raw.find(mn.first);
+        if (it == raw.end()) {
+            raw[mn.first] = static_cast<std::uint32_t>(mn.second);
+        } else if (it->second != kAmbig) {
+            it->second = kAmbig;
+        }
+    }
+    // Drop ambiguous entries.
+    for (auto it = raw.begin(); it != raw.end(); ) {
+        if (it->second == kAmbig) it = raw.erase(it);
+        else ++it;
+    }
+    // Pack into open-addressing table at load factor 0.5.
+    std::size_t cap = 1;
+    while (cap < raw.size() * 2) cap <<= 1;
+    if (cap < 16) cap = 16;
+    out_keys.assign(cap, kEmpty);
+    out_pos.assign(cap, 0);
+    std::uint64_t mask_t = cap - 1;
+    auto mix = [](std::uint64_t z) {
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    };
+    for (auto& [key, p] : raw) {
+        std::uint64_t i = mix(key) & mask_t;
+        while (out_keys[i] != kEmpty) i = (i + 1) & mask_t;
+        out_keys[i] = key;
+        out_pos[i] = p;
+    }
+}
+
+}  // namespace
 
 bool launch_phase15_curation(
-    std::uint32_t, const std::string&,
-    const std::vector<std::pair<std::string, std::string>>&,
-    std::size_t, std::size_t, int, double, int,
-    std::vector<branch::wg::CurationEvent>&,
-    std::vector<branch::wg::BranchCandidate>&) noexcept { return false; }
+    std::uint32_t hap_idx,
+    const std::string& hap_seq,
+    const std::vector<std::pair<std::string, std::string>>& reads,
+    std::size_t k,
+    std::size_t w,
+    int min_coverage_branch,
+    double min_base_agreement,
+    int default_q,
+    std::vector<branch::wg::CurationEvent>& out_events,
+    std::vector<branch::wg::BranchCandidate>& out_branches) noexcept {
+    if (!is_gpu_available()) return false;
+    if (hap_seq.empty() || reads.empty()) {
+        out_events.clear();
+        out_branches.clear();
+        return true;
+    }
+    if (w > 64) return false;  // kernel inlines a w-sized ring buffer
+
+    const std::size_t hap_len = hap_seq.size();
+    const std::size_t n_rd = reads.size();
+
+    std::vector<std::uint64_t> hmin_keys;
+    std::vector<std::uint32_t> hmin_pos;
+    build_hap_minz_table_host(hap_seq, k, w, hmin_keys, hmin_pos);
+
+    std::vector<std::uint8_t> hap_bytes(hap_len);
+    for (std::size_t i = 0; i < hap_len; ++i) {
+        char c = hap_seq[i];
+        switch (c) {
+            case 'A': case 'a': hap_bytes[i] = 0; break;
+            case 'C': case 'c': hap_bytes[i] = 1; break;
+            case 'G': case 'g': hap_bytes[i] = 2; break;
+            case 'T': case 't': hap_bytes[i] = 3; break;
+            default: hap_bytes[i] = 4; break;
+        }
+    }
+
+    // Flatten reads.
+    std::vector<char> reads_buf;
+    std::vector<std::uint64_t> reads_off(n_rd);
+    std::vector<std::uint32_t> reads_len(n_rd);
+    {
+        std::size_t cur = 0;
+        for (std::size_t i = 0; i < n_rd; ++i) {
+            reads_off[i] = cur;
+            reads_len[i] = static_cast<std::uint32_t>(reads[i].second.size());
+            reads_buf.insert(reads_buf.end(),
+                reads[i].second.begin(), reads[i].second.end());
+            cur += reads[i].second.size();
+        }
+    }
+
+    // Device allocations.
+    std::uint8_t*  d_hap = nullptr;
+    std::uint64_t* d_hkeys = nullptr;
+    std::uint32_t* d_hpos = nullptr;
+    char*          d_rb = nullptr;
+    std::uint64_t* d_ro = nullptr;
+    std::uint32_t* d_rl = nullptr;
+    PileupAtomic*  d_cnt = nullptr;
+
+    auto cleanup = [&]() {
+        for (void* p : {(void*)d_hap, (void*)d_hkeys, (void*)d_hpos,
+                        (void*)d_rb, (void*)d_ro, (void*)d_rl, (void*)d_cnt}) {
+            if (p) cudaFree(p);
+        }
+    };
+    auto bail = [&](const char* where) {
+        std::fprintf(stderr, "[gpu/wg] launch_phase15 fail at %s\n", where);
+        cleanup();
+        return false;
+    };
+
+    if (cudaMalloc(&d_hap, hap_len) != cudaSuccess) return bail("hap_seq alloc");
+    if (cudaMalloc(&d_hkeys, hmin_keys.size() * sizeof(std::uint64_t)) != cudaSuccess) return bail("hkeys alloc");
+    if (cudaMalloc(&d_hpos, hmin_pos.size() * sizeof(std::uint32_t)) != cudaSuccess) return bail("hpos alloc");
+    if (cudaMalloc(&d_rb, reads_buf.size()) != cudaSuccess) return bail("reads_buf alloc");
+    if (cudaMalloc(&d_ro, n_rd * sizeof(std::uint64_t)) != cudaSuccess) return bail("reads_off alloc");
+    if (cudaMalloc(&d_rl, n_rd * sizeof(std::uint32_t)) != cudaSuccess) return bail("reads_len alloc");
+    if (cudaMalloc(&d_cnt, hap_len * sizeof(PileupAtomic)) != cudaSuccess) return bail("counts alloc");
+    cudaMemset(d_cnt, 0, hap_len * sizeof(PileupAtomic));
+
+    if (cudaMemcpy(d_hap, hap_bytes.data(), hap_len, cudaMemcpyHostToDevice) != cudaSuccess) return bail("hap HtoD");
+    if (cudaMemcpy(d_hkeys, hmin_keys.data(), hmin_keys.size() * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("hkeys HtoD");
+    if (cudaMemcpy(d_hpos, hmin_pos.data(), hmin_pos.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("hpos HtoD");
+    if (cudaMemcpy(d_rb, reads_buf.data(), reads_buf.size(), cudaMemcpyHostToDevice) != cudaSuccess) return bail("reads_buf HtoD");
+    if (cudaMemcpy(d_ro, reads_off.data(), n_rd * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("reads_off HtoD");
+    if (cudaMemcpy(d_rl, reads_len.data(), n_rd * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("reads_len HtoD");
+
+    int block = 128;
+    int grid = static_cast<int>((n_rd + block - 1) / block);
+    k_phase15_pileup<<<grid, block>>>(
+        d_hap, hap_len,
+        d_hkeys, d_hpos,
+        static_cast<std::uint32_t>(hmin_keys.size()),
+        static_cast<std::uint64_t>(hmin_keys.size() - 1),
+        d_rb, d_ro, d_rl, n_rd,
+        static_cast<int>(k), static_cast<int>(w),
+        d_cnt);
+    if (cudaGetLastError() != cudaSuccess) return bail("k_phase15 launch");
+    if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_phase15 sync");
+
+    // Copy back the per-position counts.
+    std::vector<PileupAtomic> host_counts(hap_len);
+    if (cudaMemcpy(host_counts.data(), d_cnt, hap_len * sizeof(PileupAtomic),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return bail("counts DtoH");
+    cleanup();
+
+    // Post-process on host: emit CurationEvent + BranchCandidate.
+    out_events.clear();
+    out_branches.clear();
+    auto encode = [](char c) -> std::uint8_t {
+        switch (c) {
+            case 'A': case 'a': return 0;
+            case 'C': case 'c': return 1;
+            case 'G': case 'g': return 2;
+            case 'T': case 't': return 3;
+            default: return 4;
+        }
+    };
+    auto decode = [](std::uint8_t b) -> char {
+        static const char kBases[4] = {'A','C','G','T'};
+        return b < 4 ? kBases[b] : 'N';
+    };
+
+    for (std::size_t p = 0; p < hap_len; ++p) {
+        const auto& c = host_counts[p];
+        std::uint32_t total = c.counts[0] + c.counts[1] + c.counts[2] + c.counts[3];
+        if (total < static_cast<std::uint32_t>(min_coverage_branch * 2)) continue;
+        std::uint8_t mb = encode(hap_seq[p]);
+        if (mb >= 4) continue;
+        std::uint32_t mb_count = c.counts[mb];
+
+        std::uint8_t majority = mb;
+        std::uint32_t maj_count = mb_count;
+        for (int b = 0; b < 4; ++b) {
+            if (c.counts[b] > maj_count) {
+                maj_count = c.counts[b];
+                majority = static_cast<std::uint8_t>(b);
+            }
+        }
+        double agreement = total > 0 ? (double)mb_count / total : 1.0;
+        if (agreement < min_base_agreement && majority != mb) {
+            branch::wg::CurationEvent ev;
+            ev.hap_idx = hap_idx;
+            ev.pos_in_hap = static_cast<std::uint32_t>(p);
+            ev.original_base = decode(mb);
+            ev.curated_base = decode(majority);
+            ev.n_supporting_reads = maj_count;
+            out_events.push_back(ev);
+        }
+        for (int b = 0; b < 4; ++b) {
+            if (b == mb) continue;
+            if (c.counts[b] < static_cast<std::uint32_t>(min_coverage_branch)) continue;
+            branch::wg::BranchCandidate bc;
+            bc.hap_idx = hap_idx;
+            bc.pos_in_hap = static_cast<std::uint32_t>(p);
+            bc.alt_seq.assign(1, decode(static_cast<std::uint8_t>(b)));
+            // Simple Q-weighted evidence: count × sigmoid(default_q-12)*0.7.
+            double qw = 1.0 / (1.0 + std::exp(-((double)default_q - 12) * 0.7));
+            bc.q_weighted_evidence = qw * c.counts[b];
+            out_branches.push_back(std::move(bc));
+        }
+    }
+    return true;
+}
 
 bool launch_phase0_count(
     const std::vector<std::pair<std::string, std::string>>&,
