@@ -14,8 +14,11 @@
 #include <cstddef>
 #include <cstdint>
 
-// Forward declare cudaStream_t to avoid CUDA header dependency in CPU code
-#ifdef __CUDACC__
+// Forward declare cudaStream_t to avoid CUDA header dependency in CPU code.
+// If a translation unit already includes <cuda_runtime.h> (the host-side
+// gpu_backend.cpp under CUDA-enabled builds), do nothing — the real type
+// is already in scope.
+#if defined(__CUDACC__) || defined(CUDART_VERSION)
 #include <cuda_runtime.h>
 #else
 using cudaStream_t = void*;
