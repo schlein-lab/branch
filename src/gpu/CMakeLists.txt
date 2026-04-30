@@ -19,9 +19,11 @@ if(BRANCH_CUDA_ENABLED)
         overlap_kernel_stub.cpp
         wg_kernels.cu
     )
-    set_target_properties(branch_gpu PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-    )
+    # No CUDA_SEPARABLE_COMPILATION: every wg_kernels.cu kernel is
+    # self-contained (no device-callable functions exported across
+    # TUs), so whole-program compilation keeps the device-link step
+    # simple and does not require CUDA_RESOLVE_DEVICE_SYMBOLS in
+    # downstream targets (branch executable).
 else()
     add_library(branch_gpu STATIC
         overlap_kernel_stub.cpp
