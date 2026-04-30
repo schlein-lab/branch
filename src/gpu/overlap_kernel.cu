@@ -152,7 +152,9 @@ __global__ void process_buckets_emit_pairs(
         // atomic hash-map operations which are deferred to v0.3
         
         // Atomic output
-        const std::size_t out_idx = atomicAdd(out_count, 1ULL);
+        const unsigned long long int out_idx = atomicAdd(
+            reinterpret_cast<unsigned long long int*>(out_count),
+            static_cast<unsigned long long int>(1));
         if (out_idx < max_output_pairs) {
             out_pairs[out_idx] = branch::backend::OverlapPair{
                 .read_a = read_a,
