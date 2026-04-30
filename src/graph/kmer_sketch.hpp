@@ -60,6 +60,64 @@ inline constexpr MinimizerProfile kProfileHiFi{21, 19, 0,  0, "hifi"};
 inline constexpr MinimizerProfile kProfileONT {15, 10, 64, 0, "ont"};
 
 
+// ---------------------------------------------------------------------------
+// TechProfile (v0.5) — single source for every tech-specific threshold.
+//
+// Extends MinimizerProfile with the parameters needed by the v0.5
+// whole-genome pipeline (Phase 0..5, see docs/v0.5.md). The minimizer
+// fields are duplicated rather than inherited so existing call sites
+// using MinimizerProfile keep working without any change. New v0.5
+// modules should consume TechProfile directly.
+struct TechProfile {
+    // Phase 0 — minimizer + k-mer histogram
+    std::size_t minimizer_k        = 21;
+    std::size_t minimizer_w        = 19;
+    std::size_t bucket_cap         = 0;      // 0 = no cap (HiFi); 64 (ONT)
+    int         expected_coverage  = 30;     // user-overridable per run
+    double      bimodality_z       = 4.0;    // peak-separation z-threshold
+
+    // Phase 1 — master-tiling + curation
+    double      min_base_agreement = 0.95;
+    int         min_coverage_branch = 2;
+    int         min_branch_length_bp = 1;    // 1-bp branches as feature
+
+    // Phase 2 — transitive branch attachment
+    double      sketch_jaccard_lo  = 0.20;
+    int         max_transitive_depth = 3;
+
+    // Phase 3 — vPCR auto-primer design
+    int         primer_min_window_bp = 18;
+    int         primer_max_window_bp = 25;
+    double      primer_max_entropy = 0.5;
+
+    const char* name = "hifi";
+};
+
+inline constexpr TechProfile kTechProfileHiFi{
+    21, 19,  0, 30, 4.0,
+    0.95, 2, 1,
+    0.20, 3,
+    18, 25, 0.5,
+    "hifi"
+};
+
+inline constexpr TechProfile kTechProfileONT{
+    15, 10, 64, 35, 2.5,
+    0.70, 3, 1,
+    0.05, 5,
+    25, 40, 0.8,
+    "ont"
+};
+
+// Convenience: derive a MinimizerProfile (for the existing assemble
+// backend) from the v0.5 TechProfile.
+inline constexpr MinimizerProfile minimizer_view(const TechProfile& t) noexcept {
+    return MinimizerProfile{
+        t.minimizer_k, t.minimizer_w, t.bucket_cap, 0, t.name
+    };
+}
+
+
 
 // Minimizer hit — one minimizer from one read.
 //
