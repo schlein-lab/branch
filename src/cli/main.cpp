@@ -20,6 +20,8 @@ namespace branch::cli {
 int run_analyze(int argc, char** argv);
 int run_assemble(int argc, char** argv);
 int run_project(int argc, char** argv);
+int run_wg(int argc, char** argv);
+int run_wg_extract(int argc, char** argv);
 
 }  // namespace branch::cli
 
@@ -65,6 +67,12 @@ int dispatch(int argc, char** argv) {
     }
     if (sub == "project") {
         return branch::cli::run_project(argc - 1, argv + 1);
+    }
+    if (sub == "wg") {
+        return branch::cli::run_wg(argc - 1, argv + 1);
+    }
+    if (sub == "extract") {
+        return branch::cli::run_wg_extract(argc - 1, argv + 1);
     }
     std::cerr << "Unknown subcommand: " << sub << "\n\n";
     print_usage(std::cerr);
