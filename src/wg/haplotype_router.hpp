@@ -43,6 +43,15 @@ public:
     void find_het_pairs(double low_frac = 0.30, double high_frac = 0.70,
                         double sum_frac_lo = 0.70, double sum_frac_hi = 1.40);
 
+    /// Populate the het-pair table directly from a list of pre-computed
+    /// (kmer_a, kmer_b) tuples — used by the Phase 1.1 GPU launcher to
+    /// install the GPU-built het table without re-running the CPU loop.
+    /// Each input tuple becomes two `het_` entries (one per side, with
+    /// allele label 0 = lex-smaller bits).
+    void install_het_pairs_from_pairs(
+        const std::vector<std::uint64_t>& a,
+        const std::vector<std::uint64_t>& b);
+
     /// Anchor pass: scan a sample of reads, pick the one with the highest
     /// het-pair hit count, and lock its observed allele pattern as hap1.
     /// Empty `reads` is a no-op (route_read will then return Ambig for

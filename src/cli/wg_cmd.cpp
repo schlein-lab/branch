@@ -213,7 +213,39 @@ int run_wg(int argc, char** argv) {
     std::cerr << "[wg] Phase 1.1: haplotype routing\n";
     int route_cov = khr.detected_coverage > 0 ? khr.detected_coverage : expected_cov;
     branch::wg::HaplotypeRouter router(profile, p0_path, route_cov);
-    router.find_het_pairs();
+    bool use_gpu_p11 = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
+    bool p11_done = false;
+    if (use_gpu_p11) {
+        // Build sorted (key, count) arrays from the Phase 0 dump for the
+        // GPU het-pair launcher; binary-searches partner kmers in-kernel.
+        std::unordered_map<std::uint64_t, std::uint32_t> counter_map;
+        branch::wg::load_kmer_counter_dump(p0_path, counter_map);
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> pairs(
+            counter_map.begin(), counter_map.end());
+        std::sort(pairs.begin(), pairs.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<std::uint64_t> p11_keys;
+        std::vector<std::uint32_t> p11_cnts;
+        p11_keys.reserve(pairs.size());
+        p11_cnts.reserve(pairs.size());
+        for (const auto& kv : pairs) {
+            p11_keys.push_back(kv.first);
+            p11_cnts.push_back(kv.second);
+        }
+        std::vector<std::uint64_t> ha, hb;
+        bool ok = branch::gpu::wg_kernels::launch_phase11_het_pairs(
+            p11_keys, p11_cnts, profile.minimizer_k, route_cov,
+            0.30, 0.70, 0.70, 1.40, ha, hb);
+        if (ok) {
+            router.install_het_pairs_from_pairs(ha, hb);
+            std::cerr << "[wg]   phase1.1 on GPU: het_pairs=" << ha.size() << "\n";
+            p11_done = true;
+        }
+    }
+    if (!p11_done) {
+        router.find_het_pairs();
+        std::cerr << "[wg]   phase1.1 on CPU: het_pairs=" << router.n_het_pairs() << "\n";
+    }
     router.set_anchor_from_reads(reads);
     std::cerr << "[wg]   het_pairs=" << router.n_het_pairs()
               << " anchor=" << (router.has_anchor() ? "ok" : "none") << "\n";

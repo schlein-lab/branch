@@ -1690,4 +1690,193 @@ bool launch_phase0_count(
     return true;
 }
 
+// ===========================================================================
+// Phase 1.1 — het-pair detection kernel
+// ===========================================================================
+//
+// Per-thread = one entry in the sorted (canonical_kmer_bits, count) table.
+// For each entry whose count is in the het-frequency window, the thread:
+//   1. enumerates the 3*k 1-bp-substitution variants
+//   2. binary-searches each variant's canonical form in the sorted keys
+//   3. emits a het-pair candidate (bits_a, bits_b) if the partner's count
+//      is also in window AND the combined count is in [sum_lo, sum_hi]
+//   4. records only one pair per source key (the first valid partner)
+//
+// The output is a candidate list with potential duplicates (each pair
+// emitted from both sides) — the host post-process dedupes, sorts, and
+// assigns deterministic pair_ids before populating HaplotypeRouter::het_.
+//
+// Memory profile (whole-genome ONT, ~3 G recurrent kmers):
+//   d_keys + d_cnts: 12 GB sorted parallel arrays
+//   d_out_a / d_out_b: 16 bytes/pair × ~50 M pairs = 800 MB
+//   Total: ~13 GB on H100 80 GB.
+
+namespace {
+
+__device__ __forceinline__ std::int64_t d_binary_search(
+    const std::uint64_t* __restrict__ d_keys,
+    std::uint64_t n,
+    std::uint64_t target) {
+    std::uint64_t lo = 0, hi = n;
+    while (lo < hi) {
+        std::uint64_t mid = lo + ((hi - lo) >> 1);
+        std::uint64_t v = d_keys[mid];
+        if (v == target) return static_cast<std::int64_t>(mid);
+        if (v < target) lo = mid + 1;
+        else            hi = mid;
+    }
+    return -1;
+}
+
+__global__ void k_phase11_het_pairs(
+    const std::uint64_t* __restrict__ d_keys,
+    const std::uint32_t* __restrict__ d_cnts,
+    std::uint64_t        n_keys,
+    int                  k_bp,
+    std::uint32_t        lo, std::uint32_t hi,
+    std::uint32_t        sum_lo, std::uint32_t sum_hi,
+    std::uint64_t*       __restrict__ d_out_a,
+    std::uint64_t*       __restrict__ d_out_b,
+    std::uint32_t*       __restrict__ d_out_n,
+    std::uint64_t        out_cap) {
+    std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n_keys) return;
+    std::uint32_t count_a = d_cnts[i];
+    if (count_a < lo || count_a > hi) return;
+    std::uint64_t bits_a = d_keys[i];
+
+    for (int pos = 0; pos < k_bp; ++pos) {
+        std::uint64_t old_base = (bits_a >> (2 * pos)) & 3ULL;
+        std::uint64_t cleared  = bits_a & ~(3ULL << (2 * pos));
+        for (int alt = 0; alt < 4; ++alt) {
+            if (alt == static_cast<int>(old_base)) continue;
+            std::uint64_t fwd_bits = cleared | (static_cast<std::uint64_t>(alt) << (2 * pos));
+            std::uint64_t alt_canon = d_canon(fwd_bits, k_bp);
+            if (alt_canon == bits_a) continue;
+
+            std::int64_t j = d_binary_search(d_keys, n_keys, alt_canon);
+            if (j < 0) continue;
+            std::uint32_t count_b = d_cnts[j];
+            if (count_b < lo || count_b > hi) continue;
+            std::uint32_t sum = count_a + count_b;
+            if (sum < sum_lo || sum > sum_hi) continue;
+
+            // Emit only the canonical-ordered (smaller, larger) tuple to
+            // avoid the same pair appearing twice.
+            std::uint64_t a = bits_a < alt_canon ? bits_a   : alt_canon;
+            std::uint64_t b = bits_a < alt_canon ? alt_canon : bits_a;
+            // Symmetric: a thread for `b` would also emit (a, b). Dedup on host.
+            std::uint32_t slot = atomicAdd(d_out_n, 1u);
+            if (slot < out_cap) {
+                d_out_a[slot] = a;
+                d_out_b[slot] = b;
+            }
+            return;  // one pair per source key
+        }
+    }
+}
+
+}  // namespace
+
+bool launch_phase11_het_pairs(
+    const std::vector<std::uint64_t>& keys_sorted,
+    const std::vector<std::uint32_t>& cnts_sorted,
+    std::size_t k,
+    int expected_coverage,
+    double low_frac,
+    double high_frac,
+    double sum_frac_lo,
+    double sum_frac_hi,
+    std::vector<std::uint64_t>& out_a,
+    std::vector<std::uint64_t>& out_b) noexcept {
+    if (!is_gpu_available()) return false;
+    if (keys_sorted.empty() || keys_sorted.size() != cnts_sorted.size()) return false;
+    if (expected_coverage <= 0) return false;
+
+    const std::uint32_t lo = static_cast<std::uint32_t>(expected_coverage * low_frac);
+    const std::uint32_t hi = static_cast<std::uint32_t>(expected_coverage * high_frac);
+    const std::uint32_t sum_lo = static_cast<std::uint32_t>(expected_coverage * sum_frac_lo);
+    const std::uint32_t sum_hi = static_cast<std::uint32_t>(expected_coverage * sum_frac_hi);
+    if (lo == 0 || hi == 0) return false;
+
+    // Output capacity: 1 candidate per qualifying input key. Bounded by
+    // n_keys, but in practice only ~10 % of keys fall in the het window.
+    std::uint64_t out_cap = std::max<std::uint64_t>(keys_sorted.size() / 4, 1024ULL);
+    out_a.assign(out_cap, 0);
+    out_b.assign(out_cap, 0);
+
+    std::uint64_t* d_keys = nullptr;
+    std::uint32_t* d_cnts = nullptr;
+    std::uint64_t* d_a = nullptr;
+    std::uint64_t* d_b = nullptr;
+    std::uint32_t* d_n = nullptr;
+
+    auto cleanup = [&]() {
+        for (void* p : {(void*)d_keys, (void*)d_cnts, (void*)d_a, (void*)d_b, (void*)d_n}) {
+            if (p) cudaFree(p);
+        }
+    };
+    auto bail = [&](const char* where) {
+        std::fprintf(stderr, "[gpu/wg] launch_phase11 fail %s\n", where);
+        cleanup();
+        return false;
+    };
+
+    if (cudaMalloc(&d_keys, keys_sorted.size() * sizeof(std::uint64_t)) != cudaSuccess) return bail("keys");
+    if (cudaMalloc(&d_cnts, cnts_sorted.size() * sizeof(std::uint32_t)) != cudaSuccess) return bail("cnts");
+    if (cudaMalloc(&d_a, out_cap * sizeof(std::uint64_t)) != cudaSuccess) return bail("a");
+    if (cudaMalloc(&d_b, out_cap * sizeof(std::uint64_t)) != cudaSuccess) return bail("b");
+    if (cudaMalloc(&d_n, sizeof(std::uint32_t)) != cudaSuccess) return bail("n");
+    cudaMemset(d_n, 0, sizeof(std::uint32_t));
+    if (cudaMemcpy(d_keys, keys_sorted.data(), keys_sorted.size() * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("keys HtoD");
+    if (cudaMemcpy(d_cnts, cnts_sorted.data(), cnts_sorted.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("cnts HtoD");
+
+    int block = 256;
+    int grid = static_cast<int>((keys_sorted.size() + block - 1) / block);
+    k_phase11_het_pairs<<<grid, block>>>(
+        d_keys, d_cnts, keys_sorted.size(),
+        static_cast<int>(k), lo, hi, sum_lo, sum_hi,
+        d_a, d_b, d_n, out_cap);
+    if (cudaGetLastError() != cudaSuccess) return bail("kernel launch");
+    if (cudaDeviceSynchronize() != cudaSuccess) return bail("kernel sync");
+
+    std::uint32_t n_emitted = 0;
+    cudaMemcpy(&n_emitted, d_n, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+    if (n_emitted > out_cap) {
+        std::fprintf(stderr, "[gpu/wg] phase11 emitted %u > cap %llu — re-running with bigger cap\n",
+                     n_emitted,
+                     static_cast<unsigned long long>(out_cap));
+        cleanup();
+        // Retry with bigger cap.
+        out_a.clear(); out_b.clear();
+        out_cap = static_cast<std::uint64_t>(n_emitted) + 1024;
+        return launch_phase11_het_pairs(keys_sorted, cnts_sorted, k,
+            expected_coverage, low_frac, high_frac, sum_frac_lo, sum_frac_hi,
+            out_a, out_b);
+    }
+    out_a.resize(n_emitted);
+    out_b.resize(n_emitted);
+    if (n_emitted > 0) {
+        if (cudaMemcpy(out_a.data(), d_a, n_emitted * sizeof(std::uint64_t), cudaMemcpyDeviceToHost) != cudaSuccess) return bail("a DtoH");
+        if (cudaMemcpy(out_b.data(), d_b, n_emitted * sizeof(std::uint64_t), cudaMemcpyDeviceToHost) != cudaSuccess) return bail("b DtoH");
+    }
+    cleanup();
+
+    // Dedupe (pair appears twice — once from each direction).
+    if (n_emitted > 0) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+        pairs.reserve(n_emitted);
+        for (std::uint32_t i = 0; i < n_emitted; ++i) pairs.emplace_back(out_a[i], out_b[i]);
+        std::sort(pairs.begin(), pairs.end());
+        pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+        out_a.resize(pairs.size());
+        out_b.resize(pairs.size());
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+            out_a[i] = pairs[i].first;
+            out_b[i] = pairs[i].second;
+        }
+    }
+    return true;
+}
+
 }  // namespace branch::gpu::wg_kernels

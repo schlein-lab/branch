@@ -42,4 +42,11 @@ bool launch_phase0_count(
     std::vector<std::uint64_t>&,
     std::vector<std::uint32_t>&) noexcept { return false; }
 
+bool launch_phase11_het_pairs(
+    const std::vector<std::uint64_t>&,
+    const std::vector<std::uint32_t>&,
+    std::size_t, int, double, double, double, double,
+    std::vector<std::uint64_t>&,
+    std::vector<std::uint64_t>&) noexcept { return false; }
+
 }  // namespace branch::gpu::wg_kernels

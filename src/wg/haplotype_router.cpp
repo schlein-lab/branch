@@ -138,6 +138,26 @@ void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac,
     n_het_pairs_ = pair_id;
 }
 
+void HaplotypeRouter::install_het_pairs_from_pairs(
+    const std::vector<std::uint64_t>& a,
+    const std::vector<std::uint64_t>& b) {
+    het_.clear();
+    n_het_pairs_ = 0;
+    if (a.size() != b.size()) return;
+    het_.reserve(a.size() * 2);
+    for (std::uint32_t i = 0; i < a.size(); ++i) {
+        std::uint64_t bits_a = a[i];
+        std::uint64_t bits_b = b[i];
+        if (bits_a == bits_b) continue;
+        // Deterministic allele label: lex-smaller = 0.
+        std::uint8_t la = bits_a < bits_b ? 0 : 1;
+        std::uint8_t lb = la ^ 1;
+        het_[bits_a] = HetEntry{i, la};
+        het_[bits_b] = HetEntry{i, lb};
+    }
+    n_het_pairs_ = static_cast<std::size_t>(a.size());
+}
+
 void HaplotypeRouter::set_anchor_from_reads(
     const std::vector<std::pair<std::string, std::string>>& reads,
     std::size_t max_scan) {

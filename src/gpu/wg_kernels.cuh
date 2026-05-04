@@ -101,4 +101,26 @@ namespace branch::gpu::wg_kernels {
     std::vector<std::uint64_t>& /*out_keys*/,
     std::vector<std::uint32_t>& /*out_counts*/) noexcept;
 
+/// Phase 1.1: GPU-accelerated het-pair detection.
+///   keys_sorted, cnts_sorted: ascending-sorted parallel arrays of
+///     canonical_kmer_bits + count, identical to the Phase 0 GPU
+///     output (or sorted Phase 0 CPU output).
+///   k: kmer length.
+///   expected_coverage, low_frac, high_frac, sum_frac_lo, sum_frac_hi:
+///     same semantics as HaplotypeRouter::find_het_pairs.
+///   out_a / out_b: parallel arrays of canonical-bits forming a
+///     het-pair (a < b lexicographically). Caller should populate the
+///     HaplotypeRouter het_ table from these.
+[[nodiscard]] bool launch_phase11_het_pairs(
+    const std::vector<std::uint64_t>& keys_sorted,
+    const std::vector<std::uint32_t>& cnts_sorted,
+    std::size_t k,
+    int expected_coverage,
+    double low_frac,
+    double high_frac,
+    double sum_frac_lo,
+    double sum_frac_hi,
+    std::vector<std::uint64_t>& out_a,
+    std::vector<std::uint64_t>& out_b) noexcept;
+
 }  // namespace branch::gpu::wg_kernels
