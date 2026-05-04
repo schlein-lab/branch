@@ -49,4 +49,10 @@ bool launch_phase11_het_pairs(
     std::vector<std::uint64_t>&,
     std::vector<std::uint64_t>&) noexcept { return false; }
 
+bool launch_phase2_direct_attach(
+    const std::vector<std::string>&,
+    const std::vector<std::pair<std::string, std::string>>&,
+    std::size_t, double,
+    std::vector<std::int32_t>&) noexcept { return false; }
+
 }  // namespace branch::gpu::wg_kernels

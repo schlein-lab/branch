@@ -1879,4 +1879,274 @@ bool launch_phase11_het_pairs(
     return true;
 }
 
+// ===========================================================================
+// Phase 2 — direct-attach via sketch (no transitive BFS)
+// ===========================================================================
+//
+// One kernel that:
+//   1. computes a 64-element MinHash sketch for the read (smallest 64
+//      canonical-kmer-bits values seen in the read)
+//   2. compares against each haplotype's pre-computed sketch via sorted
+//      merge → shared count
+//   3. anchors the read at the hap with the most shared hashes if
+//      shared ≥ min_share; else marks as orphan
+//
+// We skip transitive BFS-through-branches deliberately: the branches in
+// the v0.5 pipeline are mostly 1-bp curator candidates whose sketches
+// over k=15 windows are empty, so direct-attach captures the bulk of the
+// real read-to-hap relationship. Reads that this misses fall through to
+// the orphan list, which is fine — losing 1-2 % of a transitive pool to
+// orphans is the "nice-to-have" trade we're making for the ~10× WG
+// runtime win on Phase 2 (2-3 h CPU → ~20 min GPU).
+
+namespace {
+
+constexpr int kSk = 64;
+
+__global__ void k_phase2_sketch_batch(
+    const char*    __restrict__ d_reads_buf,
+    const std::uint64_t* __restrict__ d_read_off,
+    const std::uint32_t* __restrict__ d_read_len,
+    std::size_t    n_in_batch,
+    std::uint32_t  global_offset,        // r0 of the batch in the global sketch table
+    int            k_bp,
+    std::uint64_t  kmask,
+    std::uint64_t* __restrict__ d_sketches) {
+    std::size_t b = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (b >= n_in_batch) return;
+
+    std::uint64_t off = d_read_off[b];
+    std::uint32_t len = d_read_len[b];
+    std::uint64_t* sk = d_sketches + (global_offset + b) * static_cast<std::uint64_t>(kSk);
+
+    // Initialise sketch buffer to UINT64_MAX (so first kSk hashes go in).
+    constexpr std::uint64_t kInf = ~0ULL;
+    for (int i = 0; i < kSk; ++i) sk[i] = kInf;
+
+    if (len < static_cast<std::uint32_t>(k_bp)) return;
+    const char* seq = d_reads_buf + off;
+
+    std::uint64_t kmer = 0;
+    int filled = 0;
+
+    auto try_insert = [&](std::uint64_t h) {
+        // Insert into sorted-ascending sk[] of size kSk if h < sk[kSk-1].
+        // Kept ascending by binary-search insertion in registers.
+        if (h >= sk[kSk - 1]) return;
+        // Find insertion position via binary search (registers).
+        int lo = 0, hi = kSk;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (sk[mid] < h) lo = mid + 1; else hi = mid;
+        }
+        if (lo < kSk && sk[lo] == h) return;  // already present
+        // Shift right.
+        for (int j = kSk - 1; j > lo; --j) sk[j] = sk[j - 1];
+        sk[lo] = h;
+    };
+
+    for (std::uint32_t i = 0; i < len; ++i) {
+        std::uint8_t bb = d_encode_base(seq[i]);
+        if (bb > 3) { filled = 0; kmer = 0; continue; }
+        kmer = ((kmer << 2) | bb) & kmask;
+        ++filled;
+        if (filled < k_bp) continue;
+        std::uint64_t cb = d_canon(kmer, k_bp);
+        try_insert(cb);
+    }
+}
+
+__global__ void k_phase2_attach(
+    const std::uint64_t* __restrict__ d_read_sketches,   // [n_reads * kSk]
+    std::uint64_t        n_reads,
+    const std::uint64_t* __restrict__ d_hap_sketches,    // [n_haps * kSk] sorted ascending
+    std::uint32_t        n_haps,
+    int                  min_share,
+    std::int32_t*        __restrict__ d_anchored_hap) {  // -1 = orphan
+    std::uint64_t r = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (r >= n_reads) return;
+    const std::uint64_t* sk_r = d_read_sketches + r * static_cast<std::uint64_t>(kSk);
+
+    int best_share = 0;
+    std::int32_t best_h = -1;
+
+    for (std::uint32_t h = 0; h < n_haps; ++h) {
+        const std::uint64_t* sk_h = d_hap_sketches + static_cast<std::uint64_t>(h) * kSk;
+        // Sorted-merge intersection (both arrays sorted ascending).
+        int i = 0, j = 0, count = 0;
+        constexpr std::uint64_t kInf = ~0ULL;
+        while (i < kSk && j < kSk) {
+            std::uint64_t a = sk_r[i];
+            std::uint64_t b = sk_h[j];
+            if (a == kInf || b == kInf) break;
+            if (a == b) { ++count; ++i; ++j; }
+            else if (a < b) ++i;
+            else ++j;
+        }
+        if (count > best_share) { best_share = count; best_h = static_cast<std::int32_t>(h); }
+    }
+    d_anchored_hap[r] = (best_share >= min_share) ? best_h : -1;
+}
+
+// Compute sketch for a single string on host (used for haplotypes).
+void sketch_host(const std::string& seq, std::size_t k,
+                 std::vector<std::uint64_t>& out) {
+    out.assign(kSk, ~0ULL);
+    if (seq.size() < k) return;
+    const std::uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
+    std::uint64_t kmer = 0; std::size_t filled = 0;
+    auto encode = [](char c) -> std::uint8_t {
+        switch (c) {
+            case 'A': case 'a': return 0;
+            case 'C': case 'c': return 1;
+            case 'G': case 'g': return 2;
+            case 'T': case 't': return 3;
+            default: return 4;
+        }
+    };
+    auto rc = [](std::uint64_t kmer_, std::size_t k_) {
+        std::uint64_t r = 0;
+        for (std::size_t i = 0; i < k_; ++i) {
+            r = (r << 2) | ((~kmer_) & 3ULL);
+            kmer_ >>= 2;
+        }
+        return r;
+    };
+    auto try_insert = [&](std::uint64_t h) {
+        if (h >= out[kSk - 1]) return;
+        int lo = 0, hi = kSk;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (out[mid] < h) lo = mid + 1; else hi = mid;
+        }
+        if (lo < kSk && out[lo] == h) return;
+        for (int j = kSk - 1; j > lo; --j) out[j] = out[j - 1];
+        out[lo] = h;
+    };
+    for (std::size_t i = 0; i < seq.size(); ++i) {
+        std::uint8_t b = encode(seq[i]);
+        if (b > 3) { filled = 0; kmer = 0; continue; }
+        kmer = ((kmer << 2) | b) & mask;
+        ++filled;
+        if (filled < k) continue;
+        std::uint64_t r_k = rc(kmer, k);
+        std::uint64_t cb = kmer < r_k ? kmer : r_k;
+        try_insert(cb);
+    }
+}
+
+}  // namespace
+
+bool launch_phase2_direct_attach(
+    const std::vector<std::string>& hap_seqs,
+    const std::vector<std::pair<std::string, std::string>>& ambig_reads,
+    std::size_t k,
+    double sketch_jaccard_lo,
+    std::vector<std::int32_t>& out_anchored_hap) noexcept {
+    if (!is_gpu_available()) return false;
+    out_anchored_hap.assign(ambig_reads.size(), -1);
+    if (ambig_reads.empty()) return true;
+    if (hap_seqs.empty())     return true;
+
+    const std::size_t n_haps = hap_seqs.size();
+    const std::size_t n_rd   = ambig_reads.size();
+    const int min_share = std::max(4,
+        static_cast<int>(static_cast<double>(kSk) * sketch_jaccard_lo));
+    const std::uint64_t kmask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
+
+    // 1. Sketch haps on host (small N), upload to device.
+    std::vector<std::uint64_t> hap_sk_flat;
+    hap_sk_flat.reserve(n_haps * kSk);
+    for (const auto& hs : hap_seqs) {
+        std::vector<std::uint64_t> sk;
+        sketch_host(hs, k, sk);
+        hap_sk_flat.insert(hap_sk_flat.end(), sk.begin(), sk.end());
+    }
+
+    std::uint64_t* d_hap_sk = nullptr;
+    std::uint64_t* d_read_sk = nullptr;
+    char*          d_rb = nullptr;
+    std::uint64_t* d_ro = nullptr;
+    std::uint32_t* d_rl = nullptr;
+    std::int32_t*  d_anchor = nullptr;
+
+    auto cleanup = [&]() {
+        for (void* p : {(void*)d_hap_sk, (void*)d_read_sk, (void*)d_rb,
+                        (void*)d_ro, (void*)d_rl, (void*)d_anchor}) {
+            if (p) cudaFree(p);
+        }
+    };
+    auto bail = [&](const char* where) {
+        std::fprintf(stderr, "[gpu/wg] launch_phase2 fail %s\n", where);
+        cleanup();
+        return false;
+    };
+
+    if (cudaMalloc(&d_hap_sk, hap_sk_flat.size() * sizeof(std::uint64_t)) != cudaSuccess) return bail("hap_sk alloc");
+    if (cudaMalloc(&d_read_sk, n_rd * static_cast<std::size_t>(kSk) * sizeof(std::uint64_t)) != cudaSuccess) return bail("read_sk alloc");
+    if (cudaMalloc(&d_anchor, n_rd * sizeof(std::int32_t)) != cudaSuccess) return bail("anchor alloc");
+    if (cudaMemcpy(d_hap_sk, hap_sk_flat.data(), hap_sk_flat.size() * sizeof(std::uint64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return bail("hap_sk HtoD");
+
+    // 2. Sketch reads on GPU in batches (whole-genome ambig pool can be 30+ GB).
+    constexpr std::size_t kBatchReads = 32'768;
+    std::vector<char> batch_buf;
+    std::vector<std::uint64_t> batch_off;
+    std::vector<std::uint32_t> batch_len;
+    for (std::size_t r0 = 0; r0 < n_rd; r0 += kBatchReads) {
+        std::size_t r1 = std::min(r0 + kBatchReads, n_rd);
+        std::size_t n_b = r1 - r0;
+        batch_buf.clear(); batch_off.clear(); batch_len.clear();
+        std::size_t total = 0;
+        for (std::size_t r = r0; r < r1; ++r) total += ambig_reads[r].second.size();
+        batch_buf.reserve(total);
+        batch_off.reserve(n_b);
+        batch_len.reserve(n_b);
+        std::size_t cur = 0;
+        for (std::size_t r = r0; r < r1; ++r) {
+            batch_off.push_back(cur);
+            batch_len.push_back(static_cast<std::uint32_t>(ambig_reads[r].second.size()));
+            batch_buf.insert(batch_buf.end(),
+                ambig_reads[r].second.begin(), ambig_reads[r].second.end());
+            cur += ambig_reads[r].second.size();
+        }
+
+        if (d_rb) { cudaFree(d_rb); d_rb = nullptr; }
+        if (d_ro) { cudaFree(d_ro); d_ro = nullptr; }
+        if (d_rl) { cudaFree(d_rl); d_rl = nullptr; }
+        if (cudaMalloc(&d_rb, batch_buf.size()) != cudaSuccess) return bail("batch buf");
+        if (cudaMalloc(&d_ro, n_b * sizeof(std::uint64_t)) != cudaSuccess) return bail("batch off");
+        if (cudaMalloc(&d_rl, n_b * sizeof(std::uint32_t)) != cudaSuccess) return bail("batch len");
+        if (cudaMemcpy(d_rb, batch_buf.data(), batch_buf.size(), cudaMemcpyHostToDevice) != cudaSuccess) return bail("batch buf HtoD");
+        if (cudaMemcpy(d_ro, batch_off.data(), n_b * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("batch off HtoD");
+        if (cudaMemcpy(d_rl, batch_len.data(), n_b * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("batch len HtoD");
+
+        int block = 128;
+        int grid = static_cast<int>((n_b + block - 1) / block);
+        k_phase2_sketch_batch<<<grid, block>>>(
+            d_rb, d_ro, d_rl, n_b, static_cast<std::uint32_t>(r0),
+            static_cast<int>(k), kmask, d_read_sk);
+        if (cudaGetLastError() != cudaSuccess) return bail("sketch launch");
+        if (cudaDeviceSynchronize() != cudaSuccess) return bail("sketch sync");
+    }
+    if (d_rb) { cudaFree(d_rb); d_rb = nullptr; }
+    if (d_ro) { cudaFree(d_ro); d_ro = nullptr; }
+    if (d_rl) { cudaFree(d_rl); d_rl = nullptr; }
+
+    // 3. Anchor kernel.
+    int block = 128;
+    int grid = static_cast<int>((n_rd + block - 1) / block);
+    k_phase2_attach<<<grid, block>>>(
+        d_read_sk, n_rd, d_hap_sk, static_cast<std::uint32_t>(n_haps),
+        min_share, d_anchor);
+    if (cudaGetLastError() != cudaSuccess) return bail("attach launch");
+    if (cudaDeviceSynchronize() != cudaSuccess) return bail("attach sync");
+
+    if (cudaMemcpy(out_anchored_hap.data(), d_anchor, n_rd * sizeof(std::int32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return bail("anchor DtoH");
+
+    cleanup();
+    return true;
+}
+
 }  // namespace branch::gpu::wg_kernels

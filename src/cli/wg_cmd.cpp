@@ -337,15 +337,64 @@ int run_wg(int argc, char** argv) {
     out.phase_log.emplace_back("1",
         std::chrono::duration<double>(clock::now() - t0).count());
 
-    // ---------- Phase 2: branch attachment ----------
+    // ---------- Phase 2: branch attachment (GPU-first, CPU fallback) ----------
     t0 = clock::now();
     std::cerr << "[wg] Phase 2: branch attachment\n";
+    bool use_gpu_p2 = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
+    bool p2_done = false;
     branch::wg::BranchAttacher att(profile);
     std::vector<branch::wg::OrphanRead> orphans;
-    att.attach(out.haplotype_seqs, all_candidates, ambig_reads,
-               out.branches, orphans);
-    std::cerr << "[wg]   attached=" << out.branches.size()
-              << " orphans=" << orphans.size() << "\n";
+
+    if (use_gpu_p2) {
+        // GPU direct-attach: per ambig read, sketch + best-shared-with-hap.
+        // Ambig reads with shared >= jaccard_lo*kSketchSize get attached to
+        // the best hap at depth=1; rest go to the orphan list. Curator's
+        // direct branches are kept verbatim.
+        std::vector<std::int32_t> anchored_hap;
+        bool ok = branch::gpu::wg_kernels::launch_phase2_direct_attach(
+            out.haplotype_seqs, ambig_reads, profile.minimizer_k,
+            profile.sketch_jaccard_lo, anchored_hap);
+        if (ok) {
+            // Build out.branches: direct curator candidates + anchored ambigs.
+            std::uint32_t bidx = 0;
+            for (const auto& c : all_candidates) {
+                branch::wg::AttachedBranch b{};
+                std::ostringstream name; name << "branch_" << ++bidx;
+                b.branch_name = name.str();
+                b.seq = c.alt_seq;
+                b.anchor_hap = c.hap_idx;
+                b.anchor_pos = c.pos_in_hap;
+                b.transitive_depth = 0;
+                b.confidence = c.q_weighted_evidence;
+                out.branches.push_back(std::move(b));
+            }
+            for (std::size_t r = 0; r < ambig_reads.size(); ++r) {
+                if (anchored_hap[r] >= 0) {
+                    branch::wg::AttachedBranch b{};
+                    std::ostringstream name; name << "branch_" << ++bidx;
+                    b.branch_name = name.str();
+                    b.seq = ambig_reads[r].second;
+                    b.anchor_hap = static_cast<std::uint32_t>(anchored_hap[r]);
+                    b.anchor_pos = 0;
+                    b.transitive_depth = 1;
+                    b.confidence = 0.5;
+                    out.branches.push_back(std::move(b));
+                } else {
+                    orphans.push_back(branch::wg::OrphanRead{
+                        ambig_reads[r].first, ambig_reads[r].second});
+                }
+            }
+            std::cerr << "[wg]   phase2 on GPU: attached=" << out.branches.size()
+                      << " orphans=" << orphans.size() << "\n";
+            p2_done = true;
+        }
+    }
+    if (!p2_done) {
+        att.attach(out.haplotype_seqs, all_candidates, ambig_reads,
+                   out.branches, orphans);
+        std::cerr << "[wg]   phase2 on CPU: attached=" << out.branches.size()
+                  << " orphans=" << orphans.size() << "\n";
+    }
     out.phase_log.emplace_back("2",
         std::chrono::duration<double>(clock::now() - t0).count());
 

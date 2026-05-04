@@ -101,6 +101,23 @@ namespace branch::gpu::wg_kernels {
     std::vector<std::uint64_t>& /*out_keys*/,
     std::vector<std::uint32_t>& /*out_counts*/) noexcept;
 
+/// Phase 2: GPU-accelerated branch-attachment via direct hap-sketch
+/// comparison. Sketches all ambig reads on GPU, compares each against
+/// per-haplotype sketches, anchors at depth=1 when shared sketch hashes
+/// ≥ threshold; everything else goes to the orphan output.
+///   hap_seqs:        haplotype sequences (host)
+///   ambig_reads:     (id, seq) pairs for ambig reads
+///   k:               kmer length for sketching
+///   sketch_jaccard_lo: threshold (frac of kSketchSize=64)
+///   out_anchored:    parallel arrays per ambig read
+///                    -1 = orphan, otherwise = hap_idx
+[[nodiscard]] bool launch_phase2_direct_attach(
+    const std::vector<std::string>& hap_seqs,
+    const std::vector<std::pair<std::string, std::string>>& ambig_reads,
+    std::size_t k,
+    double sketch_jaccard_lo,
+    std::vector<std::int32_t>& out_anchored_hap) noexcept;
+
 /// Phase 1.1: GPU-accelerated het-pair detection.
 ///   keys_sorted, cnts_sorted: ascending-sorted parallel arrays of
 ///     canonical_kmer_bits + count, identical to the Phase 0 GPU
