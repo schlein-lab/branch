@@ -744,26 +744,14 @@ bool launch_stage2(
     build_seed_table_host(fwds, kSeedBp, fwd_kk, fwd_first, fwd_count, fwd_hits_flat, 0);
     build_seed_table_host(revs, kSeedBp, rev_kk, rev_first, rev_count, rev_hits_flat, 1);
 
-    // Flatten reads.
-    std::vector<char>   reads_buf;
-    std::vector<std::uint64_t> reads_off(n_rd);
-    std::vector<std::uint32_t> reads_len(n_rd);
-    {
-        std::size_t cur = 0;
-        for (std::size_t i = 0; i < n_rd; ++i) {
-            reads_off[i] = cur;
-            reads_len[i] = static_cast<std::uint32_t>(reads[i].second.size());
-            reads_buf.insert(reads_buf.end(),
-                reads[i].second.begin(), reads[i].second.end());
-            cur += reads[i].second.size();
-        }
-    }
-
-    // Device allocations
+    // Streaming layout: primer-seed tables + flat primer buffers stay
+    // device-resident; reads are uploaded in batches so total reads_bp can
+    // exceed HBM. Per-batch peak ~ 32 768 reads (~512 MB at 16 kbp/read).
+    // Required for whole-genome ONT (~95 GB reads > 80 GB H100).
     std::uint32_t* d_amp_hits = nullptr;
-    char*          d_reads_buf = nullptr;
-    std::uint64_t* d_reads_off = nullptr;
-    std::uint32_t* d_reads_len = nullptr;
+    char*          d_reads_buf = nullptr;     // batch-scoped
+    std::uint64_t* d_reads_off = nullptr;     // batch-scoped
+    std::uint32_t* d_reads_len = nullptr;     // batch-scoped
     char*          d_fwd_buf = nullptr;
     std::uint32_t* d_fwd_off = nullptr;
     std::uint16_t* d_fwd_len = nullptr;
@@ -797,9 +785,6 @@ bool launch_stage2(
 
     if (cudaMalloc(&d_amp_hits, n_amp * sizeof(std::uint32_t)) != cudaSuccess) return bail("amp_hits");
     cudaMemset(d_amp_hits, 0, n_amp * sizeof(std::uint32_t));
-    if (cudaMalloc(&d_reads_buf, reads_buf.size()) != cudaSuccess) return bail("reads_buf");
-    if (cudaMalloc(&d_reads_off, n_rd * sizeof(std::uint64_t)) != cudaSuccess) return bail("reads_off");
-    if (cudaMalloc(&d_reads_len, n_rd * sizeof(std::uint32_t)) != cudaSuccess) return bail("reads_len");
     if (cudaMalloc(&d_fwd_buf, fwd_buf.size()) != cudaSuccess) return bail("fwd_buf");
     if (cudaMalloc(&d_fwd_off, n_amp * sizeof(std::uint32_t)) != cudaSuccess) return bail("fwd_off");
     if (cudaMalloc(&d_fwd_len, n_amp * sizeof(std::uint16_t)) != cudaSuccess) return bail("fwd_len");
@@ -823,9 +808,6 @@ bool launch_stage2(
         }
         return true;
     };
-    if (!cpy(d_reads_buf, reads_buf.data(), reads_buf.size(), "reads_buf")) { cleanup(); return false; }
-    if (!cpy(d_reads_off, reads_off.data(), reads_off.size() * sizeof(std::uint64_t), "reads_off")) { cleanup(); return false; }
-    if (!cpy(d_reads_len, reads_len.data(), reads_len.size() * sizeof(std::uint32_t), "reads_len")) { cleanup(); return false; }
     if (!cpy(d_fwd_buf, fwd_buf.data(), fwd_buf.size(), "fwd_buf")) { cleanup(); return false; }
     if (!cpy(d_fwd_off, fwd_off.data(), fwd_off.size() * sizeof(std::uint32_t), "fwd_off")) { cleanup(); return false; }
     if (!cpy(d_fwd_len, fwd_len.data(), fwd_len.size() * sizeof(std::uint16_t), "fwd_len")) { cleanup(); return false; }
@@ -850,17 +832,52 @@ bool launch_stage2(
     rev_t.n_slots = static_cast<std::uint32_t>(rev_kk.size());
     rev_t.mask = rev_kk.empty() ? 0 : (rev_kk.size() - 1);
 
-    int block = 128;
-    int grid = static_cast<int>((n_rd + block - 1) / block);
-    k_stage2_count_reads<<<grid, block>>>(
-        d_reads_buf, d_reads_off, d_reads_len, n_rd,
-        fwd_t, rev_t, d_fwd_hits, d_rev_hits,
-        d_fwd_buf, d_fwd_off, d_fwd_len,
-        d_rev_buf, d_rev_off, d_rev_len,
-        max_mm, amp_min, amp_max,
-        d_amp_hits);
-    if (cudaGetLastError() != cudaSuccess) return bail("k_stage2_count launch");
-    if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_stage2_count sync");
+    // Batched read upload + per-batch kernel launch.
+    constexpr std::size_t kBatchReads = 32'768;
+    std::vector<char> batch_buf;
+    std::vector<std::uint64_t> batch_off;
+    std::vector<std::uint32_t> batch_len;
+    for (std::size_t r0 = 0; r0 < n_rd; r0 += kBatchReads) {
+        std::size_t r1 = std::min(r0 + kBatchReads, n_rd);
+        std::size_t n_b = r1 - r0;
+
+        batch_buf.clear(); batch_off.clear(); batch_len.clear();
+        std::size_t total = 0;
+        for (std::size_t r = r0; r < r1; ++r) total += reads[r].second.size();
+        batch_buf.reserve(total);
+        batch_off.reserve(n_b);
+        batch_len.reserve(n_b);
+        std::size_t cur = 0;
+        for (std::size_t r = r0; r < r1; ++r) {
+            batch_off.push_back(cur);
+            batch_len.push_back(static_cast<std::uint32_t>(reads[r].second.size()));
+            batch_buf.insert(batch_buf.end(),
+                reads[r].second.begin(), reads[r].second.end());
+            cur += reads[r].second.size();
+        }
+
+        if (d_reads_buf) { cudaFree(d_reads_buf); d_reads_buf = nullptr; }
+        if (d_reads_off) { cudaFree(d_reads_off); d_reads_off = nullptr; }
+        if (d_reads_len) { cudaFree(d_reads_len); d_reads_len = nullptr; }
+        if (cudaMalloc(&d_reads_buf, batch_buf.size()) != cudaSuccess) return bail("batch reads_buf");
+        if (cudaMalloc(&d_reads_off, n_b * sizeof(std::uint64_t)) != cudaSuccess) return bail("batch reads_off");
+        if (cudaMalloc(&d_reads_len, n_b * sizeof(std::uint32_t)) != cudaSuccess) return bail("batch reads_len");
+        if (!cpy(d_reads_buf, batch_buf.data(), batch_buf.size(), "batch reads_buf")) { cleanup(); return false; }
+        if (!cpy(d_reads_off, batch_off.data(), n_b * sizeof(std::uint64_t), "batch reads_off")) { cleanup(); return false; }
+        if (!cpy(d_reads_len, batch_len.data(), n_b * sizeof(std::uint32_t), "batch reads_len")) { cleanup(); return false; }
+
+        int block = 128;
+        int grid = static_cast<int>((n_b + block - 1) / block);
+        k_stage2_count_reads<<<grid, block>>>(
+            d_reads_buf, d_reads_off, d_reads_len, n_b,
+            fwd_t, rev_t, d_fwd_hits, d_rev_hits,
+            d_fwd_buf, d_fwd_off, d_fwd_len,
+            d_rev_buf, d_rev_off, d_rev_len,
+            max_mm, amp_min, amp_max,
+            d_amp_hits);
+        if (cudaGetLastError() != cudaSuccess) return bail("k_stage2_count launch");
+        if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_stage2_count sync");
+    }
 
     std::vector<std::uint32_t> host_hits(n_amp);
     if (cudaMemcpy(host_hits.data(), d_amp_hits, n_amp * sizeof(std::uint32_t),
@@ -1169,26 +1186,15 @@ bool launch_phase15_curation(
         }
     }
 
-    // Flatten reads.
-    std::vector<char> reads_buf;
-    std::vector<std::uint64_t> reads_off(n_rd);
-    std::vector<std::uint32_t> reads_len(n_rd);
-    {
-        std::size_t cur = 0;
-        for (std::size_t i = 0; i < n_rd; ++i) {
-            reads_off[i] = cur;
-            reads_len[i] = static_cast<std::uint32_t>(reads[i].second.size());
-            reads_buf.insert(reads_buf.end(),
-                reads[i].second.begin(), reads[i].second.end());
-            cur += reads[i].second.size();
-        }
-    }
-
-    // Device allocations.
+    // Streaming layout: hap_seq + counts + hap_minz_idx stay device-resident.
+    // Reads are uploaded in batches so total reads_bp can exceed HBM (whole-
+    // genome ONT has ~95 GB reads, > 80 GB H100). Per-batch peak read upload
+    // is bounded at ~32 768 reads (~512 MB at 16 kbp/read avg) — this leaves
+    // ample headroom for the 3 Gbp WG hap_seq + 48 GB counts on H100 80 GB.
     std::uint8_t*  d_hap = nullptr;
     std::uint64_t* d_hkeys = nullptr;
     std::uint32_t* d_hpos = nullptr;
-    char*          d_rb = nullptr;
+    char*          d_rb = nullptr;       // batch-scoped, realloc'd per batch
     std::uint64_t* d_ro = nullptr;
     std::uint32_t* d_rl = nullptr;
     PileupAtomic*  d_cnt = nullptr;
@@ -1208,31 +1214,60 @@ bool launch_phase15_curation(
     if (cudaMalloc(&d_hap, hap_len) != cudaSuccess) return bail("hap_seq alloc");
     if (cudaMalloc(&d_hkeys, hmin_keys.size() * sizeof(std::uint64_t)) != cudaSuccess) return bail("hkeys alloc");
     if (cudaMalloc(&d_hpos, hmin_pos.size() * sizeof(std::uint32_t)) != cudaSuccess) return bail("hpos alloc");
-    if (cudaMalloc(&d_rb, reads_buf.size()) != cudaSuccess) return bail("reads_buf alloc");
-    if (cudaMalloc(&d_ro, n_rd * sizeof(std::uint64_t)) != cudaSuccess) return bail("reads_off alloc");
-    if (cudaMalloc(&d_rl, n_rd * sizeof(std::uint32_t)) != cudaSuccess) return bail("reads_len alloc");
     if (cudaMalloc(&d_cnt, hap_len * sizeof(PileupAtomic)) != cudaSuccess) return bail("counts alloc");
     cudaMemset(d_cnt, 0, hap_len * sizeof(PileupAtomic));
 
     if (cudaMemcpy(d_hap, hap_bytes.data(), hap_len, cudaMemcpyHostToDevice) != cudaSuccess) return bail("hap HtoD");
     if (cudaMemcpy(d_hkeys, hmin_keys.data(), hmin_keys.size() * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("hkeys HtoD");
     if (cudaMemcpy(d_hpos, hmin_pos.data(), hmin_pos.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("hpos HtoD");
-    if (cudaMemcpy(d_rb, reads_buf.data(), reads_buf.size(), cudaMemcpyHostToDevice) != cudaSuccess) return bail("reads_buf HtoD");
-    if (cudaMemcpy(d_ro, reads_off.data(), n_rd * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("reads_off HtoD");
-    if (cudaMemcpy(d_rl, reads_len.data(), n_rd * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("reads_len HtoD");
 
-    int block = 128;
-    int grid = static_cast<int>((n_rd + block - 1) / block);
-    k_phase15_pileup<<<grid, block>>>(
-        d_hap, hap_len,
-        d_hkeys, d_hpos,
-        static_cast<std::uint32_t>(hmin_keys.size()),
-        static_cast<std::uint64_t>(hmin_keys.size() - 1),
-        d_rb, d_ro, d_rl, n_rd,
-        static_cast<int>(k), static_cast<int>(w),
-        d_cnt);
-    if (cudaGetLastError() != cudaSuccess) return bail("k_phase15 launch");
-    if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_phase15 sync");
+    // Batched read upload.
+    constexpr std::size_t kBatchReads = 32'768;
+    std::vector<char> batch_buf;
+    std::vector<std::uint64_t> batch_off;
+    std::vector<std::uint32_t> batch_len;
+    for (std::size_t r0 = 0; r0 < n_rd; r0 += kBatchReads) {
+        std::size_t r1 = std::min(r0 + kBatchReads, n_rd);
+        std::size_t n_b = r1 - r0;
+
+        batch_buf.clear(); batch_off.clear(); batch_len.clear();
+        std::size_t total = 0;
+        for (std::size_t r = r0; r < r1; ++r) total += reads[r].second.size();
+        batch_buf.reserve(total);
+        batch_off.reserve(n_b);
+        batch_len.reserve(n_b);
+        std::size_t cur = 0;
+        for (std::size_t r = r0; r < r1; ++r) {
+            batch_off.push_back(cur);
+            batch_len.push_back(static_cast<std::uint32_t>(reads[r].second.size()));
+            batch_buf.insert(batch_buf.end(),
+                reads[r].second.begin(), reads[r].second.end());
+            cur += reads[r].second.size();
+        }
+
+        if (d_rb) { cudaFree(d_rb); d_rb = nullptr; }
+        if (d_ro) { cudaFree(d_ro); d_ro = nullptr; }
+        if (d_rl) { cudaFree(d_rl); d_rl = nullptr; }
+        if (cudaMalloc(&d_rb, batch_buf.size()) != cudaSuccess) return bail("batch reads_buf alloc");
+        if (cudaMalloc(&d_ro, n_b * sizeof(std::uint64_t)) != cudaSuccess) return bail("batch reads_off alloc");
+        if (cudaMalloc(&d_rl, n_b * sizeof(std::uint32_t)) != cudaSuccess) return bail("batch reads_len alloc");
+        if (cudaMemcpy(d_rb, batch_buf.data(), batch_buf.size(), cudaMemcpyHostToDevice) != cudaSuccess) return bail("batch reads_buf HtoD");
+        if (cudaMemcpy(d_ro, batch_off.data(), n_b * sizeof(std::uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("batch reads_off HtoD");
+        if (cudaMemcpy(d_rl, batch_len.data(), n_b * sizeof(std::uint32_t), cudaMemcpyHostToDevice) != cudaSuccess) return bail("batch reads_len HtoD");
+
+        int block = 128;
+        int grid = static_cast<int>((n_b + block - 1) / block);
+        k_phase15_pileup<<<grid, block>>>(
+            d_hap, hap_len,
+            d_hkeys, d_hpos,
+            static_cast<std::uint32_t>(hmin_keys.size()),
+            static_cast<std::uint64_t>(hmin_keys.size() - 1),
+            d_rb, d_ro, d_rl, n_b,
+            static_cast<int>(k), static_cast<int>(w),
+            d_cnt);
+        if (cudaGetLastError() != cudaSuccess) return bail("k_phase15 launch");
+        if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_phase15 sync");
+    }
 
     // Copy back the per-position counts.
     std::vector<PileupAtomic> host_counts(hap_len);
