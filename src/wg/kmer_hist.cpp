@@ -230,6 +230,108 @@ void KmerHistBuilder::write_to(const std::string& path,
     f.close();
 }
 
+KmerHistResult finalize_from_keys_counts(
+    int expected_coverage,
+    double bimodality_z_threshold,
+    const std::vector<std::uint64_t>& keys,
+    const std::vector<std::uint32_t>& counts,
+    std::uint64_t n_reads,
+    std::uint64_t n_bases) {
+    KmerHistResult r;
+    r.n_reads = n_reads;
+    r.n_bases = n_bases;
+    r.n_recurrent_kmers = keys.size();
+
+    constexpr std::size_t HIST_MAX = 512;
+    r.histogram.assign(HIST_MAX, 0);
+    for (std::uint32_t c : counts) {
+        std::size_t bin = std::min<std::size_t>(c, HIST_MAX - 1);
+        ++r.histogram[bin];
+    }
+
+    int lo = std::max(4, expected_coverage / 3);
+    int hi = std::min<int>(static_cast<int>(HIST_MAX) - 1, expected_coverage * 4);
+    if (lo >= hi) return r;
+
+    auto smooth = [&](int x) -> double {
+        double s = 0; int n = 0;
+        for (int d = -2; d <= 2; ++d) {
+            int xx = x + d;
+            if (xx >= 0 && xx < (int)r.histogram.size()) {
+                s += static_cast<double>(r.histogram[xx]); ++n;
+            }
+        }
+        return n ? s / n : 0.0;
+    };
+
+    int peak1 = lo;
+    double v1 = smooth(lo);
+    for (int x = lo + 1; x <= hi; ++x) {
+        double v = smooth(x);
+        if (v > v1) { v1 = v; peak1 = x; }
+    }
+    r.detected_coverage = peak1;
+
+    int peak2 = 0;
+    double v2 = 0.0;
+    int hi2 = std::max(lo, static_cast<int>(peak1 * 0.7));
+    for (int x = lo; x <= hi2; ++x) {
+        double v = smooth(x);
+        if (v > v2) { v2 = v; peak2 = x; }
+    }
+
+    if (peak2 > 0) {
+        int valley = (peak1 + peak2) / 2;
+        double vv = smooth(valley);
+        if (vv > 0) {
+            double z_low  = (v2 - vv) / std::sqrt(std::max(vv, 1.0));
+            double z_high = (v1 - vv) / std::sqrt(std::max(vv, 1.0));
+            r.bimodality_z = std::min(z_low, z_high);
+            if (r.bimodality_z >= bimodality_z_threshold) {
+                r.detected_het_coverage = peak2;
+            }
+        }
+    }
+    return r;
+}
+
+void write_phase0_dump(
+    const std::string& path,
+    std::size_t k,
+    const KmerHistResult& result,
+    const std::vector<std::uint64_t>& keys,
+    const std::vector<std::uint32_t>& counts) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open: " + path);
+    constexpr char MAGIC[8] = {'K','H','I','S','T','0','5','\0'};
+    f.write(MAGIC, 8);
+
+    std::uint64_t n_recurrent = result.n_recurrent_kmers;
+    std::uint64_t n_reads = result.n_reads;
+    std::uint64_t n_bases = result.n_bases;
+    std::int32_t cov = result.detected_coverage;
+    std::int32_t het = result.detected_het_coverage;
+    double z = result.bimodality_z;
+    std::uint32_t kk = static_cast<std::uint32_t>(k);
+    f.write(reinterpret_cast<const char*>(&n_recurrent), sizeof(n_recurrent));
+    f.write(reinterpret_cast<const char*>(&n_reads), sizeof(n_reads));
+    f.write(reinterpret_cast<const char*>(&n_bases), sizeof(n_bases));
+    f.write(reinterpret_cast<const char*>(&cov), sizeof(cov));
+    f.write(reinterpret_cast<const char*>(&het), sizeof(het));
+    f.write(reinterpret_cast<const char*>(&z), sizeof(z));
+    f.write(reinterpret_cast<const char*>(&kk), sizeof(kk));
+
+    std::uint32_t hist_n = static_cast<std::uint32_t>(result.histogram.size());
+    f.write(reinterpret_cast<const char*>(&hist_n), sizeof(hist_n));
+    f.write(reinterpret_cast<const char*>(result.histogram.data()),
+            result.histogram.size() * sizeof(std::uint64_t));
+
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        f.write(reinterpret_cast<const char*>(&keys[i]), sizeof(std::uint64_t));
+        f.write(reinterpret_cast<const char*>(&counts[i]), sizeof(std::uint32_t));
+    }
+}
+
 void load_kmer_counter_dump(
     const std::string& path,
     std::unordered_map<std::uint64_t, std::uint32_t>& out_counter) {

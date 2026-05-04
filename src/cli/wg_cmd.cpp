@@ -161,26 +161,46 @@ int run_wg(int argc, char** argv) {
     out.meta.input_bases = total_bp;
     std::cerr << "[wg] loaded " << reads.size() << " reads, " << total_bp << " bp\n";
 
-    // ---------- Phase 0 ----------
+    // ---------- Phase 0: k-mer histogram (GPU-first, CPU fallback) ----------
     auto t0 = clock::now();
     std::cerr << "[wg] Phase 0: k-mer histogram + bimodality detection\n";
-    // Size the bloom filter for expected distinct k-mers. For chr14
-    // (~100 Mbp) at k=15 ONT preset there are ~50M distinct k-mers; for
-    // a full WG ~20G. Cap at 1G to keep bloom RSS under control on a
-    // single node — over-saturation just costs FP rate, not correctness.
-    std::size_t expected_distinct = std::min<std::size_t>(
-        std::max<std::size_t>(total_bp / 4, 100'000'000ULL),
-        1'000'000'000ULL);
-    branch::wg::KmerHistBuilder kh(profile, expected_distinct);
-    for (const auto& [_, seq] : reads) kh.pass1_add_read(seq);
-    kh.switch_to_pass2();
-    for (const auto& [_, seq] : reads) kh.pass2_add_read(seq);
-    auto khr = kh.finalize(expected_cov, profile.bimodality_z);
+    bool use_gpu_p0 = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
+    branch::wg::KmerHistResult khr;
+    std::string p0_path = args.out_prefix + ".phase0.bin";
+    bool p0_done = false;
+    if (use_gpu_p0) {
+        std::vector<std::uint64_t> p0_keys;
+        std::vector<std::uint32_t> p0_cnts;
+        bool ok = branch::gpu::wg_kernels::launch_phase0_count(
+            reads, profile.minimizer_k, p0_keys, p0_cnts);
+        if (ok) {
+            khr = branch::wg::finalize_from_keys_counts(
+                expected_cov, profile.bimodality_z,
+                p0_keys, p0_cnts,
+                reads.size(), total_bp);
+            branch::wg::write_phase0_dump(p0_path, profile.minimizer_k,
+                                          khr, p0_keys, p0_cnts);
+            std::cerr << "[wg]   phase0 on GPU: recurrent_kmers=" << p0_keys.size()
+                      << "\n";
+            p0_done = true;
+        }
+    }
+    if (!p0_done) {
+        std::size_t expected_distinct = std::min<std::size_t>(
+            std::max<std::size_t>(total_bp / 4, 100'000'000ULL),
+            1'000'000'000ULL);
+        branch::wg::KmerHistBuilder kh(profile, expected_distinct);
+        for (const auto& [_, seq] : reads) kh.pass1_add_read(seq);
+        kh.switch_to_pass2();
+        for (const auto& [_, seq] : reads) kh.pass2_add_read(seq);
+        khr = kh.finalize(expected_cov, profile.bimodality_z);
+        kh.write_to(p0_path, khr);
+        std::cerr << "[wg]   phase0 on CPU: recurrent_kmers="
+                  << khr.n_recurrent_kmers << "\n";
+    }
     out.meta.detected_coverage = khr.detected_coverage;
     out.meta.detected_het_coverage = khr.detected_het_coverage;
     out.meta.bimodality_z = khr.bimodality_z;
-    std::string p0_path = args.out_prefix + ".phase0.bin";
-    kh.write_to(p0_path, khr);
     out.phase_log.emplace_back("0",
         std::chrono::duration<double>(clock::now() - t0).count());
     std::cerr << "[wg] Phase 0 done. recurrent_kmers=" << khr.n_recurrent_kmers

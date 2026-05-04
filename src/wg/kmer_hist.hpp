@@ -115,4 +115,25 @@ void load_kmer_counter_dump(
     const std::string& path,
     std::unordered_map<std::uint64_t, std::uint32_t>& out_counter);
 
+/// Build a KmerHistResult (histogram + bimodality) from (keys, counts)
+/// pairs as returned by the Phase 0 GPU launcher. Mirrors the bimodality
+/// logic of KmerHistBuilder::finalize.
+[[nodiscard]] KmerHistResult finalize_from_keys_counts(
+    int expected_coverage,
+    double bimodality_z_threshold,
+    const std::vector<std::uint64_t>& keys,
+    const std::vector<std::uint32_t>& counts,
+    std::uint64_t n_reads,
+    std::uint64_t n_bases);
+
+/// Write the same .bin dump format that KmerHistBuilder::write_to emits,
+/// but from (keys, counts) pairs instead of a builder. Used by the
+/// Phase 0 GPU launcher to persist the counter for Phase 1.1 + Stage 1.
+void write_phase0_dump(
+    const std::string& path,
+    std::size_t k,
+    const KmerHistResult& result,
+    const std::vector<std::uint64_t>& keys,
+    const std::vector<std::uint32_t>& counts);
+
 }  // namespace branch::wg

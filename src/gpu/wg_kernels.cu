@@ -1299,10 +1299,360 @@ bool launch_phase15_curation(
     return true;
 }
 
+// ===========================================================================
+// Phase 0 — bloom-filtered k-mer counter (two-pass)
+// ===========================================================================
+//
+// Pass 1: every k-mer's canonical bits are hashed and the corresponding
+//         bloom bits are atomicOr-set. After this pass, the bloom answers
+//         "have I seen this k-mer at least once?" with FP rate ~ 1 % at
+//         6 bits/key.
+// Pass 2: every k-mer that the bloom says "maybe seen" gets inserted /
+//         incremented in an open-addressing counter on the device via
+//         atomicCAS-then-atomicAdd. K-mers seen exactly once never reach
+//         the counter, which keeps it sized to ~recurrence-positive
+//         k-mers (~10× smaller than the full distinct-k-mer universe).
+//
+// Memory profile on chr14 (4.6 Gbp, ~1 G distinct, ~200 M recurrent):
+//   reads concat:  ~5 GB (streamed in-place)
+//   bloom (1 G * 6 bits): 750 MB
+//   counter (400 M slots * 12 B): 4.8 GB
+//   Total: ~11 GB on H100 80 GB.
+//
+// Streaming: the kernel processes one batch of read indices at a time,
+// uploaded with concatenated bytes + offset/len arrays. Bloom + counter
+// stay device-resident across batches.
+
+namespace {
+
+__device__ __forceinline__ std::uint64_t d_hash_i(std::uint64_t key, int i) noexcept {
+    // Two splitmix mixers, combined with seed-i, gives independent enough
+    // hashes for 5-7 bloom probes.
+    std::uint64_t z = key + static_cast<std::uint64_t>(i) * 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+__global__ void k_phase0_bloom_pass1(
+    const char*    __restrict__ d_reads_buf,
+    const uint64_t* __restrict__ d_read_off,
+    const uint32_t* __restrict__ d_read_len,
+    uint64_t        n_reads,
+    int             k_bp,
+    uint64_t        kmask,
+    // bloom
+    uint64_t*       __restrict__ d_bloom_words,
+    uint64_t        bloom_n_bits,
+    int             n_hashes) {
+    uint64_t r = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (r >= n_reads) return;
+
+    uint64_t off = d_read_off[r];
+    uint32_t len = d_read_len[r];
+    if (len < static_cast<uint32_t>(k_bp)) return;
+    const char* seq = d_reads_buf + off;
+
+    uint64_t kmer = 0;
+    int filled = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        uint8_t b = d_encode_base(seq[i]);
+        if (b > 3) { filled = 0; kmer = 0; continue; }
+        kmer = ((kmer << 2) | b) & kmask;
+        ++filled;
+        if (filled < k_bp) continue;
+        uint64_t cb = d_canon(kmer, k_bp);
+        for (int h = 0; h < n_hashes; ++h) {
+            uint64_t bit = d_hash_i(cb, h) % bloom_n_bits;
+            uint64_t word = bit >> 6;
+            uint64_t mask = 1ULL << (bit & 63ULL);
+            atomicOr(reinterpret_cast<unsigned long long*>(&d_bloom_words[word]),
+                     static_cast<unsigned long long>(mask));
+        }
+    }
+}
+
+__device__ __forceinline__ bool d_bloom_maybe_contains(
+    const uint64_t* __restrict__ d_bloom_words,
+    uint64_t bloom_n_bits,
+    int n_hashes,
+    uint64_t key) {
+    for (int h = 0; h < n_hashes; ++h) {
+        uint64_t bit = d_hash_i(key, h) % bloom_n_bits;
+        uint64_t word = bit >> 6;
+        uint64_t mask = 1ULL << (bit & 63ULL);
+        if ((d_bloom_words[word] & mask) == 0) return false;
+    }
+    return true;
+}
+
+__device__ __forceinline__ void d_counter_atomic_inc(
+    uint64_t* __restrict__ d_keys,
+    uint32_t* __restrict__ d_counts,
+    uint64_t  n_slots,
+    uint64_t  mask,
+    uint64_t  target_key) {
+    constexpr uint64_t kEmpty = ~0ULL;
+    uint64_t i = d_splitmix64(target_key) & mask;
+    for (uint32_t probes = 0; probes < n_slots; ++probes) {
+        // Try to claim an empty slot for this key.
+        unsigned long long expected = static_cast<unsigned long long>(kEmpty);
+        unsigned long long loaded = atomicCAS(
+            reinterpret_cast<unsigned long long*>(&d_keys[i]),
+            expected,
+            static_cast<unsigned long long>(target_key));
+        if (loaded == expected) {
+            // We just inserted target_key. Initialize count to 1.
+            atomicAdd(&d_counts[i], 1u);
+            return;
+        }
+        if (loaded == static_cast<unsigned long long>(target_key)) {
+            // Already inserted by another thread.
+            atomicAdd(&d_counts[i], 1u);
+            return;
+        }
+        // Collision — probe forward.
+        i = (i + 1) & mask;
+    }
+    // Table full — drop silently. We sized for 0.5 load factor so this
+    // is exceedingly rare.
+}
+
+__global__ void k_phase0_counter_pass2(
+    const char*    __restrict__ d_reads_buf,
+    const uint64_t* __restrict__ d_read_off,
+    const uint32_t* __restrict__ d_read_len,
+    uint64_t        n_reads,
+    int             k_bp,
+    uint64_t        kmask,
+    const uint64_t* __restrict__ d_bloom_words,
+    uint64_t        bloom_n_bits,
+    int             n_hashes,
+    uint64_t*       __restrict__ d_counter_keys,
+    uint32_t*       __restrict__ d_counter_counts,
+    uint64_t        counter_n_slots,
+    uint64_t        counter_mask) {
+    uint64_t r = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (r >= n_reads) return;
+
+    uint64_t off = d_read_off[r];
+    uint32_t len = d_read_len[r];
+    if (len < static_cast<uint32_t>(k_bp)) return;
+    const char* seq = d_reads_buf + off;
+
+    uint64_t kmer = 0;
+    int filled = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        uint8_t b = d_encode_base(seq[i]);
+        if (b > 3) { filled = 0; kmer = 0; continue; }
+        kmer = ((kmer << 2) | b) & kmask;
+        ++filled;
+        if (filled < k_bp) continue;
+        uint64_t cb = d_canon(kmer, k_bp);
+        if (!d_bloom_maybe_contains(d_bloom_words, bloom_n_bits, n_hashes, cb))
+            continue;
+        d_counter_atomic_inc(d_counter_keys, d_counter_counts,
+                             counter_n_slots, counter_mask, cb);
+    }
+}
+
+// Build a flat byte buffer for a slice of reads [r0, r0+n_batch).
+// Returns total bytes; fills offsets[0..n_batch] and lens[0..n_batch].
+std::size_t flatten_read_batch(
+    const std::vector<std::pair<std::string, std::string>>& reads,
+    std::size_t r0,
+    std::size_t n_batch,
+    std::vector<char>& flat,
+    std::vector<std::uint64_t>& offsets,
+    std::vector<std::uint32_t>& lens) {
+    flat.clear(); offsets.clear(); lens.clear();
+    offsets.reserve(n_batch);
+    lens.reserve(n_batch);
+    std::size_t total = 0;
+    for (std::size_t r = r0; r < r0 + n_batch && r < reads.size(); ++r) {
+        total += reads[r].second.size();
+    }
+    flat.reserve(total);
+    std::size_t cur = 0;
+    for (std::size_t r = r0; r < r0 + n_batch && r < reads.size(); ++r) {
+        offsets.push_back(cur);
+        lens.push_back(static_cast<std::uint32_t>(reads[r].second.size()));
+        flat.insert(flat.end(), reads[r].second.begin(), reads[r].second.end());
+        cur += reads[r].second.size();
+    }
+    return total;
+}
+
+}  // namespace
+
 bool launch_phase0_count(
-    const std::vector<std::pair<std::string, std::string>>&,
-    std::size_t,
-    std::vector<std::uint64_t>&,
-    std::vector<std::uint32_t>&) noexcept { return false; }
+    const std::vector<std::pair<std::string, std::string>>& reads,
+    std::size_t k,
+    std::vector<std::uint64_t>& out_keys,
+    std::vector<std::uint32_t>& out_counts) noexcept {
+    if (!is_gpu_available()) return false;
+    if (reads.empty()) {
+        out_keys.clear(); out_counts.clear();
+        return true;
+    }
+
+    // Estimate sizing.
+    std::uint64_t total_bp = 0;
+    for (const auto& r : reads) total_bp += r.second.size();
+    if (total_bp == 0) return false;
+
+    // Bloom: 1 bit per ~0.17 distinct kmers (6 bits/key for K_distinct).
+    // expected_distinct = min(total_bp / 4, 4^k, 2 G).
+    std::uint64_t expected_distinct = total_bp / 4ULL;
+    if (k < 32) {
+        std::uint64_t universe = 1ULL << (2 * k);
+        if (expected_distinct > universe) expected_distinct = universe;
+    }
+    if (expected_distinct < 1'000'000ULL) expected_distinct = 1'000'000ULL;
+    if (expected_distinct > 2'000'000'000ULL) expected_distinct = 2'000'000'000ULL;
+    std::uint64_t bloom_n_bits = expected_distinct * 6ULL;
+    // Round to multiple of 64.
+    bloom_n_bits = (bloom_n_bits + 63ULL) & ~63ULL;
+    std::uint64_t bloom_n_words = bloom_n_bits >> 6;
+    int n_hashes = 5;
+
+    // Counter: estimate ~10 % of distinct k-mers are recurrent (rest are
+    // singletons that the bloom filtered). Round up to power of two with
+    // load factor 0.5.
+    std::uint64_t expected_recurrent = expected_distinct / 10ULL;
+    if (expected_recurrent < 1024) expected_recurrent = 1024;
+    std::uint64_t counter_n_slots = 1;
+    while (counter_n_slots < expected_recurrent * 2) counter_n_slots <<= 1;
+    std::uint64_t counter_mask = counter_n_slots - 1;
+
+    std::fprintf(stderr,
+        "[gpu/wg] phase0: bloom_bits=%llu bloom_MB=%.1f "
+        "counter_slots=%llu counter_GB=%.2f\n",
+        static_cast<unsigned long long>(bloom_n_bits),
+        bloom_n_words * 8.0 / (1024.0 * 1024.0),
+        static_cast<unsigned long long>(counter_n_slots),
+        counter_n_slots * 12.0 / (1024.0 * 1024.0 * 1024.0));
+
+    // Allocate device.
+    uint64_t* d_bloom = nullptr;
+    uint64_t* d_keys = nullptr;
+    uint32_t* d_cnts = nullptr;
+    char*     d_reads_buf = nullptr;
+    uint64_t* d_read_off = nullptr;
+    uint32_t* d_read_len = nullptr;
+
+    auto cleanup = [&]() {
+        for (void* p : {(void*)d_bloom, (void*)d_keys, (void*)d_cnts,
+                        (void*)d_reads_buf, (void*)d_read_off, (void*)d_read_len}) {
+            if (p) cudaFree(p);
+        }
+    };
+    auto bail = [&](const char* where) {
+        std::fprintf(stderr, "[gpu/wg] launch_phase0 fail %s\n", where);
+        cleanup();
+        return false;
+    };
+
+    if (cudaMalloc(&d_bloom, bloom_n_words * sizeof(std::uint64_t)) != cudaSuccess)
+        return bail("bloom alloc");
+    cudaMemset(d_bloom, 0, bloom_n_words * sizeof(std::uint64_t));
+    if (cudaMalloc(&d_keys, counter_n_slots * sizeof(std::uint64_t)) != cudaSuccess)
+        return bail("counter_keys alloc");
+    if (cudaMalloc(&d_cnts, counter_n_slots * sizeof(std::uint32_t)) != cudaSuccess)
+        return bail("counter_counts alloc");
+    cudaMemset(d_cnts, 0, counter_n_slots * sizeof(std::uint32_t));
+    {
+        // Initialize keys to 0xFFFF... (kEmpty).
+        std::vector<std::uint64_t> empty(counter_n_slots, ~0ULL);
+        if (cudaMemcpy(d_keys, empty.data(),
+                       counter_n_slots * sizeof(std::uint64_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess)
+            return bail("counter_keys init");
+    }
+
+    // Streaming batches.
+    constexpr std::size_t kBatchReads = 32'768;  // ~512 MB at ~16 kbp/read
+    const std::uint64_t kmask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
+
+    auto run_pass = [&](bool pass2) -> bool {
+        for (std::size_t r0 = 0; r0 < reads.size(); r0 += kBatchReads) {
+            std::vector<char> flat;
+            std::vector<std::uint64_t> offs;
+            std::vector<std::uint32_t> lens;
+            std::size_t got = flatten_read_batch(reads, r0, kBatchReads, flat, offs, lens);
+            std::size_t n_b = offs.size();
+            if (n_b == 0) break;
+
+            // (Re)alloc device read buffers if needed.
+            if (d_reads_buf) { cudaFree(d_reads_buf); d_reads_buf = nullptr; }
+            if (d_read_off)  { cudaFree(d_read_off); d_read_off = nullptr; }
+            if (d_read_len)  { cudaFree(d_read_len); d_read_len = nullptr; }
+            if (cudaMalloc(&d_reads_buf, got) != cudaSuccess)
+                return false;
+            if (cudaMalloc(&d_read_off, n_b * sizeof(std::uint64_t)) != cudaSuccess)
+                return false;
+            if (cudaMalloc(&d_read_len, n_b * sizeof(std::uint32_t)) != cudaSuccess)
+                return false;
+            if (cudaMemcpy(d_reads_buf, flat.data(), got, cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+            if (cudaMemcpy(d_read_off, offs.data(), n_b * sizeof(std::uint64_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+            if (cudaMemcpy(d_read_len, lens.data(), n_b * sizeof(std::uint32_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+
+            int block = 128;
+            int grid = static_cast<int>((n_b + block - 1) / block);
+            if (!pass2) {
+                k_phase0_bloom_pass1<<<grid, block>>>(
+                    d_reads_buf, d_read_off, d_read_len, n_b,
+                    static_cast<int>(k), kmask,
+                    d_bloom, bloom_n_bits, n_hashes);
+            } else {
+                k_phase0_counter_pass2<<<grid, block>>>(
+                    d_reads_buf, d_read_off, d_read_len, n_b,
+                    static_cast<int>(k), kmask,
+                    d_bloom, bloom_n_bits, n_hashes,
+                    d_keys, d_cnts, counter_n_slots, counter_mask);
+            }
+            if (cudaGetLastError() != cudaSuccess) return false;
+            if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        }
+        return true;
+    };
+
+    if (!run_pass(false)) return bail("bloom pass1");
+    if (!run_pass(true))  return bail("counter pass2");
+
+    // DtoH: read all counter slots, filter where count>0.
+    std::vector<std::uint64_t> all_keys(counter_n_slots);
+    std::vector<std::uint32_t> all_cnts(counter_n_slots);
+    if (cudaMemcpy(all_keys.data(), d_keys,
+                   counter_n_slots * sizeof(std::uint64_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        return bail("keys DtoH");
+    if (cudaMemcpy(all_cnts.data(), d_cnts,
+                   counter_n_slots * sizeof(std::uint32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        return bail("counts DtoH");
+    cleanup();
+
+    out_keys.clear();
+    out_counts.clear();
+    out_keys.reserve(counter_n_slots / 8);
+    out_counts.reserve(counter_n_slots / 8);
+    for (std::size_t i = 0; i < counter_n_slots; ++i) {
+        // Skip empty slots and singletons (only recurrent k-mers are useful
+        // downstream — every occurrence in pass2 yields a count, so any
+        // bloom-FP that seeded a single insert ends up with count==1 and
+        // those carry no signal).
+        if (all_keys[i] == ~0ULL) continue;
+        if (all_cnts[i] < 2) continue;
+        out_keys.push_back(all_keys[i]);
+        out_counts.push_back(all_cnts[i]);
+    }
+    return true;
+}
 
 }  // namespace branch::gpu::wg_kernels
