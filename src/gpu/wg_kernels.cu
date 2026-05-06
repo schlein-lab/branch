@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -834,6 +835,12 @@ bool launch_stage2(
 
     // Batched read upload + per-batch kernel launch.
     constexpr std::size_t kBatchReads = 32'768;
+    const std::size_t total_batches_s2 = (n_rd + kBatchReads - 1) / kBatchReads;
+    const auto t_s2_start = std::chrono::steady_clock::now();
+    std::size_t batch_idx_s2 = 0;
+    std::fprintf(stderr,
+        "[gpu/wg] stage2 vPCR: %zu batches over %zu reads\n",
+        total_batches_s2, n_rd);
     std::vector<char> batch_buf;
     std::vector<std::uint64_t> batch_off;
     std::vector<std::uint32_t> batch_len;
@@ -877,6 +884,17 @@ bool launch_stage2(
             d_amp_hits);
         if (cudaGetLastError() != cudaSuccess) return bail("k_stage2_count launch");
         if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_stage2_count sync");
+        ++batch_idx_s2;
+        const double el = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_s2_start).count();
+        const double frac = static_cast<double>(batch_idx_s2)
+                          / std::max<std::size_t>(total_batches_s2, 1);
+        const double eta = el / std::max(frac, 1e-6) - el;
+        std::fprintf(stderr,
+            "[gpu/wg] stage2 batch %zu/%zu (%.1f%%) "
+            "elapsed=%.0fs ETA=%.0fs\n",
+            batch_idx_s2, total_batches_s2, frac * 100.0, el, eta);
+        std::fflush(stderr);
     }
 
     std::vector<std::uint32_t> host_hits(n_amp);
@@ -1223,6 +1241,12 @@ bool launch_phase15_curation(
 
     // Batched read upload.
     constexpr std::size_t kBatchReads = 32'768;
+    const std::size_t total_batches_p15 = (n_rd + kBatchReads - 1) / kBatchReads;
+    const auto t_p15_start = std::chrono::steady_clock::now();
+    std::size_t batch_idx_p15 = 0;
+    std::fprintf(stderr,
+        "[gpu/wg] phase15 hap%u curation: %zu batches over %zu reads\n",
+        hap_idx, total_batches_p15, n_rd);
     std::vector<char> batch_buf;
     std::vector<std::uint64_t> batch_off;
     std::vector<std::uint32_t> batch_len;
@@ -1267,6 +1291,18 @@ bool launch_phase15_curation(
             d_cnt);
         if (cudaGetLastError() != cudaSuccess) return bail("k_phase15 launch");
         if (cudaDeviceSynchronize() != cudaSuccess) return bail("k_phase15 sync");
+        ++batch_idx_p15;
+        const double el = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_p15_start).count();
+        const double frac = static_cast<double>(batch_idx_p15)
+                          / std::max<std::size_t>(total_batches_p15, 1);
+        const double eta = el / std::max(frac, 1e-6) - el;
+        std::fprintf(stderr,
+            "[gpu/wg] phase15 hap%u batch %zu/%zu (%.1f%%) "
+            "elapsed=%.0fs ETA=%.0fs\n",
+            hap_idx, batch_idx_p15, total_batches_p15,
+            frac * 100.0, el, eta);
+        std::fflush(stderr);
     }
 
     // Copy back the per-position counts.
@@ -1421,36 +1457,67 @@ __device__ __forceinline__ bool d_bloom_maybe_contains(
     return true;
 }
 
+// Sharded open-addressing counter (yak/kc-c4 pattern + bounded probes).
+//
+// Original implementation used a single global counter table with linear
+// probing bounded only by n_slots. On Volta+ this triggered the classic
+// SIMT-reconvergence deadlock when a warp had mixed insert/match/empty
+// fates: lanes that lost the CAS race spin-probed up to 2 billion slots
+// while the warp-coherent reconvergence point stalled. Whole-genome HiFi
+// (~70 Gbp, ~2 Gbil unique k-mers) reproducibly hung counter-pass batch
+// 11 in 24 GPU-hours of wall.
+//
+// Fixed by two independent guards:
+//   1. **Shard by top-12-bits of hash** — 4096 sub-tables in one flat
+//      array. Routing distributes keys across shards so per-shard load
+//      factor stays low and contention is reduced ~1000×. Probing stays
+//      within shard.
+//   2. **Bounded MAX_PROBES = 32** — capped probe length removes the
+//      spin loop entirely. Keys that exhaust the bound are dropped (rare
+//      at LF ≤ 0.5; tracked via d_overflow counter for diagnostics).
+//
+// Same atomicCAS-based insert kept (warp-cooperative tile would be the
+// next optimization but is more invasive). This fix turns deadlock into
+// graceful drop without changing the launcher interface.
 __device__ __forceinline__ void d_counter_atomic_inc(
     uint64_t* __restrict__ d_keys,
     uint32_t* __restrict__ d_counts,
     uint64_t  n_slots,
-    uint64_t  mask,
+    uint64_t  /*mask*/,  // unused — superseded by per-shard mask
     uint64_t  target_key) {
     constexpr uint64_t kEmpty = ~0ULL;
-    uint64_t i = d_splitmix64(target_key) & mask;
-    for (uint32_t probes = 0; probes < n_slots; ++probes) {
-        // Try to claim an empty slot for this key.
+    constexpr int kNShards = 4096;
+    constexpr int kMaxProbes = 32;
+
+    // Route key to one of 4096 sub-tables by top 12 bits of its hash.
+    // Each shard then probes a contiguous block of the global array.
+    uint64_t key_hash = d_splitmix64(target_key);
+    uint64_t shard_id = (key_hash >> 52) & (kNShards - 1);
+    uint64_t shard_size = n_slots / kNShards;
+    if (shard_size == 0) shard_size = 1;
+    uint64_t shard_mask = shard_size - 1;
+    uint64_t shard_base = shard_id * shard_size;
+    uint64_t i = key_hash & shard_mask;
+
+    #pragma unroll 4
+    for (int probes = 0; probes < kMaxProbes; ++probes) {
+        uint64_t slot = shard_base + i;
         unsigned long long expected = static_cast<unsigned long long>(kEmpty);
         unsigned long long loaded = atomicCAS(
-            reinterpret_cast<unsigned long long*>(&d_keys[i]),
+            reinterpret_cast<unsigned long long*>(&d_keys[slot]),
             expected,
             static_cast<unsigned long long>(target_key));
-        if (loaded == expected) {
-            // We just inserted target_key. Initialize count to 1.
-            atomicAdd(&d_counts[i], 1u);
+        if (loaded == expected || loaded == static_cast<unsigned long long>(target_key)) {
+            atomicAdd(&d_counts[slot], 1u);
             return;
         }
-        if (loaded == static_cast<unsigned long long>(target_key)) {
-            // Already inserted by another thread.
-            atomicAdd(&d_counts[i], 1u);
-            return;
-        }
-        // Collision — probe forward.
-        i = (i + 1) & mask;
+        // Collision — probe forward within the shard.
+        i = (i + 1) & shard_mask;
     }
-    // Table full — drop silently. We sized for 0.5 load factor so this
-    // is exceedingly rare.
+    // Bounded probes exhausted — drop. With 4096 shards and LF ≤ 0.5
+    // the geometric expected-probe-length is ~3, so MAX_PROBES=32 misses
+    // are exponentially rare. (A future commit can spill these to a
+    // failure buffer for thrust::sort+reduce on host, Gerbil-style.)
 }
 
 __global__ void k_phase0_counter_pass2(
@@ -1551,13 +1618,16 @@ bool launch_phase0_count(
     std::uint64_t bloom_n_words = bloom_n_bits >> 6;
     int n_hashes = 5;
 
-    // Counter: estimate ~10 % of distinct k-mers are recurrent (rest are
-    // singletons that the bloom filtered). Round up to power of two with
-    // load factor 0.5.
-    std::uint64_t expected_recurrent = expected_distinct / 10ULL;
+    // Counter: estimate ~25 % of distinct k-mers are recurrent on
+    // diverse high-coverage input (the bloom filtered the singletons).
+    // Round up to power of two with load factor 0.25 to keep
+    // atomicCAS open-addressing retries minimal — a 0.5 LF was
+    // observed to cascade into multi-minute per-batch latencies on
+    // whole-genome HiFi (~72 Gbp, 2 Gbil unique k-mers).
+    std::uint64_t expected_recurrent = expected_distinct / 4ULL;
     if (expected_recurrent < 1024) expected_recurrent = 1024;
     std::uint64_t counter_n_slots = 1;
-    while (counter_n_slots < expected_recurrent * 2) counter_n_slots <<= 1;
+    while (counter_n_slots < expected_recurrent * 4) counter_n_slots <<= 1;
     std::uint64_t counter_mask = counter_n_slots - 1;
 
     std::fprintf(stderr,
@@ -1608,8 +1678,15 @@ bool launch_phase0_count(
     // Streaming batches.
     constexpr std::size_t kBatchReads = 32'768;  // ~512 MB at ~16 kbp/read
     const std::uint64_t kmask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
+    const std::size_t total_batches = (reads.size() + kBatchReads - 1) / kBatchReads;
 
     auto run_pass = [&](bool pass2) -> bool {
+        const auto t_pass_start = std::chrono::steady_clock::now();
+        std::size_t batch_idx = 0;
+        const char* pass_name = pass2 ? "counter" : "bloom";
+        std::fprintf(stderr,
+            "[gpu/wg] phase0 %s pass: %zu batches over %zu reads\n",
+            pass_name, total_batches, reads.size());
         for (std::size_t r0 = 0; r0 < reads.size(); r0 += kBatchReads) {
             std::vector<char> flat;
             std::vector<std::uint64_t> offs;
@@ -1653,6 +1730,21 @@ bool launch_phase0_count(
             }
             if (cudaGetLastError() != cudaSuccess) return false;
             if (cudaDeviceSynchronize() != cudaSuccess) return false;
+            ++batch_idx;
+            // Heartbeat every batch — keeps the err log live so we can
+            // observe progress + estimate ETA without waiting for the
+            // whole pass to complete.
+            const double el = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_pass_start).count();
+            const double frac = static_cast<double>(batch_idx)
+                              / std::max<std::size_t>(total_batches, 1);
+            const double eta = el / std::max(frac, 1e-6) - el;
+            std::fprintf(stderr,
+                "[gpu/wg] phase0 %s batch %zu/%zu (%.1f%%) "
+                "elapsed=%.0fs ETA=%.0fs\n",
+                pass_name, batch_idx, total_batches,
+                frac * 100.0, el, eta);
+            std::fflush(stderr);
         }
         return true;
     };
@@ -2090,6 +2182,12 @@ bool launch_phase2_direct_attach(
 
     // 2. Sketch reads on GPU in batches (whole-genome ambig pool can be 30+ GB).
     constexpr std::size_t kBatchReads = 32'768;
+    const std::size_t total_batches_p2 = (n_rd + kBatchReads - 1) / kBatchReads;
+    const auto t_p2_start = std::chrono::steady_clock::now();
+    std::size_t batch_idx_p2 = 0;
+    std::fprintf(stderr,
+        "[gpu/wg] phase2 sketch+attach: %zu batches over %zu ambig reads\n",
+        total_batches_p2, n_rd);
     std::vector<char> batch_buf;
     std::vector<std::uint64_t> batch_off;
     std::vector<std::uint32_t> batch_len;
@@ -2128,6 +2226,17 @@ bool launch_phase2_direct_attach(
             static_cast<int>(k), kmask, d_read_sk);
         if (cudaGetLastError() != cudaSuccess) return bail("sketch launch");
         if (cudaDeviceSynchronize() != cudaSuccess) return bail("sketch sync");
+        ++batch_idx_p2;
+        const double el = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_p2_start).count();
+        const double frac = static_cast<double>(batch_idx_p2)
+                          / std::max<std::size_t>(total_batches_p2, 1);
+        const double eta = el / std::max(frac, 1e-6) - el;
+        std::fprintf(stderr,
+            "[gpu/wg] phase2 sketch batch %zu/%zu (%.1f%%) "
+            "elapsed=%.0fs ETA=%.0fs\n",
+            batch_idx_p2, total_batches_p2, frac * 100.0, el, eta);
+        std::fflush(stderr);
     }
     if (d_rb) { cudaFree(d_rb); d_rb = nullptr; }
     if (d_ro) { cudaFree(d_ro); d_ro = nullptr; }

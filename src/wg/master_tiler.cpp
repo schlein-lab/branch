@@ -13,7 +13,9 @@
 #include "wg/kmer_hist.hpp"  // canonical_kmer_bits
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -82,17 +84,43 @@ MasterTiler::MasterTiler(const ::branch::graph::TechProfile& profile)
 
 std::uint64_t MasterTiler::build_tiling(
     const std::vector<std::pair<std::string, std::string>>& reads_by_idx,
-    std::vector<MasterTile>& out_tiles) const {
+    std::vector<MasterTile>& out_tiles,
+    const std::string& partial_dump_path) const {
     out_tiles.clear();
     if (reads_by_idx.empty()) return 0;
 
+    const auto t_start = std::chrono::steady_clock::now();
     const std::size_t k = profile_.minimizer_k;
     const std::size_t w = std::max<std::size_t>(profile_.minimizer_w, 5);
+
+    // Open partial-dump TSV (append mode + line-buffered) if requested.
+    // Each emitted tile is written as one row and flushed immediately so
+    // a walltime-killed run leaves a usable partial output on disk.
+    std::FILE* partial = nullptr;
+    if (!partial_dump_path.empty()) {
+        partial = std::fopen(partial_dump_path.c_str(), "w");
+        if (partial) {
+            std::setvbuf(partial, nullptr, _IOLBF, 0);
+            std::fprintf(partial,
+                "tile_idx\tmaster_read_idx\tstart_bp\tlength_bp\t"
+                "source_offset_bp\tread_id\n");
+        }
+    }
+    auto close_partial = [&] {
+        if (partial) { std::fclose(partial); partial = nullptr; }
+    };
 
     // 1. Compute per-read minimizer lists.
     std::vector<std::vector<ReadMinimizer>> mins(reads_by_idx.size());
     for (std::size_t i = 0; i < reads_by_idx.size(); ++i) {
         compute_minimizers(reads_by_idx[i].second, k, w, mins[i]);
+        if ((i + 1) % 100'000 == 0 || i + 1 == reads_by_idx.size()) {
+            const double el = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            std::fprintf(stderr,
+                "[wg/tiler] minimize %zu/%zu reads, elapsed=%.0fs\n",
+                i + 1, reads_by_idx.size(), el);
+        }
     }
 
     // 2. Inverted index: minimizer → list of (read_idx, pos).
@@ -112,11 +140,26 @@ std::uint64_t MasterTiler::build_tiling(
 
     std::vector<bool> used(reads_by_idx.size(), false);
     std::uint32_t cursor_bp = 0;
+    std::size_t processed = 0;
+    auto t_loop_start = std::chrono::steady_clock::now();
 
     // Simple greedy: walk `order`, for each read either start a new contig
     // or extend the current one if it shares enough minimizers with the
     // previous tile.
     for (std::uint32_t r : order) {
+        ++processed;
+        if (processed % 100'000 == 0 || processed == order.size()) {
+            const double el = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_loop_start).count();
+            const double frac = static_cast<double>(processed)
+                              / static_cast<double>(order.size());
+            const double eta = el / std::max(frac, 1e-6) - el;
+            std::fprintf(stderr,
+                "[wg/tiler] tile %zu/%zu reads (%.1f%%) tiles=%zu cursor_bp=%u "
+                "elapsed=%.0fs ETA=%.0fs\n",
+                processed, order.size(), frac * 100.0,
+                out_tiles.size(), cursor_bp, el, eta);
+        }
         if (used[r]) continue;
         const std::string& seq = reads_by_idx[r].second;
         if (seq.empty()) continue;
@@ -181,10 +224,18 @@ std::uint64_t MasterTiler::build_tiling(
         t.q_mean_x10 = static_cast<std::uint32_t>(
             (profile_.name && profile_.name[0] == 'h') ? 350 : 230);
         out_tiles.push_back(t);
+        if (partial) {
+            const auto& rid = reads_by_idx[r].first;
+            std::fprintf(partial, "%zu\t%u\t%u\t%u\t%u\t%s\n",
+                out_tiles.size() - 1,
+                t.master_read_idx, t.start_bp, t.length_bp,
+                t.source_offset_bp, rid.c_str());
+        }
         cursor_bp += length;
         used[r] = true;
     }
 
+    close_partial();
     return cursor_bp;
 }
 

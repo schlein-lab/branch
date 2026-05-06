@@ -38,10 +38,14 @@ public:
     /// Build master tiles from a per-haplotype reads vector. `reads_by_idx`
     /// is the (id, seq) list for this haplotype. Tiles are emitted in
     /// `out_tiles`; each tile points to one element of `reads_by_idx`.
+    /// If `partial_dump_path` is non-empty, every emitted tile is also
+    /// appended (and flushed) to that file as a TSV row, so a killed run
+    /// still leaves a usable partial tile-set on disk.
     /// Returns total bp covered by tiles.
     std::uint64_t build_tiling(
         const std::vector<std::pair<std::string, std::string>>& reads_by_idx,
-        std::vector<MasterTile>& out_tiles) const;
+        std::vector<MasterTile>& out_tiles,
+        const std::string& partial_dump_path = "") const;
 
     /// Render the haplotype sequence as the concatenation of tile-source
     /// substrings (start = source_offset_bp for length length_bp).

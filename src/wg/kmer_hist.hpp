@@ -115,6 +115,20 @@ void load_kmer_counter_dump(
     const std::string& path,
     std::unordered_map<std::uint64_t, std::uint32_t>& out_counter);
 
+/// Same as load_kmer_counter_dump but loads directly into two parallel
+/// sorted vectors (key, count) — bypasses the std::unordered_map detour
+/// that costs ~48 B/entry of bucket overhead. For ~2 Gbil recurrent
+/// k-mers (whole-genome HiFi) this saves ~70 GB of host RAM and is the
+/// only viable load path under the 140 GB SLURM cap.
+///
+/// Output arrays are sorted ascending by key. Caller can then binary-
+/// search them or pass directly to the GPU launchers (which already
+/// expect sorted parallel arrays).
+void load_kmer_counter_sorted_arrays(
+    const std::string& path,
+    std::vector<std::uint64_t>& out_keys,
+    std::vector<std::uint32_t>& out_counts);
+
 /// Build a KmerHistResult (histogram + bimodality) from (keys, counts)
 /// pairs as returned by the Phase 0 GPU launcher. Mirrors the bimodality
 /// logic of KmerHistBuilder::finalize.

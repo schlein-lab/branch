@@ -22,8 +22,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -289,14 +291,31 @@ void VpcrAutoDesigner::count(
     std::vector<std::vector<std::uint32_t>> per_thread(n_threads,
         std::vector<std::uint32_t>(amplicons.size(), 0));
 
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (std::size_t i = 0; i < reads.size(); ++i) {
+    // Chunked outer loop so we get a heartbeat between chunks. The
+    // per-chunk barrier costs ~1% throughput but gives live progress
+    // visibility — vital for whole-genome runs that take hours.
+    const std::size_t kChunk = 200'000;
+    const auto t_start = std::chrono::steady_clock::now();
+    for (std::size_t off = 0; off < reads.size(); off += kChunk) {
+        const std::size_t end = std::min(off + kChunk, reads.size());
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (std::size_t i = off; i < end; ++i) {
 #ifdef _OPENMP
-        int tid = omp_get_thread_num();
+            int tid = omp_get_thread_num();
 #else
-        int tid = 0;
+            int tid = 0;
 #endif
-        scan_one_read(reads[i].second, per_thread[tid]);
+            scan_one_read(reads[i].second, per_thread[tid]);
+        }
+        const double el = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        const double frac = static_cast<double>(end)
+                          / static_cast<double>(reads.size());
+        const double eta = el / std::max(frac, 1e-6) - el;
+        std::fprintf(stderr,
+            "[wg/vpcr] count %zu/%zu reads (%.1f%%) "
+            "elapsed=%.0fs ETA=%.0fs\n",
+            end, reads.size(), frac * 100.0, el, eta);
     }
 
     for (auto& tc : per_thread) {

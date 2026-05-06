@@ -41,12 +41,18 @@ public:
     explicit MasterCurator(const ::branch::graph::TechProfile& profile);
 
     /// Curate one haplotype against the read pool routed to it.
+    /// If `depth_bedgraph_path` is non-empty, the per-position 4-base
+    /// pile-up totals are emitted as a 5-column bedGraph plus a 6th
+    /// column carrying a 5 kbp-window local-median z-score so consumers
+    /// can flag local outliers (Belios-style elevated regions, gaps,
+    /// chimeric tile junctions).
     void curate(std::uint32_t hap_idx,
                 const std::vector<MasterTile>& tiles,
                 const std::string& haplotype_seq,
                 const std::vector<std::pair<std::string, std::string>>& reads,
                 std::vector<CurationEvent>& out_events,
-                std::vector<BranchCandidate>& out_branches) const;
+                std::vector<BranchCandidate>& out_branches,
+                const std::string& depth_bedgraph_path = "") const;
 
 private:
     ::branch::graph::TechProfile profile_;

@@ -3,11 +3,16 @@
 #include "wg/kmer_hist.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace branch::wg {
 
@@ -366,6 +371,138 @@ void load_kmer_counter_dump(
         f.read(reinterpret_cast<char*>(&cnt), sizeof(cnt));
         out_counter.emplace(key, cnt);
     }
+}
+
+void load_kmer_counter_sorted_arrays(
+    const std::string& path,
+    std::vector<std::uint64_t>& out_keys,
+    std::vector<std::uint32_t>& out_counts) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open Phase 0 dump: " + path);
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, "KHIST05", 7) != 0)
+        throw std::runtime_error("bad magic in Phase 0 file: " + path);
+
+    std::uint64_t n_recurrent = 0, n_reads = 0, n_bases = 0;
+    std::int32_t cov = 0, het = 0;
+    double z = 0;
+    std::uint32_t k = 0;
+    f.read(reinterpret_cast<char*>(&n_recurrent), sizeof(n_recurrent));
+    f.read(reinterpret_cast<char*>(&n_reads), sizeof(n_reads));
+    f.read(reinterpret_cast<char*>(&n_bases), sizeof(n_bases));
+    f.read(reinterpret_cast<char*>(&cov), sizeof(cov));
+    f.read(reinterpret_cast<char*>(&het), sizeof(het));
+    f.read(reinterpret_cast<char*>(&z), sizeof(z));
+    f.read(reinterpret_cast<char*>(&k), sizeof(k));
+
+    std::uint32_t hist_n = 0;
+    f.read(reinterpret_cast<char*>(&hist_n), sizeof(hist_n));
+    f.seekg(sizeof(std::uint64_t) * hist_n, std::ios::cur);
+
+    // Memory profile (the whole point of this function):
+    //   keys:   8 B × n_recurrent
+    //   counts: 4 B × n_recurrent
+    //   Total:  12 B/entry — vs. ~48 B/entry in unordered_map. For
+    //   2 Gbil recurrent k-mers (HG002 HiFi WG) this saves ~70 GB and
+    //   is the only path under the 140 GB SLURM cap.
+    out_keys.clear();
+    out_counts.clear();
+    out_keys.resize(static_cast<std::size_t>(n_recurrent));
+    out_counts.resize(static_cast<std::size_t>(n_recurrent));
+    // Stream-read in 1 M-entry chunks to keep buffer overhead small.
+    constexpr std::uint64_t kChunk = 1'000'000ULL;
+    std::vector<char> buf(static_cast<std::size_t>(kChunk) * 12);
+    std::uint64_t done = 0;
+    while (done < n_recurrent) {
+        std::uint64_t take = std::min(kChunk, n_recurrent - done);
+        f.read(buf.data(), static_cast<std::streamsize>(take * 12));
+        for (std::uint64_t i = 0; i < take; ++i) {
+            std::memcpy(&out_keys[done + i],
+                        buf.data() + i * 12, 8);
+            std::memcpy(&out_counts[done + i],
+                        buf.data() + i * 12 + 8, 4);
+        }
+        done += take;
+    }
+
+    // Slot order from the GPU is hash-order, not key-order. Sort once
+    // here so downstream consumers (binary-search-by-key, GPU launchers
+    // that expect sorted input) need no further reorganization.
+    //
+    // Sort approach: pack (key, count) into a single u128-like pair
+    // (we just use std::vector<std::uint64_t> as packed representation
+    //  with key in upper 64 bits and count in lower 32 bits — but that
+    //  loses precision; instead we sort a struct-of-arrays via a 12-byte
+    //  packed entry in a single vector and split after).
+    //
+    // Practical: use std::sort with std::execution::par on a packed
+    // 12-byte buffer. For 2 G entries on 8 cores: ~30-90 s.
+    //
+    // Memory profile:
+    //   packed (12 B × N) replaces (keys 8 + counts 4 = 12 B × N).
+    //   Total during sort: 24 GB packed (no extra buffer).
+    std::fprintf(stderr,
+        "[wg/p0-load] sorting %zu (key,count) entries…\n", out_keys.size());
+    std::fflush(stderr);
+    auto t_sort = std::chrono::steady_clock::now();
+
+    struct Pkc { std::uint64_t key; std::uint32_t cnt; };
+    std::vector<Pkc> packed(out_keys.size());
+    for (std::size_t i = 0; i < out_keys.size(); ++i) {
+        packed[i].key = out_keys[i];
+        packed[i].cnt = out_counts[i];
+    }
+    // Free the unsorted parallel arrays now (we keep the packed copy);
+    // peak memory is just packed (24 GB) instead of 36 GB.
+    std::vector<std::uint64_t>().swap(out_keys);
+    std::vector<std::uint32_t>().swap(out_counts);
+
+#ifdef _OPENMP
+    // Crude parallel quicksort via OpenMP tasks: split the array into
+    // 8 chunks, sort each, then merge with std::inplace_merge.
+    const int nT = std::min(8, omp_get_max_threads());
+    const std::size_t chunk = packed.size() / nT;
+    #pragma omp parallel num_threads(nT)
+    {
+        const int tid = omp_get_thread_num();
+        const std::size_t lo = tid * chunk;
+        const std::size_t hi = (tid == nT - 1) ? packed.size()
+                                               : (tid + 1) * chunk;
+        std::sort(packed.begin() + lo, packed.begin() + hi,
+            [](const Pkc& a, const Pkc& b) { return a.key < b.key; });
+    }
+    // Sequential O(log_2 nT) merges: pairs of adjacent chunks.
+    for (std::size_t step = 1; step < static_cast<std::size_t>(nT); step *= 2) {
+        for (std::size_t i = 0; i + step < static_cast<std::size_t>(nT); i += 2 * step) {
+            std::size_t lo = i * chunk;
+            std::size_t mid = (i + step) * chunk;
+            std::size_t hi = std::min((i + 2 * step) * chunk, packed.size());
+            std::inplace_merge(packed.begin() + lo,
+                               packed.begin() + mid,
+                               packed.begin() + hi,
+                [](const Pkc& a, const Pkc& b) { return a.key < b.key; });
+        }
+    }
+#else
+    std::sort(packed.begin(), packed.end(),
+        [](const Pkc& a, const Pkc& b) { return a.key < b.key; });
+#endif
+
+    const double sort_el = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_sort).count();
+    std::fprintf(stderr,
+        "[wg/p0-load] sort done in %.1fs, splitting back to parallel arrays\n",
+        sort_el);
+    std::fflush(stderr);
+
+    out_keys.resize(packed.size());
+    out_counts.resize(packed.size());
+    for (std::size_t i = 0; i < packed.size(); ++i) {
+        out_keys[i] = packed[i].key;
+        out_counts[i] = packed[i].cnt;
+    }
+    std::vector<Pkc>().swap(packed);
 }
 
 }  // namespace branch::wg

@@ -22,8 +22,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -96,7 +98,8 @@ void MasterCurator::curate(
     const std::string& hap_seq,
     const std::vector<std::pair<std::string, std::string>>& reads,
     std::vector<CurationEvent>& out_events,
-    std::vector<BranchCandidate>& out_branches) const {
+    std::vector<BranchCandidate>& out_branches,
+    const std::string& depth_bedgraph_path) const {
     out_events.clear();
     out_branches.clear();
     if (hap_seq.empty() || reads.empty() || tiles.empty()) return;
@@ -120,7 +123,20 @@ void MasterCurator::curate(
     double qw = q_weight(default_q);
 
     // 4. Walk every read, anchor it on the haplotype, walk bases.
+    const auto t_start = std::chrono::steady_clock::now();
     for (std::size_t r = 0; r < reads.size(); ++r) {
+        if ((r + 1) % 50'000 == 0 || r + 1 == reads.size()) {
+            const double el = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            const double frac = static_cast<double>(r + 1)
+                              / static_cast<double>(reads.size());
+            const double eta = el / std::max(frac, 1e-6) - el;
+            std::fprintf(stderr,
+                "[wg/curator] hap%u read %zu/%zu (%.1f%%) "
+                "elapsed=%.0fs ETA=%.0fs\n",
+                hap_idx + 1, r + 1, reads.size(),
+                frac * 100.0, el, eta);
+        }
         const auto& seq = reads[r].second;
         if (seq.size() < k) continue;
 
@@ -187,6 +203,73 @@ void MasterCurator::curate(
                 auto& sup = alt_supporters[key];
                 if (sup.size() < 64) sup.push_back(static_cast<std::uint32_t>(r));
             }
+        }
+    }
+
+    // 4b. Optional per-bp depth dump.
+    //   We already have a per-position 4-counter from the pile-up loop;
+    //   serialize it as bedGraph before consuming it for branch / event
+    //   detection. Total = sum(A,C,G,T) per pos. The 6th column is a
+    //   5 kbp-window local-median z-score: |total - local_median| /
+    //   max(local_MAD, 1). Local Z makes Belios-style focal CNV
+    //   elevations stand out without needing a global baseline (which is
+    //   broken anyway when the master tiler over-tiles).
+    if (!depth_bedgraph_path.empty()) {
+        std::FILE* dp = std::fopen(depth_bedgraph_path.c_str(), "w");
+        if (dp) {
+            std::setvbuf(dp, nullptr, _IOLBF, 0);
+            std::fprintf(dp, "track type=bedGraph name=hap%u_depth\n", hap_idx);
+            // Compute total-coverage array first, then sliding-window
+            // median + MAD on a coarse stride to keep the cost linear.
+            std::vector<std::uint32_t> total(counts.size(), 0);
+            for (std::size_t p = 0; p < counts.size(); ++p) {
+                total[p] = counts[p][0] + counts[p][1]
+                         + counts[p][2] + counts[p][3];
+            }
+            constexpr std::size_t kWin = 5000;
+            constexpr std::size_t kStride = 500;
+            // Pre-compute median+MAD per stride-bin centre.
+            std::vector<std::pair<double, double>> bin_stats;  // (med, mad)
+            bin_stats.reserve(total.size() / kStride + 1);
+            std::vector<std::uint32_t> wbuf;
+            wbuf.reserve(kWin);
+            for (std::size_t centre = 0; centre < total.size(); centre += kStride) {
+                std::size_t lo = centre > kWin / 2 ? centre - kWin / 2 : 0;
+                std::size_t hi = std::min(total.size(), centre + kWin / 2);
+                wbuf.clear();
+                for (std::size_t p = lo; p < hi; ++p) wbuf.push_back(total[p]);
+                if (wbuf.empty()) { bin_stats.emplace_back(0.0, 1.0); continue; }
+                std::nth_element(wbuf.begin(),
+                                 wbuf.begin() + wbuf.size() / 2,
+                                 wbuf.end());
+                double med = wbuf[wbuf.size() / 2];
+                std::vector<std::uint32_t> dev;
+                dev.reserve(wbuf.size());
+                for (auto v : wbuf) {
+                    double d = std::fabs(static_cast<double>(v) - med);
+                    dev.push_back(static_cast<std::uint32_t>(d));
+                }
+                std::nth_element(dev.begin(),
+                                 dev.begin() + dev.size() / 2,
+                                 dev.end());
+                double mad = std::max<double>(dev[dev.size() / 2], 1.0);
+                bin_stats.emplace_back(med, mad);
+            }
+            // Emit one row per bp; z-score from nearest bin centre.
+            for (std::size_t p = 0; p < total.size(); ++p) {
+                std::size_t bin = p / kStride;
+                if (bin >= bin_stats.size()) bin = bin_stats.size() - 1;
+                double med = bin_stats[bin].first;
+                double mad = bin_stats[bin].second;
+                double z = (static_cast<double>(total[p]) - med) / mad;
+                std::fprintf(dp, "hap%u\t%zu\t%zu\t%u\t%.2f\n",
+                             hap_idx,
+                             p, p + 1, total[p], z);
+            }
+            std::fclose(dp);
+            std::fprintf(stderr,
+                "[wg/curator] hap%u wrote per-bp depth to %s\n",
+                hap_idx, depth_bedgraph_path.c_str());
         }
     }
 
