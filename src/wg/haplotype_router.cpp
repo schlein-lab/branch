@@ -18,6 +18,8 @@
 #include "wg/kmer_hist.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -48,9 +50,14 @@ double ReadRouting::confidence() const noexcept {
 
 HaplotypeRouter::HaplotypeRouter(const ::branch::graph::TechProfile& profile,
                                  const std::string& kmer_hist_path,
-                                 int expected_coverage)
-    : profile_(profile), expected_coverage_(expected_coverage) {
-    load_counter_(kmer_hist_path);
+                                 int expected_coverage,
+                                 bool lazy_load_counter)
+    : profile_(profile), expected_coverage_(expected_coverage),
+      counter_path_(kmer_hist_path) {
+    if (!lazy_load_counter) {
+        load_counter_(kmer_hist_path);
+        counter_loaded_ = true;
+    }
 }
 
 void HaplotypeRouter::load_counter_(const std::string& path) {
@@ -92,6 +99,13 @@ void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac,
                                      double sum_frac_lo, double sum_frac_hi) {
     het_.clear();
     n_het_pairs_ = 0;
+    // Lazy-load the counter on first CPU het-pair invocation. GPU path
+    // never reaches this code (results piped via install_het_pairs_from_pairs),
+    // so the 95 GB unordered_map blow-up is avoided.
+    if (!counter_loaded_ && !counter_path_.empty()) {
+        load_counter_(counter_path_);
+        counter_loaded_ = true;
+    }
     if (expected_coverage_ <= 0 || counter_.empty()) return;
 
     const std::size_t k = profile_.minimizer_k;
@@ -171,7 +185,25 @@ void HaplotypeRouter::set_anchor_from_reads(
     std::size_t best_idx = 0;
     std::size_t best_hits = 0;
     std::size_t scanned = std::min(reads.size(), max_scan);
+    auto t_anchor = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+        "[wg/anchor] scanning %zu reads for anchor candidate "
+        "(het_ table size %zu)\n",
+        scanned, het_.size());
+    std::fflush(stderr);
     for (std::size_t r = 0; r < scanned; ++r) {
+        if ((r + 1) % 10'000 == 0 || r + 1 == scanned) {
+            const double el = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_anchor).count();
+            const double frac = static_cast<double>(r + 1)
+                              / static_cast<double>(scanned);
+            const double eta = el / std::max(frac, 1e-6) - el;
+            std::fprintf(stderr,
+                "[wg/anchor] %zu/%zu (%.1f%%) best_hits=%zu "
+                "elapsed=%.0fs ETA=%.0fs\n",
+                r + 1, scanned, frac * 100.0, best_hits, el, eta);
+            std::fflush(stderr);
+        }
         const auto& seq = reads[r].second;
         if (seq.size() < k) continue;
         std::uint64_t kmer = 0;
@@ -277,6 +309,23 @@ std::size_t HaplotypeRouter::bytes() const noexcept {
     return counter_.size() * (sizeof(std::uint64_t) + sizeof(std::uint32_t))
          + het_.size() * (sizeof(std::uint64_t) + sizeof(HetEntry))
          + hap1_pattern_.size() * (sizeof(std::uint32_t) + sizeof(std::uint8_t));
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>>
+HaplotypeRouter::export_het_pair_kmers() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> out(n_het_pairs_,
+        {0ULL, 0ULL});
+    for (const auto& [bits, ent] : het_) {
+        if (ent.pair_id >= n_het_pairs_) continue;
+        if (ent.allele == 0) out[ent.pair_id].first  = bits;
+        else                 out[ent.pair_id].second = bits;
+    }
+    // Drop any pair where one side is still 0 (defensive — shouldn't
+    // happen since install_/find_ both set both sides).
+    out.erase(std::remove_if(out.begin(), out.end(),
+        [](const auto& p) { return p.first == 0 || p.second == 0; }),
+        out.end());
+    return out;
 }
 
 }  // namespace branch::wg

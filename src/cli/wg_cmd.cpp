@@ -13,6 +13,7 @@
 #include "wg/vpcr_wg.hpp"
 #include "wg/orphan_clusterer.hpp"
 #include "wg/vpf_writer.hpp"
+#include "wg/phaser/phaser.hpp"
 #include "graph/kmer_sketch.hpp"
 #include "gpu/wg_kernels.cuh"
 
@@ -38,6 +39,10 @@ void print_wg_usage(std::ostream& os) {
        << "  branch wg --reads <fastq.gz> --read-tech {hifi,ont} \\\n"
        << "            --out-prefix <prefix> [--threads N]\n"
        << "            [--phase 0,1,2,3,4,5] [--no-vpcr] [--no-ref-annotation]\n"
+       << "            [--use-phaser]      use the v0.6 modular phaser pipeline\n"
+       << "                                (overlap_graph + bubble_finder +\n"
+       << "                                 iterative phase_engine + EM refiner)\n"
+       << "                                Replaces legacy Phase 1.1+ phases.\n"
        << "\n"
        << "Outputs:\n"
        << "  <prefix>.fa     FASTA: hap1 + hap2 + branches + orphans\n"
@@ -55,6 +60,13 @@ struct WgArgs {
     bool do_ref = true;
     bool no_gpu = false;          // --no-gpu forces CPU-only Phase 3
     std::vector<int> phases = {0, 1, 2, 3, 4, 5};
+    // v0.6: route through the new modular phaser instead of the legacy
+    // monolithic Phase 1.1+ pipeline. The phaser handles overlap_graph,
+    // bubble_finder, phase_engine (iterative, with relaxing thresholds),
+    // refiner (EM remap until convergence), balance_qc and gfa_writer
+    // — all from src/wg/phaser/. When set, downstream legacy phases
+    // are skipped.
+    bool use_phaser = false;
     bool ok = false;
     std::string err;
 };
@@ -75,6 +87,7 @@ WgArgs parse_wg_args(int argc, char** argv) {
         else if (k == "--no-vpcr")    { a.do_vpcr = false; }
         else if (k == "--no-ref-annotation") { a.do_ref = false; }
         else if (k == "--no-gpu")     { a.no_gpu = true; }
+        else if (k == "--use-phaser") { a.use_phaser = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -216,22 +229,15 @@ int run_wg(int argc, char** argv) {
     bool use_gpu_p11 = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
     bool p11_done = false;
     if (use_gpu_p11) {
-        // Build sorted (key, count) arrays from the Phase 0 dump for the
-        // GPU het-pair launcher; binary-searches partner kmers in-kernel.
-        std::unordered_map<std::uint64_t, std::uint32_t> counter_map;
-        branch::wg::load_kmer_counter_dump(p0_path, counter_map);
-        std::vector<std::pair<std::uint64_t, std::uint32_t>> pairs(
-            counter_map.begin(), counter_map.end());
-        std::sort(pairs.begin(), pairs.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
+        // Load Phase 0 directly into sorted parallel arrays. The old
+        // unordered_map → vector<pair> → sort detour cost ~95 GB for
+        // 2 Gbil recurrent k-mers and OOM-killed v08 at 144 GB MaxRSS;
+        // the direct load uses 12 B/entry instead of ~48 B/entry.
         std::vector<std::uint64_t> p11_keys;
         std::vector<std::uint32_t> p11_cnts;
-        p11_keys.reserve(pairs.size());
-        p11_cnts.reserve(pairs.size());
-        for (const auto& kv : pairs) {
-            p11_keys.push_back(kv.first);
-            p11_cnts.push_back(kv.second);
-        }
+        branch::wg::load_kmer_counter_sorted_arrays(p0_path, p11_keys, p11_cnts);
+        std::cerr << "[wg]   loaded sorted phase0 dump: "
+                  << p11_keys.size() << " recurrent k-mers\n";
         std::vector<std::uint64_t> ha, hb;
         bool ok = branch::gpu::wg_kernels::launch_phase11_het_pairs(
             p11_keys, p11_cnts, profile.minimizer_k, route_cov,
@@ -246,45 +252,163 @@ int run_wg(int argc, char** argv) {
         router.find_het_pairs();
         std::cerr << "[wg]   phase1.1 on CPU: het_pairs=" << router.n_het_pairs() << "\n";
     }
+
+    // ---------- v0.6 phaser branch ----------
+    // When --use-phaser is set, we replace the entire downstream legacy
+    // pipeline (anchor + per-read voting + master_tiler + master_curator
+    // + branch_attacher + Phase 3 vPCR + orphan_clusterer + vpf_writer)
+    // with the modular phaser. The phaser does iterative bubble-aware
+    // assembly graph construction → topological bubble detection →
+    // het-pair-vote phase tagging → EM-style remap refinement → GFA1
+    // emission with explicit hap1/hap2 P-lines.
+    if (args.use_phaser) {
+        std::cerr << "[wg] === switching to v0.6 modular phaser ===\n";
+        auto het_kmers = router.export_het_pair_kmers();
+        std::cerr << "[wg]   exported " << het_kmers.size()
+                  << " het-pair kmer tuples\n";
+
+        branch::wg::phaser::ReadsInput pin;
+        pin.reads.reserve(reads.size());
+        pin.read_id_strings.reserve(reads.size());
+        for (std::uint32_t i = 0; i < reads.size(); ++i) {
+            pin.reads.emplace_back(i, std::move(reads[i].second));
+            pin.read_id_strings.push_back(std::move(reads[i].first));
+        }
+        std::vector<std::pair<std::string, std::string>>().swap(reads);
+
+        pin.het_pairs.reserve(het_kmers.size());
+        for (const auto& [a, b] : het_kmers) {
+            branch::wg::phaser::HetPair hp;
+            hp.kmer_a = a;
+            hp.kmer_b = b;
+            hp.anchor_node = 0;
+            hp.anchor_pos_bp = 0;
+            pin.het_pairs.push_back(hp);
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(het_kmers);
+
+        branch::wg::phaser::PhaserOpts popts;
+        popts.minimizer_k = static_cast<int>(profile.minimizer_k);
+        // Sparser sketch (w=23) cuts memory ~2× vs w=11; still tested by
+        // minimap2/hifiasm at this density for HiFi.
+        popts.minimizer_w = 23;
+        popts.min_overlap_bp = 1000;
+        popts.min_jaccard = 0.30;
+        popts.iter1_min_supporting = 10;
+        popts.iter1_min_ratio = 0.85;
+        popts.imbalance_warn = 0.05;
+        popts.imbalance_err = 0.20;
+        popts.out_gfa_path             = args.out_prefix + ".gfa";
+        popts.out_h1_fa_path           = args.out_prefix + ".h1.fa";
+        popts.out_h2_fa_path           = args.out_prefix + ".h2.fa";
+        popts.out_assignments_tsv_path = args.out_prefix + ".assignments.tsv";
+
+        auto pres = branch::wg::phaser::run(pin, popts);
+        std::cerr << "[wg] phaser summary: "
+                  << "h1=" << pres.stats.n_reads_h1
+                  << " h2=" << pres.stats.n_reads_h2
+                  << " shared=" << pres.stats.n_reads_shared
+                  << " branch=" << pres.stats.n_reads_branch
+                  << " uncertain=" << pres.stats.n_reads_uncertain
+                  << " | bubbles=" << pres.stats.n_bubbles
+                  << " phased=" << pres.stats.n_bubbles_phased
+                  << " | h1_bp=" << static_cast<long long>(pres.stats.h1_bp)
+                  << " h2_bp=" << static_cast<long long>(pres.stats.h2_bp)
+                  << " shared_bp=" << static_cast<long long>(pres.stats.shared_bp)
+                  << " | build_iters=" << pres.stats.build_iterations
+                  << " refine_iters=" << pres.stats.refine_iterations
+                  << " qc_flags=" << pres.qc_flags.size() << "\n";
+        std::cerr << "[wg] === phaser done. Skipping legacy phases. ===\n";
+        return 0;
+    }
+
     router.set_anchor_from_reads(reads);
     std::cerr << "[wg]   het_pairs=" << router.n_het_pairs()
               << " anchor=" << (router.has_anchor() ? "ok" : "none") << "\n";
 
     // Bin reads to hap1/hap2/ambig and stamp #disp records.
+    // Use std::move on elements so the original `reads` strings are
+    // emptied as we go — total host RAM stays at ~71 GB instead of
+    // doubling to ~142 GB and blowing the SLURM cap.
     std::vector<std::pair<std::string, std::string>> hap1_reads, hap2_reads, ambig_reads;
     hap1_reads.reserve(reads.size() / 2);
     hap2_reads.reserve(reads.size() / 2);
-    for (const auto& [id, seq] : reads) {
-        auto rr = router.route_read(seq);
+    auto t_route_start = clock::now();
+    std::size_t routed_n = 0;
+    for (auto& [id, seq] : reads) {  // non-const so we can move
+        ++routed_n;
+        if (routed_n % 100'000 == 0 || routed_n == reads.size()) {
+            const double el = std::chrono::duration<double>(
+                clock::now() - t_route_start).count();
+            const double frac = static_cast<double>(routed_n)
+                              / static_cast<double>(reads.size());
+            const double eta = el / std::max(frac, 1e-6) - el;
+            std::fprintf(stderr,
+                "[wg/route] %zu/%zu reads (%.1f%%) "
+                "h1=%zu h2=%zu amb=%zu elapsed=%.0fs ETA=%.0fs\n",
+                routed_n, reads.size(), frac * 100.0,
+                hap1_reads.size(), hap2_reads.size(), ambig_reads.size(),
+                el, eta);
+            std::fflush(stderr);
+        }
+        auto rr = router.route_read(seq);  // read seq BEFORE we move it
         const char* label = "ambig";
+        std::ostringstream info;
+        info << "phase=1 outcome=";
         bool routed = false;
         if (rr.confidence() >= 0.6) {
             switch (rr.hap) {
                 case branch::wg::Haplotype::Hap1:
-                    label = "hap1"; hap1_reads.emplace_back(id, seq); routed = true; break;
+                    label = "hap1";
+                    info << label << " votes_h1=" << rr.votes_hap1
+                         << " votes_h2=" << rr.votes_hap2;
+                    out.read_disposition.emplace_back(id, info.str());
+                    hap1_reads.emplace_back(std::move(id), std::move(seq));
+                    routed = true;
+                    break;
                 case branch::wg::Haplotype::Hap2:
-                    label = "hap2"; hap2_reads.emplace_back(id, seq); routed = true; break;
+                    label = "hap2";
+                    info << label << " votes_h1=" << rr.votes_hap1
+                         << " votes_h2=" << rr.votes_hap2;
+                    out.read_disposition.emplace_back(id, info.str());
+                    hap2_reads.emplace_back(std::move(id), std::move(seq));
+                    routed = true;
+                    break;
                 default: break;
             }
         }
-        if (!routed) ambig_reads.emplace_back(id, seq);
-        std::ostringstream info;
-        info << "phase=1 outcome=" << label
-             << " votes_h1=" << rr.votes_hap1
-             << " votes_h2=" << rr.votes_hap2;
-        out.read_disposition.emplace_back(id, info.str());
+        if (!routed) {
+            info << label << " votes_h1=" << rr.votes_hap1
+                 << " votes_h2=" << rr.votes_hap2;
+            out.read_disposition.emplace_back(id, info.str());
+            ambig_reads.emplace_back(std::move(id), std::move(seq));
+        }
     }
     std::cerr << "[wg]   bin: hap1=" << hap1_reads.size()
               << " hap2=" << hap2_reads.size()
               << " ambig=" << ambig_reads.size() << "\n";
+
+    // Free the original reads vector — hap1+hap2+ambig now hold all
+    // sequences (as copies) and the original is no longer referenced.
+    // Without this swap-release we'd have ~71 GB reads + ~71 GB
+    // hap+ambig = ~142 GB total RAM, blowing the 140 GB SLURM cap
+    // exactly as v09c did at Phase 2. Phase 3 Stage 2 (vPCR count)
+    // wants the full read pool, so we feed it ambig_reads + a
+    // concatenated hap1+hap2 view at that point — see Phase 3 below.
+    std::vector<std::pair<std::string, std::string>>().swap(reads);
+    std::cerr << "[wg]   freed original reads vector (~71 GB)\n";
 
     // ---------- Phase 1.3: master tiling ----------
     std::cerr << "[wg] Phase 1.3: master tiling per haplotype\n";
     branch::wg::MasterTiler tiler(profile);
     out.haplotype_tiles.assign(2, {});
     out.haplotype_seqs.assign(2, std::string());
-    tiler.build_tiling(hap1_reads, out.haplotype_tiles[0]);
-    tiler.build_tiling(hap2_reads, out.haplotype_tiles[1]);
+    // Pass partial-dump paths so each emitted tile is also flushed to a
+    // TSV row on disk — a walltime-killed run leaves usable output.
+    tiler.build_tiling(hap1_reads, out.haplotype_tiles[0],
+                       args.out_prefix + ".tiles.h0.partial.tsv");
+    tiler.build_tiling(hap2_reads, out.haplotype_tiles[1],
+                       args.out_prefix + ".tiles.h1.partial.tsv");
     out.haplotype_seqs[0] = tiler.render_haplotype_seq(out.haplotype_tiles[0], hap1_reads);
     out.haplotype_seqs[1] = tiler.render_haplotype_seq(out.haplotype_tiles[1], hap2_reads);
     std::cerr << "[wg]   hap1: tiles=" << out.haplotype_tiles[0].size()
@@ -317,7 +441,13 @@ int run_wg(int argc, char** argv) {
                               << " branches=" << bcout.size() << "\n";
         }
         if (!ok) {
-            curator.curate(h_idx, out.haplotype_tiles[h_idx], seq, reads_h, evout, bcout);
+            // Pass per-bp depth bedgraph path: every bp gets a row with
+            // local-median z-score so we can flag focal CNV elevations
+            // (Belios IGHG4-pattern) without a global baseline.
+            std::ostringstream dp;
+            dp << args.out_prefix << ".depth.h" << h_idx << ".bedgraph";
+            curator.curate(h_idx, out.haplotype_tiles[h_idx], seq, reads_h,
+                           evout, bcout, dp.str());
             std::cerr << "[wg]   hap" << (h_idx+1)
                       << " curate on CPU: events=" << evout.size()
                       << " branches=" << bcout.size() << "\n";
@@ -398,6 +528,21 @@ int run_wg(int argc, char** argv) {
     out.phase_log.emplace_back("2",
         std::chrono::duration<double>(clock::now() - t0).count());
 
+    // v09g: bimodality_z << 0 means strong homozygous signal — skip Phase 3
+    // vPCR which has no diploid signal to validate. Frees ~30 GB by
+    // dropping ambig_reads (orphans vector already has copies of the same
+    // sequences). Without this gate v09f hit OOM at Phase 3 Stage 1 with
+    // 140 GB MaxRSS because ambig_reads + counter + stage1 buffers
+    // coexisted.
+    const bool skip_phase3_homo = (out.meta.bimodality_z < -100.0);
+    if (skip_phase3_homo) {
+        std::cerr << "[wg] Phase 3 SKIPPED: homozygous signal "
+                  << "(bimodality_z=" << out.meta.bimodality_z
+                  << ", threshold < -100)\n";
+        std::vector<std::pair<std::string, std::string>>().swap(ambig_reads);
+        std::cerr << "[wg]   freed ambig_reads (~30 GB)\n";
+    }
+
     // ---------- Phase 3: two-stage vPCR (GPU-first, CPU fallback) ----------
     //   Stage 1 — cheap whole-genome k-mer-coverage screen (no coding
     //   bias, multi-window, OR'd signals). Output: candidate regions +
@@ -406,36 +551,28 @@ int run_wg(int argc, char** argv) {
     //   count via k-mer-seed indexed scan.
     bool use_gpu = !args.no_gpu && branch::gpu::wg_kernels::is_gpu_available();
     std::cerr << "[wg] gpu=" << (use_gpu ? "available, will use" : "off") << "\n";
-    if (args.do_vpcr) {
+    if (args.do_vpcr && !skip_phase3_homo) {
         t0 = clock::now();
         std::cerr << "[wg] Phase 3 Stage 1: cheap k-mer-coverage screen\n";
-        // Reload Phase 0 counter (was freed by router after Phase 1.1).
-        std::unordered_map<std::uint64_t, std::uint32_t> p0_counter;
-        branch::wg::load_kmer_counter_dump(p0_path, p0_counter);
-        std::cerr << "[wg]   loaded " << p0_counter.size()
-                  << " recurrent k-mers from " << p0_path << "\n";
 
-        // Pre-flatten counter for GPU launcher (sorted ascending).
+        // Load Phase 0 directly into sorted parallel arrays. The
+        // GPU Stage 1 launcher already expects sorted inputs; the CPU
+        // fallback path will rebuild a temporary unordered_map from the
+        // arrays only when GPU is unavailable.
         std::vector<std::uint64_t> p0_keys_sorted;
         std::vector<std::uint32_t> p0_cnts_sorted;
-        if (use_gpu) {
-            p0_keys_sorted.reserve(p0_counter.size());
-            p0_cnts_sorted.reserve(p0_counter.size());
-            std::vector<std::pair<std::uint64_t, std::uint32_t>> pairs(
-                p0_counter.begin(), p0_counter.end());
-            std::sort(pairs.begin(), pairs.end(),
-                [](const auto& a, const auto& b) { return a.first < b.first; });
-            for (const auto& kv : pairs) {
-                p0_keys_sorted.push_back(kv.first);
-                p0_cnts_sorted.push_back(kv.second);
-            }
-            std::cerr << "[wg]   flattened counter for GPU ("
-                      << p0_keys_sorted.size() << " entries)\n";
-        }
+        branch::wg::load_kmer_counter_sorted_arrays(
+            p0_path, p0_keys_sorted, p0_cnts_sorted);
+        std::cerr << "[wg]   loaded sorted phase0: "
+                  << p0_keys_sorted.size() << " recurrent k-mers\n";
 
         branch::wg::Stage1Screener screener(profile);
         std::vector<branch::wg::Stage1Window> all_windows;
         std::vector<branch::wg::CandidateRegion> all_regions;
+        // Build a CPU-fallback counter view only if needed (rare in
+        // GPU-available builds; never instantiated when use_gpu=true).
+        std::unordered_map<std::uint64_t, std::uint32_t> p0_counter_cpu;
+        bool cpu_counter_built = false;
         for (std::size_t h = 0; h < out.haplotype_seqs.size(); ++h) {
             std::vector<branch::wg::Stage1Window> wins;
             bool gpu_ok = false;
@@ -455,8 +592,15 @@ int run_wg(int argc, char** argv) {
                 }
             }
             if (!gpu_ok) {
+                if (!cpu_counter_built) {
+                    p0_counter_cpu.reserve(p0_keys_sorted.size());
+                    for (std::size_t i = 0; i < p0_keys_sorted.size(); ++i) {
+                        p0_counter_cpu.emplace(p0_keys_sorted[i], p0_cnts_sorted[i]);
+                    }
+                    cpu_counter_built = true;
+                }
                 screener.screen_haplotype(static_cast<std::uint32_t>(h),
-                                          out.haplotype_seqs[h], p0_counter, wins);
+                                          out.haplotype_seqs[h], p0_counter_cpu, wins);
                 std::cerr << "[wg]   hap" << (h+1) << " stage1 on CPU: "
                           << wins.size() << " windows\n";
             }
@@ -496,14 +640,19 @@ int run_wg(int argc, char** argv) {
         bool stage2_gpu_ok = false;
         const int amp_min = 200;
         const int amp_max = (profile.name && profile.name[0] == 'h') ? 1500 : 3000;
+        // Original `reads` was swap-released after binning to stay
+        // under 140 GB. ambig_reads holds ~99% of the read pool in
+        // homozygous samples (HG002 routed ~4.3M of 4.3M reads as
+        // ambig) so feeding it alone is a near-lossless approximation
+        // and avoids the ~71 GB temporary duplicate that v09c hit.
         if (use_gpu) {
             stage2_gpu_ok = branch::gpu::wg_kernels::launch_stage2(
-                out.vpcr_amplicons, reads,
+                out.vpcr_amplicons, ambig_reads,
                 /*max_mm=*/2, amp_min, amp_max, expected_cov);
             if (stage2_gpu_ok) std::cerr << "[wg]   stage2 counted on GPU\n";
         }
         if (!stage2_gpu_ok) {
-            vp.count(out.vpcr_amplicons, reads, expected_cov);
+            vp.count(out.vpcr_amplicons, ambig_reads, expected_cov);
             std::cerr << "[wg]   stage2 counted on CPU\n";
         }
         out.phase_log.emplace_back("3",

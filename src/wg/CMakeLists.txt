@@ -17,3 +17,6 @@ target_link_libraries(branch_wg PUBLIC branch_graph branch_common branch_vpcr)
 
 # zstd is needed by vpf_writer.cpp. Reuse the system find done at top-level.
 target_compile_features(branch_wg PUBLIC cxx_std_20)
+
+# v0.6 modular phaser — independent successor to monolithic Phase 1.1.
+add_subdirectory(phaser)

@@ -32,9 +32,17 @@ class HaplotypeRouter {
 public:
     /// `expected_coverage` is the single-copy peak (typically the
     /// detected_coverage from Phase 0, or user-overridden via CLI).
+    /// If `lazy_load_counter` is true (the default has changed to true),
+    /// the counter_ map is NOT loaded eagerly — it is only loaded if a
+    /// caller invokes `find_het_pairs()` (CPU fallback). The GPU het-pair
+    /// path skips counter_ entirely (fed via install_het_pairs_from_pairs)
+    /// so the unordered_map's ~48 B/entry overhead — ~95 GB for 2 Gbil
+    /// recurrent k-mers — is avoided. v08 OOMed at 144 GB MaxRSS exactly
+    /// because of this eager load.
     HaplotypeRouter(const ::branch::graph::TechProfile& profile,
                     const std::string& kmer_hist_path,
-                    int expected_coverage);
+                    int expected_coverage,
+                    bool lazy_load_counter = true);
 
     /// Build the het-pair table from the loaded counter. `low_frac` and
     /// `high_frac` define the per-allele count window relative to the
@@ -76,6 +84,12 @@ public:
     [[nodiscard]] bool has_anchor() const noexcept { return !hap1_pattern_.empty(); }
     [[nodiscard]] std::size_t bytes() const noexcept;
 
+    /// Export het_pair allele tuples in canonical (kmer_a, kmer_b) form,
+    /// where allele 0 maps to kmer_a and allele 1 to kmer_b. Used by the
+    /// v0.6 phaser to seed its phase_engine signature index.
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>>
+        export_het_pair_kmers() const;
+
 private:
     ::branch::graph::TechProfile profile_;
     int expected_coverage_;
@@ -99,6 +113,10 @@ private:
     std::unordered_map<std::uint32_t, std::uint8_t> hap1_pattern_;
 
     void load_counter_(const std::string& path);
+
+    // Path retained for lazy loading on first find_het_pairs() call.
+    std::string counter_path_;
+    bool counter_loaded_ = false;
 };
 
 }  // namespace branch::wg
