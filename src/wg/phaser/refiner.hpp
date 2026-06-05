@@ -13,6 +13,7 @@
 // hap2 grows, the read may align better there.
 
 #include "types.hpp"
+#include "fastq_index.hpp"
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -44,7 +45,7 @@ public:
         std::vector<UnitigNode>& unitigs,
         std::vector<Bubble>& bubbles,
         std::vector<ReadAssignment>& assignments,
-        const std::vector<std::pair<ReadId, std::string>>& reads,
+        FastqIndex& reads,
         const RefinerOpts& opts = {});
 };
 

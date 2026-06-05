@@ -1,5 +1,7 @@
 #include "gfa_writer.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -24,6 +26,28 @@ std::string node_name(const UnitigNode& u) {
     std::ostringstream s;
     s << kind_str(u.kind) << "_" << u.id;
     return s.str();
+}
+
+// Materialize a single unitig's sequence into `out` from its member_reads
+// using the same overlap-cut rule as collapse_to_unitigs. Caller is
+// expected to clear/reuse `out`.
+void build_unitig_seq(
+    const UnitigNode& u,
+    FastqIndex& reads,
+    int approx_overlap,
+    std::string& out,
+    std::string& tmp_seq)
+{
+    out.clear();
+    for (std::size_t k = 0; k < u.member_reads.size(); ++k) {
+        reads.read_seq(u.member_reads[k], tmp_seq);
+        if (tmp_seq.empty()) continue;
+        if (k == 0) {
+            out += tmp_seq;
+        } else if (static_cast<int>(tmp_seq.size()) > approx_overlap) {
+            out.append(tmp_seq.begin() + approx_overlap, tmp_seq.end());
+        }
+    }
 }
 
 // Forward-direction walk from a starting node, following next_nodes
@@ -76,10 +100,13 @@ std::vector<NodeId> walk_path(
     return path;
 }
 
-void write_fasta_from_path(const std::string& path_out,
-                           const std::string& contig_name,
-                           const std::vector<NodeId>& path,
-                           const std::vector<UnitigNode>& unitigs)
+void write_fasta_from_path(
+    const std::string& path_out,
+    const std::string& contig_name,
+    const std::vector<NodeId>& path,
+    const std::vector<UnitigNode>& unitigs,
+    FastqIndex& reads,
+    int approx_overlap)
 {
     std::ofstream f(path_out);
     if (!f) {
@@ -89,9 +116,12 @@ void write_fasta_from_path(const std::string& path_out,
     f << '>' << contig_name << "\n";
     std::string buf;
     buf.reserve(64'000);
+    std::string useq;
+    std::string tmp_seq;
     for (NodeId nid : path) {
         if (nid >= unitigs.size()) continue;
-        for (char c : unitigs[nid].seq) {
+        build_unitig_seq(unitigs[nid], reads, approx_overlap, useq, tmp_seq);
+        for (char c : useq) {
             buf.push_back(c);
             if (buf.size() >= 60) { f << buf << "\n"; buf.clear(); }
         }
@@ -106,9 +136,12 @@ void GfaWriter::write(
     const std::vector<Bubble>& bubbles,
     const std::vector<ReadAssignment>& assignments,
     const std::vector<std::string>& read_id_strings,
+    FastqIndex& reads,
     const GfaWriterOpts& opts)
 {
     (void)bubbles;
+
+    const int approx_overlap = opts.approx_overlap_bp;
 
     // ----- GFA -----
     if (!opts.out_gfa_path.empty()) {
@@ -117,12 +150,35 @@ void GfaWriter::write(
             std::cerr << "[phaser/gfa] cannot open " << opts.out_gfa_path << "\n";
         } else {
             g << "H\tVN:Z:1.0\n";
-            for (const auto& u : unitigs) {
+            auto t_s_start = std::chrono::steady_clock::now();
+            std::cerr << "[phaser/gfa] writing S-lines for "
+                      << unitigs.size() << " unitigs\n";
+            std::fflush(stderr);
+            std::string useq;
+            std::string tmp_seq;
+            std::size_t s_emitted = 0;
+            for (std::size_t ui = 0; ui < unitigs.size(); ++ui) {
+                if (ui % 100'000 == 0 && ui > 0) {
+                    const double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_s_start).count();
+                    std::fprintf(stderr,
+                        "[phaser/gfa] S-lines %zu/%zu (%.1f%%) emitted=%zu elapsed=%.0fs\n",
+                        ui, unitigs.size(),
+                        100.0 * static_cast<double>(ui) /
+                        static_cast<double>(unitigs.size()),
+                        s_emitted, el);
+                    std::fflush(stderr);
+                }
+                const auto& u = unitigs[ui];
                 if (u.kind == NodeKind::UNCLASSIFIED) continue;
-                g << "S\t" << node_name(u) << '\t' << u.seq
-                  << "\tLN:i:" << u.seq.size()
+                build_unitig_seq(u, reads, approx_overlap, useq, tmp_seq);
+                g << "S\t" << node_name(u) << '\t' << useq
+                  << "\tLN:i:" << useq.size()
                   << "\tKD:Z:" << kind_str(u.kind) << "\n";
+                ++s_emitted;
             }
+            std::cerr << "[phaser/gfa] writing L-lines\n";
+            std::fflush(stderr);
             for (const auto& u : unitigs) {
                 for (NodeId n : u.next_nodes) {
                     if (n >= unitigs.size()) continue;
@@ -196,7 +252,8 @@ void GfaWriter::write(
         NodeId s = find_start_for_fa(true);
         if (s != ~0u) {
             auto p = walk_path(unitigs, s, true, false, false);
-            write_fasta_from_path(opts.out_h1_fa_path, "hap1", p, unitigs);
+            write_fasta_from_path(opts.out_h1_fa_path, "hap1", p, unitigs,
+                                  reads, approx_overlap);
             std::cerr << "[phaser/gfa] wrote " << opts.out_h1_fa_path
                       << " (" << p.size() << " unitigs)\n";
         }
@@ -205,9 +262,74 @@ void GfaWriter::write(
         NodeId s = find_start_for_fa(false);
         if (s != ~0u) {
             auto p = walk_path(unitigs, s, false, true, false);
-            write_fasta_from_path(opts.out_h2_fa_path, "hap2", p, unitigs);
+            write_fasta_from_path(opts.out_h2_fa_path, "hap2", p, unitigs,
+                                  reads, approx_overlap);
             std::cerr << "[phaser/gfa] wrote " << opts.out_h2_fa_path
                       << " (" << p.size() << " unitigs)\n";
+        }
+    }
+
+    // ----- bridge.fa + novel.fa: read-level evidence outputs -----
+    // Emit each read tagged BRANCH_BRIDGE / BRANCH_NOVEL as one FASTA
+    // record. These reads are the v0.10 Variante B "no read left behind"
+    // outputs — they carry biology that current mappers/assemblers drop.
+    auto emit_read_class = [&](const std::string& path_out,
+                               ReadTag target_tag,
+                               const char* prefix) {
+        if (path_out.empty()) return;
+        std::ofstream f(path_out);
+        if (!f) {
+            std::cerr << "[phaser/gfa] cannot open " << path_out << "\n";
+            return;
+        }
+        std::string seq;
+        std::size_t n = 0;
+        for (const auto& a : assignments) {
+            if (a.tag != target_tag) continue;
+            if (a.read_id >= read_id_strings.size()) continue;
+            reads.read_seq(a.read_id, seq);
+            if (seq.empty()) continue;
+            f << '>' << prefix << '_' << read_id_strings[a.read_id] << "\n";
+            for (std::size_t i = 0; i < seq.size(); i += 60) {
+                f.write(seq.data() + i,
+                        std::min<std::size_t>(60, seq.size() - i));
+                f.put('\n');
+            }
+            ++n;
+        }
+        std::cerr << "[phaser/gfa] wrote " << path_out
+                  << " (" << n << " reads)\n";
+    };
+    emit_read_class(opts.out_bridge_fa_path, ReadTag::BRANCH_BRIDGE, "bridge");
+    emit_read_class(opts.out_novel_fa_path,  ReadTag::BRANCH_NOVEL,  "novel");
+
+    // ----- branch.fa: each BRANCH-typed unitig as its own contig -----
+    // No path walking — branches are by definition off the main hap walks,
+    // so we emit one contig per BRANCH unitig labeled by branch_idx (set
+    // by phase_engine via VAF classifier).
+    if (!opts.out_branch_fa_path.empty()) {
+        std::ofstream f(opts.out_branch_fa_path);
+        if (!f) {
+            std::cerr << "[phaser/gfa] cannot open "
+                      << opts.out_branch_fa_path << "\n";
+        } else {
+            std::string useq;
+            std::string tmp_seq;
+            std::size_t n_branch = 0;
+            for (const auto& u : unitigs) {
+                if (u.kind != NodeKind::BRANCH) continue;
+                build_unitig_seq(u, reads, approx_overlap, useq, tmp_seq);
+                if (useq.empty()) continue;
+                f << ">branch_" << u.id << "\n";
+                for (std::size_t i = 0; i < useq.size(); i += 60) {
+                    f.write(useq.data() + i,
+                            std::min<std::size_t>(60, useq.size() - i));
+                    f.put('\n');
+                }
+                ++n_branch;
+            }
+            std::cerr << "[phaser/gfa] wrote " << opts.out_branch_fa_path
+                      << " (" << n_branch << " branch unitigs)\n";
         }
     }
 

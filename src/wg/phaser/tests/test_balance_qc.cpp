@@ -17,7 +17,7 @@ UnitigNode mk(NodeId id, NodeKind k, std::size_t len) {
     UnitigNode u;
     u.id = id;
     u.kind = k;
-    u.seq.assign(len, 'A');
+    u.length_bp = static_cast<Position>(len);
     return u;
 }
 

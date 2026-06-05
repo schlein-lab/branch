@@ -81,7 +81,7 @@ RefinerProgress Refiner::refine(
     std::vector<UnitigNode>& unitigs,
     std::vector<Bubble>& bubbles,
     std::vector<ReadAssignment>& assignments,
-    const std::vector<std::pair<ReadId, std::string>>& reads,
+    FastqIndex& reads,
     const RefinerOpts& opts)
 {
     (void)bubbles;
@@ -89,10 +89,28 @@ RefinerProgress Refiner::refine(
     RefinerProgress p;
     p.reads_total = assignments.size();
 
-    // Map ReadId → seq
-    std::unordered_map<ReadId, const std::string*> read_lut;
-    read_lut.reserve(reads.size() * 2);
-    for (const auto& [rid, seq] : reads) read_lut[rid] = &seq;
+    // Refiner skips at WG scale.
+    //
+    // The previous implementation rebuilds unitig sketches and re-scores
+    // every assignment against every unitig: O(N_reads × N_unitigs × |sk|)
+    // per pass. That is fine for the unit tests (a handful of unitigs)
+    // but completely infeasible at WG scale (4.3M × 4M ≈ 1.7e13 ops per
+    // pass) and would also need ~50 GB of cached per-read minimizers on
+    // top of the ~60 GB raw reads. A scalable v2 refiner needs to score
+    // only against neighbouring nodes in the overlap graph, not all
+    // unitigs — that is a redesign, not a parameter tweak.
+    //
+    // For v10g we skip refinement at WG scale and rely on the build-pass
+    // assignments produced by phase_engine. This keeps the unit tests
+    // green for small inputs while letting WG runs complete.
+    constexpr std::size_t kRefineMaxNodes = 50'000;
+    if (unitigs.size() > kRefineMaxNodes) {
+        std::cerr << "[phaser/refine] skipping at WG scale (n_unitigs="
+                  << unitigs.size() << " > " << kRefineMaxNodes
+                  << "); v2 will rescore only adjacent nodes\n";
+        p.iter_n = 0;
+        return p;
+    }
 
     // Pre-compute unitig sketches once per refinement pass.
     const int k = 21, w = 11;
@@ -105,6 +123,7 @@ RefinerProgress Refiner::refine(
 
     std::vector<std::vector<std::uint64_t>> u_sk;
 
+    std::string read_seq_buf;
     for (int it = 0; it < opts.max_iters; ++it) {
         rebuild_unitig_sketches(u_sk);
         std::size_t changed_this_iter = 0;
@@ -116,9 +135,9 @@ RefinerProgress Refiner::refine(
             if (a.tag == ReadTag::UNCERTAIN) continue;
             if (a.tag == ReadTag::UNTAGGED) continue;
 
-            auto it_seq = read_lut.find(a.read_id);
-            if (it_seq == read_lut.end()) continue;
-            minimizers_of(*it_seq->second, k, w, rd_sk);
+            reads.read_seq(a.read_id, read_seq_buf);
+            if (read_seq_buf.empty()) continue;
+            minimizers_of(read_seq_buf, k, w, rd_sk);
 
             // Score current home + every other unitig of compatible kind.
             const NodeKind cur_kind = (a.home_node < unitigs.size())

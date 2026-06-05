@@ -13,7 +13,7 @@ void BalanceQc::summarize(
 {
     out_h1_bp = out_h2_bp = out_shared_bp = out_branch_bp = 0.0;
     for (const auto& u : unitigs) {
-        const double L = static_cast<double>(u.seq.size());
+        const double L = static_cast<double>(u.length_bp);
         switch (u.kind) {
             case NodeKind::SHARED:    out_shared_bp += L; break;
             case NodeKind::BUBBLE_H1: out_h1_bp     += L; break;
@@ -108,7 +108,7 @@ void BalanceQc::check(
     };
 
     for (const auto& u : unitigs) {
-        const Position L = static_cast<Position>(u.seq.size());
+        const Position L = u.length_bp;
         const double Ld = static_cast<double>(L);
         switch (u.kind) {
             case NodeKind::SHARED:    win_shared += Ld; break;

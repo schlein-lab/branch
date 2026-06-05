@@ -1,19 +1,15 @@
 #include "phase_engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <unordered_map>
 
 namespace branch::wg::phaser {
 
 namespace {
-
-inline std::uint64_t hash64(std::uint64_t x) {
-    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33; return x;
-}
 
 inline std::uint8_t base_code(char c) {
     switch (c) {
@@ -25,8 +21,12 @@ inline std::uint8_t base_code(char c) {
     }
 }
 
-void scan_kmer_hashes(const std::string& seq, int k,
-                      std::vector<std::uint64_t>& out) {
+// Emit each k-mer as its canonical 2-bit-packed form (NOT a hash). Must
+// stay byte-identical with the router's `canonical_kmer_bits()` since
+// the het_pair table on the consumer side keys on those raw bits — any
+// extra hashing here breaks lookup (v13 measurement: votes 0/0).
+void scan_canonical_kmers(const std::string& seq, int k,
+                          std::vector<std::uint64_t>& out) {
     out.clear();
     if (static_cast<int>(seq.size()) < k) return;
     const std::uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
@@ -40,7 +40,7 @@ void scan_kmer_hashes(const std::string& seq, int k,
         rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << (2 * (k - 1)));
         ++valid;
         if (valid >= k) {
-            out.push_back(hash64(std::min(fwd, rev)));
+            out.push_back(std::min(fwd, rev));
         }
     }
     std::sort(out.begin(), out.end());
@@ -50,9 +50,15 @@ void scan_kmer_hashes(const std::string& seq, int k,
 }  // namespace
 
 void PhaseEngine::prepare(
-    const std::vector<std::pair<ReadId, std::string>>& reads,
+    FastqIndex& reads,
     const std::vector<HetPair>& het_pairs)
 {
+    auto t_start = std::chrono::steady_clock::now();
+    const std::size_t N = reads.n_reads();
+    std::cerr << "[phaser/pe] prepare: indexing " << het_pairs.size()
+              << " het-pairs over " << N << " reads\n";
+    std::fflush(stderr);
+
     // Map allele-A/B kmer hashes → (hetpair_idx, allele)
     std::unordered_map<std::uint64_t, std::pair<std::uint32_t, std::uint8_t>>
         allele_lut;
@@ -61,16 +67,33 @@ void PhaseEngine::prepare(
         allele_lut[het_pairs[i].kmer_a] = {static_cast<std::uint32_t>(i), 0};
         allele_lut[het_pairs[i].kmer_b] = {static_cast<std::uint32_t>(i), 1};
     }
+    // Snapshot anchor nodes — needed in run_iteration for anchor-based
+    // voting after het_pairs goes out of scope.
+    hetpair_anchors_.clear();
+    hetpair_anchors_.reserve(het_pairs.size());
+    for (const auto& hp : het_pairs) {
+        hetpair_anchors_.push_back(hp.anchor_node);
+    }
 
-    // Find the largest read_id to size the signatures array.
-    ReadId max_id = 0;
-    for (auto& [rid, _] : reads) max_id = std::max(max_id, rid);
-    read_signatures_.assign(static_cast<std::size_t>(max_id) + 1, {});
+    // ReadId == sequential 0..N-1 from FastqIndex; signatures aligned.
+    read_signatures_.assign(N, {});
 
     std::vector<std::uint64_t> hashes;
-    int k = 21;  // het-pair k-mer size, must match Phase 0 settings
-    for (const auto& [rid, seq] : reads) {
-        scan_kmer_hashes(seq, k, hashes);
+    const int k = 21;  // het-pair k-mer size, must match Phase 0 settings
+    std::size_t processed = 0;
+    reads.for_each([&](ReadId rid, const std::string& seq) {
+        if (processed % 200'000 == 0 && processed > 0) {
+            const double el = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            std::fprintf(stderr,
+                "[phaser/pe] prepare %zu/%zu (%.1f%%) elapsed=%.0fs\n",
+                processed, N,
+                100.0 * static_cast<double>(processed) /
+                static_cast<double>(N), el);
+            std::fflush(stderr);
+        }
+        scan_canonical_kmers(seq, k, hashes);
+        if (rid >= read_signatures_.size()) return;
         auto& sig = read_signatures_[rid];
         sig.clear();
         for (auto h : hashes) {
@@ -79,7 +102,8 @@ void PhaseEngine::prepare(
                 sig.emplace_back(it->second.first, it->second.second);
             }
         }
-    }
+        ++processed;
+    });
 }
 
 PhaseEngineProgress PhaseEngine::run_iteration(
@@ -118,69 +142,99 @@ PhaseEngineProgress PhaseEngine::run_iteration(
         }
     }
 
-    // Per-bubble per-alt vote totals: votes[b.id][alt] = total het-pair
-    // evidence summed over all reads sitting on that alt's nodes.
-    struct AltScore { std::uint64_t allele0 = 0; std::uint64_t allele1 = 0; };
-    std::unordered_map<std::uint64_t, AltScore> bubble_alt_scores;
-    auto key = [](BubbleId b, std::uint8_t a) {
-        return (static_cast<std::uint64_t>(b) << 8) | a;
+    // v0.10 Variante B: bubble_voter has already done the read→alt
+    // assignment by sequence similarity. We consume Bubble.read_counts
+    // directly — no per-iteration re-counting from home_node.
+    //
+    // For each bubble:
+    //   - Total reads supporting this bubble = sum(read_counts)
+    //   - Per-alt support = read_counts[alt_idx]
+    //   - We decide using these directly; het-pair signatures stay
+    //     available only for B-3 (molecular-clock cross-check), not
+    //     used here.
+    std::uint64_t total_supporting = 0;
+    for (const auto& b : bubbles) {
+        for (auto c : b.read_counts) total_supporting += c;
+    }
+    std::cerr << "[phaser/pe] voter input: " << total_supporting
+              << " reads attributed across " << bubbles.size() << " bubbles\n";
+    std::fflush(stderr);
+
+    // Helper: walk an alt-path and tag its interior nodes (skipping
+    // anchors, which stay UNCLASSIFIED → SHARED).
+    auto tag_alt = [&](const Bubble& b, NodeId start, NodeKind kind) {
+        NodeId cur = start;
+        int guard = 0;
+        while (cur != b.sink_anchor && cur < unitigs.size() && guard++ < 64) {
+            if (unitigs[cur].kind == NodeKind::UNCLASSIFIED) {
+                unitigs[cur].kind = kind;
+            }
+            if (unitigs[cur].next_nodes.empty()) break;
+            cur = unitigs[cur].next_nodes[0];
+        }
     };
 
-    for (auto& a : assignments) {
-        if (a.tag != ReadTag::UNTAGGED) continue;
-        if (a.read_id >= read_signatures_.size()) continue;
-        if (a.home_node >= unitigs.size()) continue;
-        auto it = node_to_alt.find(a.home_node);
-        if (it == node_to_alt.end()) continue;
-        for (auto& [hp_idx, allele] : read_signatures_[a.read_id]) {
-            auto& s = bubble_alt_scores[key(it->second.first,
-                                            it->second.second)];
-            if (allele == 0) ++s.allele0; else ++s.allele1;
+    // Decide each bubble: dispatch on BubbleType (set by classifier from
+    // voter VAFs). Voter+classifier already answered "what is this
+    // bubble?" via sequence-similarity read attribution; phase_engine
+    // only does the final node-kind tagging.
+    //
+    //   HET (D0)        [50, 50]            → alt 0 → H1, alt 1 → H2
+    //   BRANCH (D1)     [50, 25, 25]        → parent → H1, children → BRANCH
+    //   BIB (D2)        [50, 25, 12.5, 12.5]→ parent → H1, 3 children → BRANCH
+    //   TRIALLELIC / NOISY / UNKNOWN        → skip
+    //
+    // H1/H2 labels are per-bubble arbitrary (consistent only by parent_alt
+    // = highest VAF). The anchored phaser flips globally when needed.
+    for (auto& b : bubbles) {
+        if (b.phased) continue;
+
+        std::uint64_t total = 0;
+        for (auto c : b.read_counts) total += c;
+        if (total < static_cast<std::uint64_t>(opts.min_supporting_overlaps)) {
+            continue;
+        }
+
+        if (b.type == BubbleType::HET && b.alt_paths.size() == 2) {
+            tag_alt(b, b.alt_paths[0], NodeKind::BUBBLE_H1);
+            tag_alt(b, b.alt_paths[1], NodeKind::BUBBLE_H2);
+            b.phased = true;
+            ++p.bubbles_newly_phased;
+        } else if ((b.type == BubbleType::BRANCH ||
+                    b.type == BubbleType::BRANCH_IN_BRANCH)
+                   && b.parent_alt < b.alt_paths.size()) {
+            for (std::size_t a = 0; a < b.alt_paths.size(); ++a) {
+                NodeKind k = (a == b.parent_alt) ? NodeKind::BUBBLE_H1
+                                                 : NodeKind::BRANCH;
+                tag_alt(b, b.alt_paths[a], k);
+            }
+            b.phased = true;
+            ++p.bubbles_newly_phased;
         }
     }
 
-    // Decide each bubble: alt with strongest skewed vote becomes
-    // BUBBLE_H1; the other BUBBLE_H2. Untied/insufficient: leave unphased.
+    // Build node → branch_idx map for BRANCH-classified bubbles. Each
+    // non-parent alt of every BRANCH / BRANCH_IN_BRANCH bubble gets a
+    // unique branch_idx (globally across the run) so that downstream
+    // output can emit branch_0.fa, branch_1.fa, …
+    std::unordered_map<NodeId, std::uint32_t> node_to_branch_idx;
+    std::uint32_t next_branch_idx = 0;
     for (auto& b : bubbles) {
-        if (b.phased) continue;
-        if (b.alt_paths.size() != 2) continue;  // skip multi-allelic for v1
-
-        AltScore s0 = bubble_alt_scores[key(b.id, 0)];
-        AltScore s1 = bubble_alt_scores[key(b.id, 1)];
-        const std::uint64_t total0 = s0.allele0 + s0.allele1;
-        const std::uint64_t total1 = s1.allele0 + s1.allele1;
-        if (total0 < static_cast<std::uint64_t>(opts.min_supporting_overlaps)
-         || total1 < static_cast<std::uint64_t>(opts.min_supporting_overlaps)) {
-            continue;
-        }
-        // alt 0 prefers allele X; alt 1 prefers allele Y. If both prefer
-        // the same allele, the bubble isn't really diploid → skip.
-        const auto winner0 = (s0.allele0 >= s0.allele1) ? 0 : 1;
-        const auto winner1 = (s1.allele0 >= s1.allele1) ? 0 : 1;
-        if (winner0 == winner1) continue;
-        const double r0 = static_cast<double>(std::max(s0.allele0, s0.allele1)) /
-                          static_cast<double>(total0);
-        const double r1 = static_cast<double>(std::max(s1.allele0, s1.allele1)) /
-                          static_cast<double>(total1);
-        if (r0 < opts.min_ratio || r1 < opts.min_ratio) continue;
-
-        // Phase: alt 0 → BUBBLE_H1, alt 1 → BUBBLE_H2.
-        // Walk each alt path, tag intermediate unitigs.
-        auto tag_alt = [&](NodeId start, NodeKind kind) {
-            NodeId cur = start;
+        if (b.type != BubbleType::BRANCH &&
+            b.type != BubbleType::BRANCH_IN_BRANCH) continue;
+        for (std::size_t a = 0; a < b.alt_paths.size(); ++a) {
+            if (a == b.parent_alt) continue;
+            NodeId cur = b.alt_paths[a];
             int guard = 0;
             while (cur != b.sink_anchor && cur < unitigs.size() && guard++ < 64) {
-                if (unitigs[cur].kind == NodeKind::UNCLASSIFIED) {
-                    unitigs[cur].kind = kind;
+                if (unitigs[cur].kind == NodeKind::BRANCH) {
+                    node_to_branch_idx[cur] = next_branch_idx;
                 }
                 if (unitigs[cur].next_nodes.empty()) break;
                 cur = unitigs[cur].next_nodes[0];
             }
-        };
-        tag_alt(b.alt_paths[0], NodeKind::BUBBLE_H1);
-        tag_alt(b.alt_paths[1], NodeKind::BUBBLE_H2);
-        b.phased = true;
-        ++p.bubbles_newly_phased;
+            ++next_branch_idx;
+        }
     }
 
     // Per-read tag: based on home_node kind.
@@ -193,7 +247,14 @@ PhaseEngineProgress PhaseEngine::run_iteration(
             case NodeKind::SHARED:    t = ReadTag::SHARED; break;
             case NodeKind::BUBBLE_H1: t = ReadTag::H1_ONLY; break;
             case NodeKind::BUBBLE_H2: t = ReadTag::H2_ONLY; break;
-            case NodeKind::BRANCH:    t = ReadTag::BRANCH; break;
+            case NodeKind::BRANCH: {
+                t = ReadTag::BRANCH;
+                auto it = node_to_branch_idx.find(a.home_node);
+                if (it != node_to_branch_idx.end()) {
+                    a.branch_idx = it->second;
+                }
+                break;
+            }
             default: break;
         }
         if (t != ReadTag::UNTAGGED) {
@@ -217,6 +278,73 @@ PhaseEngineProgress PhaseEngine::run_iteration(
         if (a.tag == ReadTag::UNTAGGED) ++p.reads_still_untagged;
     }
     return p;
+}
+
+void PhaseEngine::apply_voter_outcomes(
+    const std::vector<UnitigNode>& unitigs,
+    const std::vector<Bubble>& bubbles,
+    const std::vector<VoterReadOutcome>& outcomes,
+    std::vector<ReadAssignment>& assignments)
+{
+    // Map alt-head NodeId → NodeKind for fast lookup. (Bubble alt-paths
+    // hold the head NodeId of each path; its kind was stamped by
+    // run_iteration based on classifier output.)
+    std::unordered_map<NodeId, NodeKind> alt_head_kind;
+    for (const auto& b : bubbles) {
+        for (NodeId head : b.alt_paths) {
+            if (head < unitigs.size()) {
+                alt_head_kind[head] = unitigs[head].kind;
+            }
+        }
+    }
+
+    std::size_t n_overrides_h1 = 0, n_overrides_h2 = 0,
+                n_overrides_branch = 0, n_bridge = 0, n_novel = 0;
+    for (auto& a : assignments) {
+        if (a.read_id >= outcomes.size()) continue;
+        const auto& o = outcomes[a.read_id];
+        switch (o.kind) {
+            case VoterReadOutcome::ASSIGNED: {
+                if (o.primary_bubble >= bubbles.size()) break;
+                const auto& b = bubbles[o.primary_bubble];
+                if (o.primary_alt >= b.alt_paths.size()) break;
+                NodeId head = b.alt_paths[o.primary_alt];
+                auto it = alt_head_kind.find(head);
+                if (it == alt_head_kind.end()) break;
+                switch (it->second) {
+                    case NodeKind::BUBBLE_H1:
+                        a.tag = ReadTag::H1_ONLY; ++n_overrides_h1; break;
+                    case NodeKind::BUBBLE_H2:
+                        a.tag = ReadTag::H2_ONLY; ++n_overrides_h2; break;
+                    case NodeKind::BRANCH:
+                        a.tag = ReadTag::BRANCH; ++n_overrides_branch; break;
+                    default: break;  // bubble didn't phase → keep prior tag
+                }
+                a.branch_path = {o.primary_bubble, o.primary_alt};
+                a.confidence = 1.0f;
+                break;
+            }
+            case VoterReadOutcome::BRIDGE:
+                a.tag = ReadTag::BRANCH_BRIDGE;
+                a.confidence = 0.5f;  // by definition not committed to one alt
+                ++n_bridge;
+                break;
+            case VoterReadOutcome::NOVEL:
+                a.tag = ReadTag::BRANCH_NOVEL;
+                a.confidence = 0.5f;
+                ++n_novel;
+                break;
+            case VoterReadOutcome::ABSENT:
+                break;  // leave whatever home_node-based tagging produced
+        }
+    }
+    std::cerr << "[phaser/pe] voter→tag bridge: "
+              << "h1=" << n_overrides_h1
+              << " h2=" << n_overrides_h2
+              << " branch=" << n_overrides_branch
+              << " bridge=" << n_bridge
+              << " novel=" << n_novel << "\n";
+    std::fflush(stderr);
 }
 
 }  // namespace branch::wg::phaser

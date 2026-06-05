@@ -9,6 +9,8 @@
 // stay as UNCERTAIN regions.
 
 #include "types.hpp"
+#include "fastq_index.hpp"
+#include "bubble_voter.hpp"
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -43,7 +45,8 @@ class PhaseEngine {
 public:
     // Called once after overlap_graph; precomputes per-read het-pair
     // signatures so subsequent iterations don't re-extract them.
-    void prepare(const std::vector<std::pair<ReadId, std::string>>& reads,
+    // Streams sequences from the FastqIndex sequentially.
+    void prepare(FastqIndex& reads,
                  const std::vector<HetPair>& het_pairs);
 
     // Run one iteration of tagging. Updates `assignments` in place
@@ -55,10 +58,35 @@ public:
         std::vector<ReadAssignment>& assignments,
         const PhaseEngineOpts& opts);
 
+    // Bridge: take per-read voter outcomes and write them into
+    // assignments. This OVERRIDES home_node-based tags so that every
+    // read assigned/bridged/marked-novel by the voter gets the
+    // corresponding ReadTag, regardless of where its home_node sat.
+    //
+    // Priority (per read):
+    //   ASSIGNED → tag from primary bubble's alt kind (H1/H2/BRANCH)
+    //   BRIDGE   → BRANCH_BRIDGE (CNV-junction)
+    //   NOVEL    → BRANCH_NOVEL  (deep sub-branch candidate)
+    //   ABSENT   → don't touch (home_node-based tagging took over,
+    //              usually SHARED in homozygous regions)
+    static void apply_voter_outcomes(
+        const std::vector<UnitigNode>& unitigs,
+        const std::vector<Bubble>& bubbles,
+        const std::vector<VoterReadOutcome>& outcomes,
+        std::vector<ReadAssignment>& assignments);
+
 private:
     // Sparse: read_signatures_[i] is a list of (hetpair_idx, allele 0/1).
     std::vector<std::vector<std::pair<std::uint32_t, std::uint8_t>>>
         read_signatures_;
+
+    // hetpair_anchors_[hp_idx] = HetPair.anchor_node. Used by run_iteration
+    // to attribute each (signature, allele) to the bubble whose alt-path
+    // contains the anchor. This decouples voting from home_node — at WG
+    // scale a read's home_node is one of many unitigs it spans, so
+    // home_node-based voting starves bubble alts of evidence (v11: 12.7K
+    // votes over 2550 bubbles → 0 phased).
+    std::vector<NodeId> hetpair_anchors_;
 };
 
 }  // namespace branch::wg::phaser

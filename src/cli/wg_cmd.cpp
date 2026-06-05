@@ -67,6 +67,13 @@ struct WgArgs {
     // — all from src/wg/phaser/. When set, downstream legacy phases
     // are skipped.
     bool use_phaser = false;
+    // v0.8 dual-phaser: optional pangenome-anchored second track.
+    std::string ref_hap1;
+    std::string ref_hap2;
+    // v0.10: GFA emission disabled by default at WG scale (see
+    // out_gfa_path setup below). Opt-in via --emit-gfa for small inputs
+    // or after gfa_writer's bulk-IO refactor.
+    bool emit_gfa = false;
     bool ok = false;
     std::string err;
 };
@@ -88,6 +95,9 @@ WgArgs parse_wg_args(int argc, char** argv) {
         else if (k == "--no-ref-annotation") { a.do_ref = false; }
         else if (k == "--no-gpu")     { a.no_gpu = true; }
         else if (k == "--use-phaser") { a.use_phaser = true; }
+        else if (k == "--ref-hap1")   { auto v = need("--ref-hap1"); if (!v) return a; a.ref_hap1 = v; }
+        else if (k == "--ref-hap2")   { auto v = need("--ref-hap2"); if (!v) return a; a.ref_hap2 = v; }
+        else if (k == "--emit-gfa")   { a.emit_gfa = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
     }
@@ -268,13 +278,12 @@ int run_wg(int argc, char** argv) {
                   << " het-pair kmer tuples\n";
 
         branch::wg::phaser::ReadsInput pin;
-        pin.reads.reserve(reads.size());
-        pin.read_id_strings.reserve(reads.size());
-        for (std::uint32_t i = 0; i < reads.size(); ++i) {
-            pin.reads.emplace_back(i, std::move(reads[i].second));
-            pin.read_id_strings.push_back(std::move(reads[i].first));
-        }
+        // Free the upstream in-memory reads vector NOW, before the
+        // phaser opens its own FastqIndex on the same FASTQ. With WG-HiFi
+        // the upstream vector holds ~60 GB; keeping both alive while the
+        // phaser sketches doubles the floor.
         std::vector<std::pair<std::string, std::string>>().swap(reads);
+        pin.fastq_path = args.reads;
 
         pin.het_pairs.reserve(het_kmers.size());
         for (const auto& [a, b] : het_kmers) {
@@ -294,14 +303,42 @@ int run_wg(int argc, char** argv) {
         popts.minimizer_w = 23;
         popts.min_overlap_bp = 1000;
         popts.min_jaccard = 0.30;
-        popts.iter1_min_supporting = 10;
-        popts.iter1_min_ratio = 0.85;
+        // v0.10: anchor-based voting (see phase_engine.cpp) lets every
+        // het-pair signature contribute, so per-alt evidence is no longer
+        // bottlenecked by home_node sparsity. Lowered min_supporting from
+        // 10→3 to match: HiFi at 30× expects ~30 reads/alt — we can ask
+        // for at least 3 signatures and still have margin.
+        popts.iter1_min_supporting = 3;
+        popts.iter1_min_ratio = 0.80;
         popts.imbalance_warn = 0.05;
         popts.imbalance_err = 0.20;
-        popts.out_gfa_path             = args.out_prefix + ".gfa";
+        // GFA emission is O(n_unitigs × per-unitig random IO). v14 measured
+        // 26 S-lines/sec → 23h for WG (2.17M unitigs) — would have failed
+        // 12h SLURM limit. Disable by default; user can opt in via
+        // explicit --emit-gfa once gfa_writer is bulk-IO-refactored.
+        popts.out_gfa_path             = args.emit_gfa
+                                            ? args.out_prefix + ".gfa"
+                                            : "";
         popts.out_h1_fa_path           = args.out_prefix + ".h1.fa";
         popts.out_h2_fa_path           = args.out_prefix + ".h2.fa";
+        popts.out_branch_fa_path       = args.out_prefix + ".branch.fa";
+        popts.out_bridge_fa_path       = args.out_prefix + ".bridge.fa";
+        popts.out_novel_fa_path        = args.out_prefix + ".novel.fa";
         popts.out_assignments_tsv_path = args.out_prefix + ".assignments.tsv";
+        // v0.8 dual-phaser passthrough.
+        popts.ref_hap1_fa_path = args.ref_hap1;
+        popts.ref_hap2_fa_path = args.ref_hap2;
+        popts.anchored_n_threads = args.threads;
+        // Anchored-phaser LLmap preset must match read tech. v12 chr14
+        // smoke-tested map-hifi vs ONT data and lost ~92% of reads to
+        // UNCERTAIN — preset mismatch is fatal for the anchored track.
+        popts.anchored_preset = (args.read_tech == "ont")
+                                    ? "map-ont"
+                                    : "map-hifi";
+        if (!args.ref_hap1.empty() && !args.ref_hap2.empty()) {
+            popts.out_reconciled_tsv_path =
+                args.out_prefix + ".reconciled.tsv";
+        }
 
         auto pres = branch::wg::phaser::run(pin, popts);
         std::cerr << "[wg] phaser summary: "

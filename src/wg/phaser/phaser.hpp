@@ -47,8 +47,31 @@ struct PhaserOpts {
     std::string out_gfa_path;
     std::string out_h1_fa_path;
     std::string out_h2_fa_path;
+    std::string out_branch_fa_path;
+    std::string out_bridge_fa_path;
+    std::string out_novel_fa_path;
     std::string out_assignments_tsv_path;
     std::string out_qc_bed_path;
+
+    // ---- v0.8 dual-phaser: optional pangenome-anchored second track ----
+    //
+    // When ref_hap1_fa_path AND ref_hap2_fa_path are both set, BRANCH
+    // runs a second phaser that aligns reads against the pangenome
+    // reference assemblies. The two assignment vectors then go into the
+    // Reconciler, which agrees / neural-resolves / flags per read.
+    //
+    // HPRC is not ground-truth — it's a fast first model. The point of
+    // running both is to expose disagreement, which is itself biological
+    // signal.
+    std::string ref_hap1_fa_path;
+    std::string ref_hap2_fa_path;
+    std::string out_reconciled_tsv_path;  // emits reconciled assignments
+                                          // with provenance column
+    int         anchored_n_threads = 8;
+    int         anchored_min_align_score = 200;
+    double      anchored_hap_call_margin = 0.10;
+    std::string anchored_preset = "map-hifi";  // or "map-ont" for ONT
+    std::string neural_voter_model_path;  // v0.9; empty for now
 };
 
 // Iteration log: one entry per build pass. Refinement gets its own
@@ -73,10 +96,19 @@ struct PhaserResult {
     PhaserStats                 stats;
 };
 
-// Reads passed in as id-sequence pairs. Sequences may be released by the
-// caller after run() returns; the PhaserResult holds only consensus
-// sequences in unitigs, never raw read sequences.
+// Reads passed in either as a path to a (gz)FASTQ on disk OR as an
+// in-memory id/sequence vector for unit tests. The pipeline opens the
+// FASTQ once, builds an offset index, and loads sequences on demand —
+// the full dataset is never held in RAM simultaneously.
+//
+// At WG-HiFi scale this is critical: 4M reads × 15 KB ≈ 60 GB. The old
+// vector-resident layout forced peak RSS up to the 140 GB SLURM cap.
 struct ReadsInput {
+    // Preferred for production runs. If non-empty, the in-memory vector
+    // is ignored and the file is indexed.
+    std::string fastq_path;
+
+    // Test path: in-memory reads. Used when fastq_path is empty.
     std::vector<std::pair<ReadId, std::string>> reads;
     std::vector<std::string> read_id_strings;   // ReadId index → name
 
