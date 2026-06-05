@@ -1,5 +1,5 @@
 // BRANCH — Reference Aligner
-// Wrapper around minimap2/ksw2 for query-vs-reference alignment.
+// Query-vs-reference alignment via the LLmap classical engine.
 
 #pragma once
 
@@ -14,7 +14,7 @@ namespace branch::align {
 
 /// Result of aligning a query sequence against a reference.
 struct AlignmentResult {
-    int32_t score{0};           ///< Alignment score (ksw2 score)
+    int32_t score{0};           ///< Alignment score (LLmap classical score)
     float identity{0.0f};       ///< Sequence identity (matches / alignment_length)
     std::string cigar;          ///< CIGAR string
     int32_t ref_start{0};       ///< Reference start position (0-based)
@@ -23,7 +23,7 @@ struct AlignmentResult {
     int32_t query_end{0};       ///< Query end position (exclusive)
 };
 
-/// Reference aligner using minimap2/ksw2.
+/// Reference aligner using the LLmap classical engine.
 ///
 /// Usage:
 ///   ReferenceAligner aligner("reference.fa");

@@ -1,5 +1,5 @@
 // BRANCH v0.4 — Linear reference mapper for `branch project`.
-// Shell-out to minimap2 per branch, parse PAF, return mappings.
+// Maps branch contigs against linear references via the LLmap classical engine.
 
 #ifndef BRANCH_PROJECT_LINEAR_MAPPER_HPP
 #define BRANCH_PROJECT_LINEAR_MAPPER_HPP
@@ -29,16 +29,14 @@ struct LinearRef {
 };
 
 struct LinearMapOptions {
-    std::string minimap2_path = "minimap2";
-    std::string preset = "asm20";        // HiFi-vs-ref default
+    std::string preset = "asm20";        // contig-vs-ref divergence preset
     int threads = 4;
     int min_mapq = 0;                    // emit all; caller filters UNANNOTATED
 };
 
-// Map one branch FASTA against all given linear refs. Returns mappings sorted
-// by (ref_name, query_start). Shell-out to minimap2 preset (asm20) — one call
-// per (branch-FASTA x ref) pair. Caller is responsible for iterating over
-// branches; this maps EVERY branch in fasta_path against EVERY ref.
+// Map one branch FASTA against all given linear refs via the LLmap classical
+// engine. Returns mappings sorted by (ref_name, branch_id, query_start). Maps
+// EVERY branch in fasta_path against EVERY ref (one minimizer index per ref).
 std::vector<LinearMapping> map_branches_linear(
     const std::string& fasta_path,
     const std::vector<LinearRef>& refs,

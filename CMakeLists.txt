@@ -129,32 +129,58 @@ endif()
 find_package(OpenMP REQUIRED)
 
 # ------------------------------------------------------------------------------
-# minimap2 (FetchContent for ksw2 alignment)
+# LLmap — alignment engine (replaces the former minimap2/ksw2 dependency).
+#
+# BRANCH consumes LLmap's `classical` static libraries (gap-affine WFA2/Gotoh
+# pairwise alignment + seed-chain-extend mapping). There is NO minimap2 in the
+# build any more, and no network FetchContent — the build is fully offline.
+#
+# Point the build at a checked-out + built LLmap tree:
+#   -DBRANCH_LLMAP_DIR=<llmap source root>   (headers, expects <dir>/src)
+#   -DBRANCH_LLMAP_BUILD_DIR=<llmap build>   (static libs, expects <dir>/src)
+# Pin the LLmap commit for reproducibility (recorded in docs/llmap-pin.md).
 # ------------------------------------------------------------------------------
-include(FetchContent)
-FetchContent_Declare(
-    minimap2
-    GIT_REPOSITORY https://github.com/lh3/minimap2.git
-    GIT_TAG        v2.28
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(minimap2)
+find_package(Threads REQUIRED)
 
-# Create static library for ksw2 alignment (compiled from minimap2 C sources)
-# We need ksw2_extz2_sse.c and kalloc.c for the ksw_extz2_sse function.
-add_library(branch_minimap2 STATIC
-    "${minimap2_SOURCE_DIR}/ksw2_extz2_sse.c"
-    "${minimap2_SOURCE_DIR}/kalloc.c"
-)
-target_include_directories(branch_minimap2 SYSTEM PUBLIC "${minimap2_SOURCE_DIR}")
-# Disable warnings for vendored C code
-target_compile_options(branch_minimap2 PRIVATE -w)
+set(BRANCH_LLMAP_DIR "" CACHE PATH "LLmap source tree root (for headers)")
+set(BRANCH_LLMAP_BUILD_DIR "" CACHE PATH "Built LLmap tree (for static libs)")
+if(NOT BRANCH_LLMAP_DIR OR NOT BRANCH_LLMAP_BUILD_DIR)
+    message(FATAL_ERROR
+        "BRANCH requires LLmap. Configure with:\n"
+        "  -DBRANCH_LLMAP_DIR=<llmap source root>\n"
+        "  -DBRANCH_LLMAP_BUILD_DIR=<llmap build dir>")
+endif()
+if(NOT EXISTS "${BRANCH_LLMAP_DIR}/src/classical/wfa2_aligner.h")
+    message(FATAL_ERROR
+        "BRANCH_LLMAP_DIR='${BRANCH_LLMAP_DIR}' does not look like an LLmap "
+        "source tree (missing src/classical/wfa2_aligner.h)")
+endif()
+
+add_library(branch_llmap INTERFACE)
+target_include_directories(branch_llmap SYSTEM INTERFACE "${BRANCH_LLMAP_DIR}/src")
+# classical depends on annot, checkpoint and core (the pipeline consults a
+# checkpoint dispatcher). Resolve any inter-archive ordering with a linker
+# group rather than relying on a hand-maintained order.
+set(_branch_llmap_libs "")
+foreach(_ll classical annot checkpoint core)
+    find_library(BRANCH_LLMAP_LIB_${_ll}
+        NAMES llmap_${_ll}
+        PATHS "${BRANCH_LLMAP_BUILD_DIR}/src" "${BRANCH_LLMAP_BUILD_DIR}/lib"
+        NO_DEFAULT_PATH REQUIRED)
+    list(APPEND _branch_llmap_libs "${BRANCH_LLMAP_LIB_${_ll}}")
+endforeach()
+target_link_libraries(branch_llmap INTERFACE
+    -Wl,--start-group ${_branch_llmap_libs} -Wl,--end-group
+    Threads::Threads)
 
 # Subdirectories
 # ------------------------------------------------------------------------------
+# Enable testing at the top level so add_test() calls in subdirectories (the
+# standalone phaser + align unit tests, gated on BUILD_TESTING) register into
+# the root CTest run. The heavier GoogleTest suite stays behind BRANCH_BUILD_TESTS.
+enable_testing()
 add_subdirectory(src)
 
 if(BRANCH_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(tests)
 endif()

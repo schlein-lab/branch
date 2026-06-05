@@ -1,89 +1,68 @@
 // BRANCH v0.4 — Linear reference mapper implementation.
 //
-// Shell-out to minimap2 per (branch FASTA x ref) pair, parse PAF output,
-// return merged mappings sorted by (ref_name, query_start).
+// Maps every branch consensus contig against each linear reference
+// (CHM13, GRCh38, ...) via the in-process LLmap classical engine
+// (branch::align::llmap_backend::ReferenceMapper). No minimap2 subprocess,
+// no PAF round-trip.
 
 #include "linear_mapper.hpp"
+#include "../align/llmap_align_backend.hpp"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <zlib.h>
 
 namespace branch::project {
 
 namespace {
 
-// Check if a path contains unsafe shell characters.
-// Returns true if safe, false if dangerous.
-bool is_safe_shell_path(const std::string& path) {
-    for (char c : path) {
-        if (c == '\0' || c == '\'' || c == '"' || c == '$' || c == '`' || c == '\\') {
-            return false;
+// Minimal gz-aware FASTA reader → (name, sequence) records. Name is the
+// header up to the first whitespace.
+std::vector<std::pair<std::string, std::string>>
+read_fasta_named(const std::string& path) {
+    std::vector<std::pair<std::string, std::string>> out;
+    gzFile fp = gzopen(path.c_str(), "rb");
+    if (!fp) return out;
+
+    constexpr int kBuf = 1 << 16;
+    std::vector<char> buf(kBuf);
+    std::string line, name, seq;
+    auto flush = [&]() {
+        if (!name.empty() || !seq.empty()) out.emplace_back(name, seq);
+        name.clear();
+        seq.clear();
+    };
+    auto take_header = [&](const std::string& l) {
+        flush();
+        std::size_t sp = l.find_first_of(" \t");
+        name = l.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
+    };
+
+    int n;
+    while ((n = gzread(fp, buf.data(), kBuf)) > 0) {
+        for (int i = 0; i < n; ++i) {
+            char c = buf[i];
+            if (c == '\n') {
+                if (!line.empty()) {
+                    if (line[0] == '>') take_header(line);
+                    else seq += line;
+                }
+                line.clear();
+            } else if (c != '\r') {
+                line += c;
+            }
         }
     }
-    return true;
-}
-
-// Parse a single PAF line into a LinearMapping.
-// PAF format (tab-separated):
-//   0: query_name, 1: query_len, 2: qstart, 3: qend, 4: strand (+/-),
-//   5: target_name, 6: target_len, 7: tstart, 8: tend, 9: n_matches,
-//   10: alignment_block_len, 11: mapq, 12+: optional tags
-// Returns true on success, false on parse error.
-bool parse_paf_line(const std::string& line, const std::string& ref_name,
-                    LinearMapping& out) {
-    if (line.empty() || line[0] == '#') {
-        return false;
+    if (!line.empty()) {
+        if (line[0] == '>') take_header(line);
+        else seq += line;
     }
-
-    std::istringstream iss(line);
-    std::string query_name, strand_str, target_name;
-    std::int64_t query_len, qstart, qend, target_len, tstart, tend;
-    std::int64_t n_matches, block_len;
-    int mapq;
-
-    // Read all 12 mandatory PAF columns
-    if (!(iss >> query_name >> query_len >> qstart >> qend >> strand_str
-              >> target_name >> target_len >> tstart >> tend
-              >> n_matches >> block_len >> mapq)) {
-        return false;
-    }
-
-    // Validate strand
-    if (strand_str.empty() || (strand_str[0] != '+' && strand_str[0] != '-')) {
-        return false;
-    }
-
-    out.branch_id = query_name;
-    out.ref_name = ref_name;
-    out.target = target_name;
-    out.target_start = tstart;
-    out.target_end = tend;
-    out.mapq = mapq;
-    out.strand = strand_str[0];
-    out.query_len = query_len;
-    out.query_start = qstart;
-    out.query_end = qend;
-
-    return true;
-}
-
-// Build the minimap2 command line.
-std::string build_minimap2_cmd(const std::string& minimap2_path,
-                                const std::string& preset,
-                                int threads,
-                                const std::string& ref_path,
-                                const std::string& fasta_path) {
-    std::ostringstream cmd;
-    cmd << minimap2_path
-        << " -x " << preset
-        << " -t " << threads
-        << " '" << ref_path << "'"
-        << " '" << fasta_path << "'"
-        << " 2>/dev/null";
-    return cmd.str();
+    flush();
+    gzclose(fp);
+    return out;
 }
 
 }  // namespace
@@ -96,83 +75,48 @@ std::vector<LinearMapping> map_branches_linear(
 
     std::vector<LinearMapping> result;
 
-    // Validate paths for shell safety
-    if (!is_safe_shell_path(fasta_path)) {
-        if (err_out) {
-            *err_out = "fasta_path contains unsafe shell characters";
-        }
-        return result;
-    }
-
-    if (!is_safe_shell_path(opts.minimap2_path)) {
-        if (err_out) {
-            *err_out = "minimap2_path contains unsafe shell characters";
-        }
+    // Load the branch contigs once; they are queried against every reference.
+    auto branches = read_fasta_named(fasta_path);
+    if (branches.empty()) {
+        if (err_out) *err_out = "no branch sequences read from: " + fasta_path;
         return result;
     }
 
     for (const auto& ref : refs) {
-        if (!is_safe_shell_path(ref.path)) {
-            if (err_out) {
-                *err_out = "ref path '" + ref.name + "' contains unsafe shell characters";
-            }
-            return result;
+        // One minimizer index per reference. The preset name is passed
+        // through; ReferenceMapper maps non-ONT presets (asm5/asm20/map-hifi)
+        // onto its high-identity defaults, appropriate for same-species
+        // contig-vs-reference projection.
+        branch::align::llmap_backend::ReferenceMapper mapper(ref.path, opts.preset);
+        if (!mapper.valid()) {
+            if (err_out) *err_out = "failed to index reference: " + ref.name;
+            continue;  // try remaining refs
         }
-        if (!is_safe_shell_path(ref.name)) {
-            if (err_out) {
-                *err_out = "ref name '" + ref.name + "' contains unsafe shell characters";
+
+        for (const auto& [branch_id, seq] : branches) {
+            for (const auto& hit : mapper.all(seq)) {
+                if (static_cast<int>(hit.mapq) < opts.min_mapq) continue;
+                LinearMapping m;
+                m.branch_id    = branch_id;
+                m.ref_name     = ref.name;
+                m.target       = hit.ref_name;
+                m.target_start = hit.ref_start;
+                m.target_end   = hit.ref_end;
+                m.mapq         = static_cast<int>(hit.mapq);
+                m.strand       = hit.is_forward ? '+' : '-';
+                m.query_len    = static_cast<std::int64_t>(seq.size());
+                m.query_start  = hit.query_start;
+                m.query_end    = hit.query_end;
+                result.push_back(std::move(m));
             }
-            return result;
         }
     }
 
-    // Map against each reference
-    for (const auto& ref : refs) {
-        std::string cmd = build_minimap2_cmd(
-            opts.minimap2_path, opts.preset, opts.threads,
-            ref.path, fasta_path);
-
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) {
-            if (err_out) {
-                *err_out = "minimap2 not found or failed to execute: " + opts.minimap2_path;
-            }
-            return {};  // Return empty on failure
-        }
-
-        // Read and parse PAF output line by line
-        char buffer[8192];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            // Remove trailing newline
-            std::size_t len = std::strlen(buffer);
-            if (len > 0 && buffer[len - 1] == '\n') {
-                buffer[len - 1] = '\0';
-            }
-
-            LinearMapping mapping;
-            if (parse_paf_line(buffer, ref.name, mapping)) {
-                if (mapping.mapq >= opts.min_mapq) {
-                    result.push_back(std::move(mapping));
-                }
-            }
-        }
-
-        int status = pclose(pipe);
-        if (status != 0) {
-            // minimap2 exited non-zero — could be missing ref, but we continue
-            // to try other refs. Only error out if ALL refs fail.
-        }
-    }
-
-    // Sort by (ref_name, branch_id, query_start)
+    // Sort by (ref_name, branch_id, query_start).
     std::sort(result.begin(), result.end(),
               [](const LinearMapping& a, const LinearMapping& b) {
-                  if (a.ref_name != b.ref_name) {
-                      return a.ref_name < b.ref_name;
-                  }
-                  if (a.branch_id != b.branch_id) {
-                      return a.branch_id < b.branch_id;
-                  }
+                  if (a.ref_name != b.ref_name) return a.ref_name < b.ref_name;
+                  if (a.branch_id != b.branch_id) return a.branch_id < b.branch_id;
                   return a.query_start < b.query_start;
               });
 

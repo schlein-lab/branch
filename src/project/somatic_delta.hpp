@@ -55,15 +55,15 @@ std::vector<SomaticDelta> compute_somatic_deltas(
     const SomaticDeltaOptions& opts,
     std::string* err_out);
 
-/// Compute edit distance between two sequences using ksw2.
-/// This is the low-level alignment function.
+/// Compute edit distance between two sequences via the LLmap classical
+/// engine (gap-affine WFA2/Gotoh). This is the low-level alignment function.
 ///
 /// @param query    Query sequence
-/// @param target   Target/reference sequence  
+/// @param target   Target/reference sequence
 /// @param opts     Alignment options
 /// @param cigar_out  Output CIGAR string (optional)
 /// @return Edit distance
-int ksw2_edit_distance(
+int aligned_edit_distance(
     const std::string& query,
     const std::string& target,
     const SomaticDeltaOptions& opts,

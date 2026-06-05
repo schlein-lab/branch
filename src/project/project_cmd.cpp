@@ -48,7 +48,7 @@ void print_project_usage(std::ostream& os) {
           "                         Example: --ref-linear CHM13=/refs/chm13.mmi\n"
           "  --out-prefix <path>    Output prefix for result files\n"
           "\nOptional:\n"
-          "  --threads <N>          Thread count for minimap2 (default: 4)\n"
+          "  --threads <N>          Thread count for alignment (default: 4)\n"
           "  --min-mapq <N>         Minimum MAPQ for annotation (default: 0)\n"
           "                         Branches with no mapping >= min-mapq are marked unannotated.\n"
           "  --help                 Show this help\n"
