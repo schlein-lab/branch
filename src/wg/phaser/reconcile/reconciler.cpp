@@ -1,4 +1,5 @@
 #include "reconciler.hpp"
+#include "neural_features.hpp"
 
 #include <algorithm>
 #include <iostream>
@@ -28,6 +29,45 @@ inline std::size_t tag_idx(ReadTag t) {
 
 }  // namespace
 
+void Reconciler::neural_resolve(
+    const ReadAssignment& a,
+    const ReadAssignment& b,
+    ReconciledAssignment& out)
+{
+    const std::vector<float> probs = voter_.forward(make_feature_vector(a, b));
+    if (probs.size() != kVoterClasses) {
+        // Defensive: a malformed model output falls back to the heuristic
+        // rather than emitting a garbage call.
+        heuristic_resolve(a, b, out);
+        return;
+    }
+
+    // argmax over {PickA, PickB, Flag}.
+    std::uint32_t arg = 0;
+    for (std::uint32_t i = 1; i < kVoterClasses; ++i) {
+        if (probs[i] > probs[arg]) arg = i;
+    }
+    const float conf = probs[arg];
+
+    switch (static_cast<VoterClass>(arg)) {
+        case VoterClass::PickA:
+            out.source = PhaseSource::NEURAL_A;
+            out.tag_final = a.tag;
+            out.confidence = conf;
+            break;
+        case VoterClass::PickB:
+            out.source = PhaseSource::NEURAL_B;
+            out.tag_final = b.tag;
+            out.confidence = conf;
+            break;
+        case VoterClass::Flag:
+            out.source = PhaseSource::FLAGGED;
+            out.tag_final = ReadTag::UNCERTAIN;
+            out.confidence = conf;
+            break;
+    }
+}
+
 void Reconciler::heuristic_resolve(
     const ReadAssignment& a,
     const ReadAssignment& b,
@@ -35,8 +75,8 @@ void Reconciler::heuristic_resolve(
 {
     // No neural model loaded — fall back to confidence-weighted picking.
     // FLAG when both confidences are weak (genuine disagreement we can't
-    // adjudicate). This is the v0.8 default until v0.9's neural voter
-    // ships.
+    // adjudicate). Labelled HEURISTIC_* so it is never confused with a real
+    // model decision.
     const bool a_weak = a.confidence < kFlagConfidenceThreshold;
     const bool b_weak = b.confidence < kFlagConfidenceThreshold;
 
@@ -47,11 +87,11 @@ void Reconciler::heuristic_resolve(
         return;
     }
     if (a.confidence > b.confidence) {
-        out.source = PhaseSource::NEURAL_A;  // heuristic stand-in
+        out.source = PhaseSource::HEURISTIC_A;
         out.tag_final = a.tag;
         out.confidence = a.confidence;
     } else {
-        out.source = PhaseSource::NEURAL_B;
+        out.source = PhaseSource::HEURISTIC_B;
         out.tag_final = b.tag;
         out.confidence = b.confidence;
     }
@@ -71,15 +111,27 @@ void Reconciler::reconcile(
                   << " — using min, others marked FLAGGED\n";
     }
 
-    if (!opts.neural_model_path.empty()) {
-        // v0.9: load TorchScript / ONNX neural voter.
-        // For v0.8 we ship the heuristic fallback only.
-        std::cerr << "[reconcile] neural model path provided ("
-                  << opts.neural_model_path
-                  << ") but neural inference not yet wired in v0.8; "
-                     "using heuristic resolver.\n";
-    }
     neural_loaded_ = false;
+    if (!opts.neural_model_path.empty()) {
+        std::string err;
+        if (voter_.load(opts.neural_model_path, &err) &&
+            voter_.input_dim() == kFeatureDim &&
+            voter_.output_dim() == kVoterClasses) {
+            neural_loaded_ = true;
+            std::cerr << "[reconcile] neural voter loaded ("
+                      << opts.neural_model_path << ", in=" << voter_.input_dim()
+                      << " out=" << voter_.output_dim() << ")\n";
+        } else {
+            std::cerr << "[reconcile] WARN: could not use neural model '"
+                      << opts.neural_model_path << "' (";
+            if (!err.empty()) std::cerr << err;
+            else std::cerr << "expected in=" << kFeatureDim << " out="
+                           << kVoterClasses << ", got in=" << voter_.input_dim()
+                           << " out=" << voter_.output_dim();
+            std::cerr << "); falling back to heuristic resolver.\n";
+        }
+    }
+    stats_.model_used = neural_loaded_;
 
     const std::size_t n = std::min(assignments_a.size(), assignments_b.size());
     out.clear();
@@ -104,11 +156,14 @@ void Reconciler::reconcile(
             r.confidence = std::max(a.confidence, b.confidence);
             ++stats_.n_agreed;
         } else {
-            heuristic_resolve(a, b, r);
+            if (neural_loaded_) neural_resolve(a, b, r);
+            else                heuristic_resolve(a, b, r);
             switch (r.source) {
-                case PhaseSource::NEURAL_A: ++stats_.n_neural_a; break;
-                case PhaseSource::NEURAL_B: ++stats_.n_neural_b; break;
-                case PhaseSource::FLAGGED:  ++stats_.n_flagged;  break;
+                case PhaseSource::NEURAL_A:    ++stats_.n_neural_a;    break;
+                case PhaseSource::NEURAL_B:    ++stats_.n_neural_b;    break;
+                case PhaseSource::HEURISTIC_A: ++stats_.n_heuristic_a; break;
+                case PhaseSource::HEURISTIC_B: ++stats_.n_heuristic_b; break;
+                case PhaseSource::FLAGGED:     ++stats_.n_flagged;     break;
                 default: break;
             }
         }
@@ -123,8 +178,11 @@ void Reconciler::reconcile(
             : 0.0;
         std::cerr << "[reconcile] " << stats_.n_total << " reads | "
                   << "agreed=" << stats_.n_agreed << " (" << pct << "%) | "
-                  << "resolved_to_A=" << stats_.n_neural_a
-                  << " resolved_to_B=" << stats_.n_neural_b
+                  << (stats_.model_used ? "neural" : "heuristic")
+                  << " resolved_to_A="
+                  << (stats_.model_used ? stats_.n_neural_a : stats_.n_heuristic_a)
+                  << " resolved_to_B="
+                  << (stats_.model_used ? stats_.n_neural_b : stats_.n_heuristic_b)
                   << " flagged=" << stats_.n_flagged << "\n";
     }
 }

@@ -72,9 +72,12 @@ void test_strong_disagreement_picks_stronger() {
     ropts.verbose = false;
     r.reconcile(a, b, out, ropts);
     assert(out.size() == 1);
-    assert(out[0].source == PhaseSource::NEURAL_A);
+    // No model loaded → confidence fallback, honestly labelled HEURISTIC_*.
+    assert(out[0].source == PhaseSource::HEURISTIC_A);
     assert(out[0].tag_final == ReadTag::H1_ONLY);
-    assert(r.stats().n_neural_a == 1);
+    assert(r.stats().n_heuristic_a == 1);
+    assert(r.stats().n_neural_a == 0);
+    assert(r.stats().model_used == false);
     assert(r.stats().n_flagged == 0);
 }
 
@@ -86,7 +89,7 @@ void test_strong_disagreement_picks_b_when_higher() {
     ReconcilerOpts ropts;
     ropts.verbose = false;
     r.reconcile(a, b, out, ropts);
-    assert(out[0].source == PhaseSource::NEURAL_B);
+    assert(out[0].source == PhaseSource::HEURISTIC_B);
     assert(out[0].tag_final == ReadTag::H2_ONLY);
 }
 

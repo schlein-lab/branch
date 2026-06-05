@@ -14,6 +14,7 @@
 
 #include "../types.hpp"
 #include "../types_dual.hpp"
+#include "mlp.hpp"
 #include <array>
 #include <string>
 #include <vector>
@@ -32,9 +33,12 @@ struct ReconcilerOpts {
 struct ReconcilerStats {
     std::size_t n_total = 0;
     std::size_t n_agreed = 0;
-    std::size_t n_neural_a = 0;
-    std::size_t n_neural_b = 0;
+    std::size_t n_neural_a = 0;      // model sided with de-novo
+    std::size_t n_neural_b = 0;      // model sided with anchored
+    std::size_t n_heuristic_a = 0;   // confidence-fallback sided with de-novo
+    std::size_t n_heuristic_b = 0;   // confidence-fallback sided with anchored
     std::size_t n_flagged = 0;
+    bool model_used = false;         // true if a neural model adjudicated
     // Confusion matrix: tag_a × tag_b
     std::array<std::array<std::size_t, 6>, 6> confusion{};
 };
@@ -52,11 +56,20 @@ public:
 private:
     ReconcilerStats stats_;
 
-    // Neural model placeholder. v0.9 implementation will load a TorchScript
-    // or ONNX model here; v0.8 ships with a heuristic fallback that
-    // sides with whichever phaser had higher per-read confidence and
-    // FLAGS only when both confidences are below a threshold.
+    // Neural voter (v0.9). When ReconcilerOpts::neural_model_path points at a
+    // valid BRANCH_MLP weights file, the model adjudicates each disagreement;
+    // otherwise the confidence-fallback below is used and labelled HEURISTIC_*.
+    MLP  voter_;
     bool neural_loaded_ = false;
+
+    // Model-based adjudication: features → softmax over {A, B, flag}.
+    void neural_resolve(
+        const ReadAssignment& a,
+        const ReadAssignment& b,
+        ReconciledAssignment& out);
+
+    // Confidence fallback: side with the higher-confidence track, FLAG only
+    // when both are below threshold. Labelled HEURISTIC_*, never NEURAL_*.
     void heuristic_resolve(
         const ReadAssignment& a,
         const ReadAssignment& b,

@@ -15,22 +15,26 @@ namespace branch::wg::phaser {
 
 // Which model produced this read assignment.
 enum class PhaseSource : std::uint8_t {
-    DENOVO    = 0,   // overlap-graph + bubble + het-pair vote
-    ANCHORED  = 1,   // pangenome-anchored phaser
-    AGREED    = 2,   // both models agreed
-    NEURAL_A  = 3,   // disagreement; neural voter sided with DENOVO
-    NEURAL_B  = 4,   // disagreement; neural voter sided with ANCHORED
-    FLAGGED   = 5,   // disagreement; neural unsicher → biologically-meaningful uncertain
+    DENOVO      = 0,   // overlap-graph + bubble + het-pair vote
+    ANCHORED    = 1,   // pangenome-anchored phaser
+    AGREED      = 2,   // both models agreed
+    NEURAL_A    = 3,   // disagreement; neural voter sided with DENOVO
+    NEURAL_B    = 4,   // disagreement; neural voter sided with ANCHORED
+    FLAGGED     = 5,   // disagreement; voter unsure → biologically-meaningful uncertain
+    HEURISTIC_A = 6,   // disagreement; confidence-fallback sided with DENOVO (no model)
+    HEURISTIC_B = 7,   // disagreement; confidence-fallback sided with ANCHORED (no model)
 };
 
 inline const char* phase_source_str(PhaseSource s) {
     switch (s) {
-        case PhaseSource::DENOVO:   return "denovo";
-        case PhaseSource::ANCHORED: return "anchored";
-        case PhaseSource::AGREED:   return "agreed";
-        case PhaseSource::NEURAL_A: return "neural_denovo";
-        case PhaseSource::NEURAL_B: return "neural_anchored";
-        case PhaseSource::FLAGGED:  return "flagged";
+        case PhaseSource::DENOVO:      return "denovo";
+        case PhaseSource::ANCHORED:    return "anchored";
+        case PhaseSource::AGREED:      return "agreed";
+        case PhaseSource::NEURAL_A:    return "neural_denovo";
+        case PhaseSource::NEURAL_B:    return "neural_anchored";
+        case PhaseSource::FLAGGED:     return "flagged";
+        case PhaseSource::HEURISTIC_A: return "heuristic_denovo";
+        case PhaseSource::HEURISTIC_B: return "heuristic_anchored";
     }
     return "?";
 }

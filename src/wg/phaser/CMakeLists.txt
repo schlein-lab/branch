@@ -18,6 +18,7 @@ add_library(branch_phaser STATIC
     # v0.8 dual-phaser scaffold
     anchored/anchored_phaser.cpp
     reconcile/reconciler.cpp
+    reconcile/mlp.cpp
 )
 target_include_directories(branch_phaser PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(branch_phaser PUBLIC cxx_std_20)
@@ -69,4 +70,8 @@ if (BUILD_TESTING)
     add_executable(test_bubble_voter tests/test_bubble_voter.cpp)
     target_link_libraries(test_bubble_voter PRIVATE branch_phaser)
     add_test(NAME bubble_voter COMMAND test_bubble_voter)
+
+    add_executable(test_mlp tests/test_mlp.cpp)
+    target_link_libraries(test_mlp PRIVATE branch_phaser)
+    add_test(NAME mlp COMMAND test_mlp)
 endif()
