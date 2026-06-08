@@ -70,6 +70,7 @@ struct WgArgs {
     // v0.8 dual-phaser: optional pangenome-anchored second track.
     std::string ref_hap1;
     std::string ref_hap2;
+    std::string neural_voter;   // BRANCH_MLP weights for reconciler voting
     // v0.10: GFA emission disabled by default at WG scale (see
     // out_gfa_path setup below). Opt-in via --emit-gfa for small inputs
     // or after gfa_writer's bulk-IO refactor.
@@ -97,6 +98,7 @@ WgArgs parse_wg_args(int argc, char** argv) {
         else if (k == "--use-phaser") { a.use_phaser = true; }
         else if (k == "--ref-hap1")   { auto v = need("--ref-hap1"); if (!v) return a; a.ref_hap1 = v; }
         else if (k == "--ref-hap2")   { auto v = need("--ref-hap2"); if (!v) return a; a.ref_hap2 = v; }
+        else if (k == "--neural-voter") { auto v = need("--neural-voter"); if (!v) return a; a.neural_voter = v; }
         else if (k == "--emit-gfa")   { a.emit_gfa = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
@@ -328,6 +330,7 @@ int run_wg(int argc, char** argv) {
         // v0.8 dual-phaser passthrough.
         popts.ref_hap1_fa_path = args.ref_hap1;
         popts.ref_hap2_fa_path = args.ref_hap2;
+        popts.neural_voter_model_path = args.neural_voter;
         popts.anchored_n_threads = args.threads;
         // Anchored-phaser LLmap preset must match read tech. v12 chr14
         // smoke-tested map-hifi vs ONT data and lost ~92% of reads to

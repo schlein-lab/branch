@@ -1,172 +1,158 @@
 #!/usr/bin/env python3
 """Train the dual-phaser neural voter and export BRANCH_MLP v1 weights.
 
-The runtime side is a self-contained C++ MLP (src/wg/phaser/reconcile/mlp.cpp)
-that loads the text format this script writes. The FEATURE LAYOUT and CLASS
-ORDER here MUST match src/wg/phaser/reconcile/neural_features.hpp exactly:
+Pure-NumPy implementation (no torch / no GPU runtime needed) of a small
+2-layer MLP: Linear(FEATURE_DIM, hidden) -> ReLU -> Linear(hidden, 3) -> softmax.
+Trained with class-weighted cross-entropy and Adam, exported to the text format
+that src/wg/phaser/reconcile/mlp.cpp loads. The C++ binary stays dependency-free.
 
-  feature vector (dim 22):
-    [0..8]   one-hot(tag_a)              # 9 ReadTag classes
-    [9..17]  one-hot(tag_b)
-    [18]     conf_a
-    [19]     conf_b
-    [20]     conf_a - conf_b
-    [21]     home_node_a == home_node_b ? 1 : 0
-  classes (3): 0 = pick A (de-novo), 1 = pick B (anchored), 2 = flag
+The FEATURE LAYOUT and CLASS ORDER MUST match
+src/wg/phaser/reconcile/neural_features.hpp exactly:
+  features (22): one-hot(tag_a)[9] | one-hot(tag_b)[9] | conf_a | conf_b |
+                 conf_a-conf_b | (home_node_a==home_node_b)
+  classes (3):   0 = pick A (de-novo), 1 = pick B (anchored), 2 = flag
 
-Input: a TSV with `dim` feature columns followed by one integer label column
-(0/1/2). Generate it by running the dual phaser on data with known truth
-(pbsim3 simulated reads or HG002-trio-phased reads): for each DISAGREEMENT,
-emit the feature row and the label = which track matched truth (or 2 = flag
-when neither did). See scripts/make_voter_trainset.py (data generation).
-
-Usage:
+Input TSV: `dim` feature columns + 1 integer label column (see
+make_voter_trainset.py). Usage:
   train_neural_voter.py --data examples.tsv --out voter.mlp.txt [--hidden 32]
-  train_neural_voter.py --selftest --out /tmp/voter.mlp.txt   # synthetic round-trip
+  train_neural_voter.py --selftest --out /tmp/voter.mlp.txt
 """
 import argparse
 import sys
 
+import numpy as np
+
 NUM_TAGS = 9
-FEATURE_DIM = 2 * NUM_TAGS + 4   # 22 — keep in sync with neural_features.hpp
+FEATURE_DIM = 2 * NUM_TAGS + 4   # 22
 NUM_CLASSES = 3
 
 
 def load_tsv(path):
-    import numpy as np
-    rows = np.loadtxt(path, dtype=float)
+    rows = np.loadtxt(path, dtype=np.float64)
     if rows.ndim == 1:
         rows = rows.reshape(1, -1)
     if rows.shape[1] != FEATURE_DIM + 1:
         raise SystemExit(
-            f"expected {FEATURE_DIM + 1} columns ({FEATURE_DIM} features + label), "
-            f"got {rows.shape[1]}")
-    X = rows[:, :FEATURE_DIM].astype("float32")
-    y = rows[:, FEATURE_DIM].astype("int64")
-    return X, y
+            f"expected {FEATURE_DIM + 1} columns, got {rows.shape[1]}")
+    return rows[:, :FEATURE_DIM], rows[:, FEATURE_DIM].astype(np.int64)
 
 
 def make_synthetic(n=4000, seed=0):
-    """Toy separable trainset: label = argmax(conf_a, conf_b, both-weak->flag)."""
-    import numpy as np
     rng = np.random.default_rng(seed)
-    X = np.zeros((n, FEATURE_DIM), dtype="float32")
-    y = np.zeros(n, dtype="int64")
+    X = np.zeros((n, FEATURE_DIM))
+    y = np.zeros(n, dtype=np.int64)
     for i in range(n):
         ta, tb = rng.integers(0, NUM_TAGS, size=2)
         ca, cb = rng.random(), rng.random()
         X[i, ta] = 1.0
         X[i, NUM_TAGS + tb] = 1.0
-        X[i, 2 * NUM_TAGS + 0] = ca
-        X[i, 2 * NUM_TAGS + 1] = cb
-        X[i, 2 * NUM_TAGS + 2] = ca - cb
-        X[i, 2 * NUM_TAGS + 3] = float(rng.integers(0, 2))
-        if ca < 0.5 and cb < 0.5:
-            y[i] = 2                      # flag
-        else:
-            y[i] = 0 if ca >= cb else 1   # pick stronger
+        X[i, 2 * NUM_TAGS:2 * NUM_TAGS + 4] = [ca, cb, ca - cb,
+                                               float(rng.integers(0, 2))]
+        y[i] = 2 if (ca < 0.5 and cb < 0.5) else (0 if ca >= cb else 1)
     return X, y
 
 
-def train(X, y, hidden, epochs, lr, seed, val_frac=0.15):
-    import numpy as np
-    import torch
-    import torch.nn as nn
-    torch.manual_seed(seed)
+def relu(z):
+    return np.maximum(z, 0.0)
 
-    # Shuffle + split into train / validation.
+
+def softmax(z):
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def train(X, y, hidden, epochs, lr, seed, val_frac=0.15):
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(y))
     X, y = X[perm], y[perm]
     n_val = max(1, int(len(y) * val_frac))
-    Xtr, ytr = X[n_val:], y[n_val:]
     Xva, yva = X[:n_val], y[:n_val]
+    Xtr, ytr = X[n_val:], y[n_val:]
 
-    # Inverse-frequency class weights to counter imbalance (classes that are
-    # rare in the trainset are upweighted so the voter still learns them).
-    counts = np.bincount(ytr, minlength=NUM_CLASSES).astype("float64")
+    counts = np.bincount(ytr, minlength=NUM_CLASSES).astype(np.float64)
     counts[counts == 0] = 1.0
-    w = counts.sum() / (NUM_CLASSES * counts)
-    print(f"train n={len(ytr)} val n={len(yva)} class_counts={counts.astype(int)} "
-          f"weights={np.round(w, 3)}", file=sys.stderr)
+    cw = counts.sum() / (NUM_CLASSES * counts)        # inverse-frequency weights
+    print(f"train n={len(ytr)} val n={len(yva)} counts={counts.astype(int)} "
+          f"weights={np.round(cw, 3)}", file=sys.stderr)
 
-    model = nn.Sequential(
-        nn.Linear(FEATURE_DIM, hidden), nn.ReLU(),
-        nn.Linear(hidden, NUM_CLASSES),
-    )
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(dev)
-    Xtr_t = torch.from_numpy(Xtr).to(dev)
-    ytr_t = torch.from_numpy(ytr).to(dev)
-    Xva_t = torch.from_numpy(Xva).to(dev)
-    yva_t = torch.from_numpy(yva).to(dev)
-    cw = torch.from_numpy(w.astype("float32")).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss(weight=cw)
+    # He-init.
+    W1 = rng.standard_normal((hidden, FEATURE_DIM)) * np.sqrt(2.0 / FEATURE_DIM)
+    b1 = np.zeros(hidden)
+    W2 = rng.standard_normal((NUM_CLASSES, hidden)) * np.sqrt(2.0 / hidden)
+    b2 = np.zeros(NUM_CLASSES)
+    params = [W1, b1, W2, b2]
+    m = [np.zeros_like(p) for p in params]
+    v = [np.zeros_like(p) for p in params]
+    b1m, b2m, eps = 0.9, 0.999, 1e-8
 
+    Yoh = np.eye(NUM_CLASSES)[ytr]
+    sample_w = cw[ytr]
+    n = len(ytr)
+
+    t = 0
     for ep in range(epochs):
-        model.train()
-        opt.zero_grad()
-        loss = loss_fn(model(Xtr_t), ytr_t)
-        loss.backward()
-        opt.step()
+        # forward
+        z1 = Xtr @ W1.T + b1
+        a1 = relu(z1)
+        p = softmax(a1 @ W2.T + b2)
+        # weighted CE gradient on logits
+        dlogits = (p - Yoh) * sample_w[:, None] / n
+        gW2 = dlogits.T @ a1
+        gb2 = dlogits.sum(axis=0)
+        da1 = dlogits @ W2
+        dz1 = da1 * (z1 > 0)
+        gW1 = dz1.T @ Xtr
+        gb1 = dz1.sum(axis=0)
+        grads = [gW1, gb1, gW2, gb2]
+        # Adam
+        t += 1
+        for i in range(4):
+            m[i] = b1m * m[i] + (1 - b1m) * grads[i]
+            v[i] = b2m * v[i] + (1 - b2m) * grads[i] ** 2
+            mhat = m[i] / (1 - b1m ** t)
+            vhat = v[i] / (1 - b2m ** t)
+            params[i] -= lr * mhat / (np.sqrt(vhat) + eps)
+        W1, b1, W2, b2 = params
         if (ep + 1) % max(1, epochs // 10) == 0:
-            model.eval()
-            with torch.no_grad():
-                pred = model(Xva_t).argmax(1)
-                acc = (pred == yva_t).float().mean().item()
-            print(f"epoch {ep+1}/{epochs} loss={loss.item():.4f} val_acc={acc:.4f}",
+            pv = softmax(relu(Xva @ W1.T + b1) @ W2.T + b2).argmax(1)
+            print(f"epoch {ep+1}/{epochs} val_acc={(pv == yva).mean():.4f}",
                   file=sys.stderr)
 
-    # Final per-class validation report.
-    model.eval()
-    with torch.no_grad():
-        pred = model(Xva_t).argmax(1).cpu().numpy()
-    yva_np = yva_t.cpu().numpy()
-    print("=== validation per-class ===", file=sys.stderr)
+    pv = softmax(relu(Xva @ W1.T + b1) @ W2.T + b2).argmax(1)
     names = {0: "pickA(denovo)", 1: "pickB(anchored)", 2: "flag"}
+    print("=== validation per-class ===", file=sys.stderr)
     for c in range(NUM_CLASSES):
-        m = (yva_np == c)
-        n = int(m.sum())
-        a = float((pred[m] == c).mean()) if n else 0.0
-        print(f"  class {c} {names[c]:16s} n={n:6d} recall={a:.3f}", file=sys.stderr)
-    overall = float((pred == yva_np).mean())
-    print(f"  overall val_acc={overall:.4f}", file=sys.stderr)
-    return model.cpu()
+        mask = (yva == c)
+        nc = int(mask.sum())
+        rec = float((pv[mask] == c).mean()) if nc else 0.0
+        print(f"  class {c} {names[c]:16s} n={nc:7d} recall={rec:.3f}",
+              file=sys.stderr)
+    print(f"  overall val_acc={(pv == yva).mean():.4f}", file=sys.stderr)
+    return [("relu", W1, b1), ("softmax", W2, b2)]
 
 
-def export_branch_mlp(model, path):
-    """Write nn.Sequential(Linear,ReLU,Linear) as BRANCH_MLP v1.
-
-    Layer activations: hidden Linear -> relu, output Linear -> softmax (the C++
-    side applies softmax; CrossEntropyLoss trained on logits is consistent).
-    """
-    import torch.nn as nn
-    layers = [m for m in model if isinstance(m, nn.Linear)]
-    acts = ["relu"] * (len(layers) - 1) + ["softmax"]
+def export_branch_mlp(layers, path):
     with open(path, "w") as o:
         o.write("BRANCH_MLP v1\n")
         o.write(f"{len(layers)}\n")
-        for li, (lin, act) in enumerate(zip(layers, acts)):
-            W = lin.weight.detach().numpy()   # (out, in)
-            b = lin.bias.detach().numpy()      # (out,)
-            in_dim, out_dim = W.shape[1], W.shape[0]
+        for li, (act, W, b) in enumerate(layers):
+            out_dim, in_dim = W.shape
             o.write(f"# layer {li}\n{in_dim} {out_dim} {act}\n")
-            o.write(" ".join(f"{v:.8g}" for v in W.reshape(-1)) + "\n")
-            o.write(" ".join(f"{v:.8g}" for v in b) + "\n")
+            o.write(" ".join(f"{x:.8g}" for x in W.reshape(-1)) + "\n")
+            o.write(" ".join(f"{x:.8g}" for x in b) + "\n")
     print(f"wrote {path} ({len(layers)} layers)", file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", help="labeled TSV (features + label)")
-    ap.add_argument("--out", required=True, help="output BRANCH_MLP weights file")
+    ap.add_argument("--data")
+    ap.add_argument("--out", required=True)
     ap.add_argument("--hidden", type=int, default=32)
-    ap.add_argument("--epochs", type=int, default=300)
-    ap.add_argument("--lr", type=float, default=1e-2)
+    ap.add_argument("--epochs", type=int, default=400)
+    ap.add_argument("--lr", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--selftest", action="store_true",
-                    help="train on synthetic separable data (no --data needed)")
+    ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
@@ -176,8 +162,8 @@ def main():
     else:
         raise SystemExit("provide --data or --selftest")
 
-    model = train(X, y, args.hidden, args.epochs, args.lr, args.seed)
-    export_branch_mlp(model, args.out)
+    layers = train(X, y, args.hidden, args.epochs, args.lr, args.seed)
+    export_branch_mlp(layers, args.out)
 
 
 if __name__ == "__main__":
