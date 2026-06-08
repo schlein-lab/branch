@@ -29,9 +29,14 @@ struct AnchoredPhaserOpts {
     std::string ref_hap1_fa_path;
     std::string ref_hap2_fa_path;
 
-    int    n_threads = 8;
-    int    min_align_score = 200;     // skip weak hits (matched-base weight)
-    double hap_call_margin = 0.10;    // require best hap >10% better than other
+    int n_threads = 8;
+    // A hit counts only if it spans at least this many query bases (drops
+    // tiny spurious alignments before the mismatch comparison).
+    int min_aligned_bp = 500;
+    // Require at least this net mismatch difference between the two haps to
+    // call a haplotype; below it the read covers no discriminating site and
+    // is SHARED (homozygous span).
+    int min_discriminating_sites = 1;
 
     // LLmap mapping preset, matched to read tech:
     //   "map-hifi" (k=19,w=19, identity≥0.85) for PacBio HiFi/CCS,

@@ -68,8 +68,8 @@ struct PhaserOpts {
     std::string out_reconciled_tsv_path;  // emits reconciled assignments
                                           // with provenance column
     int         anchored_n_threads = 8;
-    int         anchored_min_align_score = 200;
-    double      anchored_hap_call_margin = 0.10;
+    int         anchored_min_aligned_bp = 500;
+    int         anchored_min_discriminating_sites = 1;
     std::string anchored_preset = "map-hifi";  // or "map-ont" for ONT
     std::string neural_voter_model_path;  // v0.9; empty for now
 };

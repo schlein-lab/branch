@@ -68,31 +68,70 @@ def make_synthetic(n=4000, seed=0):
     return X, y
 
 
-def train(X, y, hidden, epochs, lr, seed):
+def train(X, y, hidden, epochs, lr, seed, val_frac=0.15):
+    import numpy as np
     import torch
     import torch.nn as nn
     torch.manual_seed(seed)
+
+    # Shuffle + split into train / validation.
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(y))
+    X, y = X[perm], y[perm]
+    n_val = max(1, int(len(y) * val_frac))
+    Xtr, ytr = X[n_val:], y[n_val:]
+    Xva, yva = X[:n_val], y[:n_val]
+
+    # Inverse-frequency class weights to counter imbalance (classes that are
+    # rare in the trainset are upweighted so the voter still learns them).
+    counts = np.bincount(ytr, minlength=NUM_CLASSES).astype("float64")
+    counts[counts == 0] = 1.0
+    w = counts.sum() / (NUM_CLASSES * counts)
+    print(f"train n={len(ytr)} val n={len(yva)} class_counts={counts.astype(int)} "
+          f"weights={np.round(w, 3)}", file=sys.stderr)
+
     model = nn.Sequential(
-        nn.Linear(FEATURE_DIM, hidden),
-        nn.ReLU(),
+        nn.Linear(FEATURE_DIM, hidden), nn.ReLU(),
         nn.Linear(hidden, NUM_CLASSES),
     )
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(dev)
-    Xt = torch.from_numpy(X).to(dev)
-    yt = torch.from_numpy(y).to(dev)
+    Xtr_t = torch.from_numpy(Xtr).to(dev)
+    ytr_t = torch.from_numpy(ytr).to(dev)
+    Xva_t = torch.from_numpy(Xva).to(dev)
+    yva_t = torch.from_numpy(yva).to(dev)
+    cw = torch.from_numpy(w.astype("float32")).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(weight=cw)
+
     for ep in range(epochs):
+        model.train()
         opt.zero_grad()
-        out = model(Xt)
-        loss = loss_fn(out, yt)
+        loss = loss_fn(model(Xtr_t), ytr_t)
         loss.backward()
         opt.step()
         if (ep + 1) % max(1, epochs // 10) == 0:
-            acc = (out.argmax(1) == yt).float().mean().item()
-            print(f"epoch {ep+1}/{epochs} loss={loss.item():.4f} acc={acc:.4f}",
+            model.eval()
+            with torch.no_grad():
+                pred = model(Xva_t).argmax(1)
+                acc = (pred == yva_t).float().mean().item()
+            print(f"epoch {ep+1}/{epochs} loss={loss.item():.4f} val_acc={acc:.4f}",
                   file=sys.stderr)
+
+    # Final per-class validation report.
+    model.eval()
+    with torch.no_grad():
+        pred = model(Xva_t).argmax(1).cpu().numpy()
+    yva_np = yva_t.cpu().numpy()
+    print("=== validation per-class ===", file=sys.stderr)
+    names = {0: "pickA(denovo)", 1: "pickB(anchored)", 2: "flag"}
+    for c in range(NUM_CLASSES):
+        m = (yva_np == c)
+        n = int(m.sum())
+        a = float((pred[m] == c).mean()) if n else 0.0
+        print(f"  class {c} {names[c]:16s} n={n:6d} recall={a:.3f}", file=sys.stderr)
+    overall = float((pred == yva_np).mean())
+    print(f"  overall val_acc={overall:.4f}", file=sys.stderr)
     return model.cpu()
 
 

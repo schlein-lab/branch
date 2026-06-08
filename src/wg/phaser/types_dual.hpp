@@ -49,6 +49,8 @@ struct ReconciledAssignment {
     ReadTag  tag_final;  // consensus / neural / flagged
     PhaseSource source;
     float    confidence;     // [0,1]; 1.0 = both agree; <0.5 = uncertain
+    float    conf_a = 0.0f;  // de-novo track per-read confidence
+    float    conf_b = 0.0f;  // anchored track per-read confidence
     NodeId   home_node_a;
     NodeId   home_node_b;
 };

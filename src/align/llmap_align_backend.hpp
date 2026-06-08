@@ -87,8 +87,10 @@ struct RefHit {
     bool is_forward = true;
     bool is_primary = true;
     std::string cigar;
-    int   score    = 0;
-    float identity = 0.0f;
+    int   score       = 0;
+    float identity    = 0.0f;
+    int   aligned_len = 0;   // query bases spanned by the alignment
+    int   mismatches  = 0;   // substitutions + indel bases within the span
     std::uint32_t mapq = 0;
 };
 

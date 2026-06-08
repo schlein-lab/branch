@@ -317,10 +317,10 @@ PhaserResult run(const ReadsInput& reads_in, const PhaserOpts& opts) {
         AnchoredPhaserOpts ap_opts;
         ap_opts.ref_hap1_fa_path  = opts.ref_hap1_fa_path;
         ap_opts.ref_hap2_fa_path  = opts.ref_hap2_fa_path;
-        ap_opts.n_threads         = opts.anchored_n_threads;
-        ap_opts.min_align_score   = opts.anchored_min_align_score;
-        ap_opts.hap_call_margin   = opts.anchored_hap_call_margin;
-        ap_opts.preset            = opts.anchored_preset;
+        ap_opts.n_threads                = opts.anchored_n_threads;
+        ap_opts.min_aligned_bp           = opts.anchored_min_aligned_bp;
+        ap_opts.min_discriminating_sites = opts.anchored_min_discriminating_sites;
+        ap_opts.preset                   = opts.anchored_preset;
         std::vector<ReadAssignment> assignments_b;
         ap.run(idx, assignments_b, ap_opts);
 
@@ -340,7 +340,7 @@ PhaserResult run(const ReadsInput& reads_in, const PhaserOpts& opts) {
                           << opts.out_reconciled_tsv_path << "\n";
             } else {
                 r << "read_id\ttag_a\ttag_b\ttag_final\tsource\tconfidence"
-                     "\thome_node_a\thome_node_b\n";
+                     "\tconf_a\tconf_b\thome_node_a\thome_node_b\n";
                 const auto& names = idx.read_id_strings();
                 for (const auto& x : reconciled) {
                     const std::string& nm =
@@ -353,6 +353,8 @@ PhaserResult run(const ReadsInput& reads_in, const PhaserOpts& opts) {
                       << read_tag_str(x.tag_final) << '\t'
                       << phase_source_str(x.source) << '\t'
                       << x.confidence << '\t'
+                      << x.conf_a << '\t'
+                      << x.conf_b << '\t'
                       << x.home_node_a << '\t'
                       << x.home_node_b << '\n';
                 }

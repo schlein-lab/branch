@@ -5,22 +5,10 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace branch::wg::phaser {
-
-namespace {
-
-// Matched-base weight for a hit: identity × aligned query span. A robust,
-// always-non-negative proxy for alignment quality used to compare the two
-// haplotypes' fits for one read (replaces minimap2's AS:i score).
-int hit_weight(const branch::align::llmap_backend::RefHit& h) {
-    const int aligned = h.query_end - h.query_start;
-    if (aligned <= 0) return 0;
-    return static_cast<int>(h.identity * static_cast<float>(aligned));
-}
-
-}  // namespace
 
 void AnchoredPhaser::run(
     FastqIndex& reads,
@@ -31,7 +19,6 @@ void AnchoredPhaser::run(
     out_assignments.clear();
     out_assignments.resize(reads.n_reads());
 
-    // Initialize all assignments as UNTAGGED (no hits yet).
     for (std::size_t i = 0; i < reads.n_reads(); ++i) {
         out_assignments[i].read_id = static_cast<ReadId>(i);
         out_assignments[i].tag = ReadTag::UNTAGGED;
@@ -45,7 +32,6 @@ void AnchoredPhaser::run(
         return;
     }
 
-    // -- Build one minimizer index per haplotype (held for the whole pass).
     branch::align::llmap_backend::ReferenceMapper mapper_h1(
         opts.ref_hap1_fa_path, opts.preset);
     branch::align::llmap_backend::ReferenceMapper mapper_h2(
@@ -56,31 +42,31 @@ void AnchoredPhaser::run(
         return;
     }
 
-    // Per-read matched-base weight against each haplotype.
-    std::vector<int> weight_h1(reads.n_reads(), 0);
-    std::vector<int> weight_h2(reads.n_reads(), 0);
+    // Per-read mismatch counts to each haplotype (-1 = did not map).
+    constexpr int kUnmapped = -1;
+    std::vector<int> mm_h1(reads.n_reads(), kUnmapped);
+    std::vector<int> mm_h2(reads.n_reads(), kUnmapped);
 
-    // -- Stream reads in bounded batches; map each batch in parallel.
     std::vector<ReadId>      batch_rids;
     std::vector<std::string> batch_seqs;
     batch_rids.reserve(opts.batch_size);
     batch_seqs.reserve(opts.batch_size);
     std::size_t n_mapped = 0;
 
+    auto record = [&](const std::optional<branch::align::llmap_backend::RefHit>& hit,
+                      std::vector<int>& mm, ReadId rid) {
+        if (hit && hit->aligned_len >= opts.min_aligned_bp) {
+            mm[rid] = hit->mismatches;
+        }
+    };
+
     auto flush_batch = [&]() {
         if (batch_seqs.empty()) return;
         auto hits1 = mapper_h1.best_batch(batch_seqs, opts.n_threads);
         auto hits2 = mapper_h2.best_batch(batch_seqs, opts.n_threads);
         for (std::size_t i = 0; i < batch_rids.size(); ++i) {
-            const ReadId rid = batch_rids[i];
-            if (hits1[i]) {
-                const int w = hit_weight(*hits1[i]);
-                if (w >= opts.min_align_score) weight_h1[rid] = w;
-            }
-            if (hits2[i]) {
-                const int w = hit_weight(*hits2[i]);
-                if (w >= opts.min_align_score) weight_h2[rid] = w;
-            }
+            record(hits1[i], mm_h1, batch_rids[i]);
+            record(hits2[i], mm_h2, batch_rids[i]);
         }
         n_mapped += batch_seqs.size();
         batch_rids.clear();
@@ -92,37 +78,51 @@ void AnchoredPhaser::run(
         batch_seqs.push_back(seq);  // copy: for_each reuses its buffer
         if (batch_seqs.size() >= opts.batch_size) flush_batch();
     });
-    flush_batch();  // trailing partial batch
+    flush_batch();
 
-    // -- Per-read decision.
+    // -- Per-read decision: SNV-aware discrimination by mismatch difference.
+    //
+    // A read from its true haplotype matches that hap's allele at every
+    // differing (het) site and mismatches the other hap there; sequencing
+    // errors hit both haps about equally and cancel. So the SIGN of
+    // (mm_other - mm_true) isolates the het-site signal, even when the haps
+    // are >99.9% identical and the total alignment weights are nearly equal.
     for (std::size_t rid = 0; rid < reads.n_reads(); ++rid) {
         auto& a = out_assignments[rid];
-        const int s1 = weight_h1[rid];
-        const int s2 = weight_h2[rid];
-        const int total = s1 + s2;
-        if (total == 0) {
-            // No hits anywhere → genuinely unmappable (novel SV, contam, etc.)
-            a.tag = ReadTag::UNCERTAIN;
+        const int m1 = mm_h1[rid];
+        const int m2 = mm_h2[rid];
+        const bool map1 = (m1 != kUnmapped);
+        const bool map2 = (m2 != kUnmapped);
+
+        if (!map1 && !map2) {
+            a.tag = ReadTag::UNCERTAIN;     // maps to neither hap
             a.confidence = 0.0f;
             continue;
         }
-        const double frac_h1 = static_cast<double>(s1) / static_cast<double>(total);
-        const double frac_h2 = static_cast<double>(s2) / static_cast<double>(total);
-        if (std::abs(frac_h1 - frac_h2) < opts.hap_call_margin) {
-            // Both haplotypes equally well aligned → SHARED.
+        if (map1 != map2) {
+            // Aligns to exactly one hap → unambiguous assignment.
+            a.tag = map1 ? ReadTag::H1_ONLY : ReadTag::H2_ONLY;
+            a.confidence = 1.0f;
+            continue;
+        }
+
+        const int d = m2 - m1;            // >0 ⇒ fewer mismatches to hap1
+        const int ad = std::abs(d);
+        if (ad < opts.min_discriminating_sites) {
+            // No discriminating mismatch difference → homozygous span.
             a.tag = ReadTag::SHARED;
-            a.confidence = static_cast<float>(1.0 - std::abs(frac_h1 - frac_h2));
-        } else if (frac_h1 > frac_h2) {
-            a.tag = ReadTag::H1_ONLY;
-            a.confidence = static_cast<float>(frac_h1);
+            a.confidence = 1.0f;
         } else {
-            a.tag = ReadTag::H2_ONLY;
-            a.confidence = static_cast<float>(frac_h2);
+            a.tag = (d > 0) ? ReadTag::H1_ONLY : ReadTag::H2_ONLY;
+            // Confidence grows with the net discriminating margin (bounded,
+            // monotone): 1 site → 0.5, 2 → 0.67, 4 → 0.8, → 1.0.
+            a.confidence = static_cast<float>(ad) / static_cast<float>(ad + 1);
         }
     }
 
     auto t1 = std::chrono::steady_clock::now();
-    std::cerr << "[anchored] mapped " << n_mapped << " reads vs 2 haplotypes in "
+    std::cerr << "[anchored] mapped " << n_mapped
+              << " reads vs 2 haplotypes (SNV-aware) in "
               << std::chrono::duration<double>(t1 - t0).count() << "s\n";
 }
 

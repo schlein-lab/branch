@@ -231,6 +231,15 @@ struct ReferenceMapper::Impl {
         h.score       = a.score;
         h.identity    = a.identity;
         h.mapq        = a.mapq;
+        // Mismatch count within the aligned query span. identity is the
+        // match fraction, so (1 - identity) × span ≈ substitutions + indels.
+        // This is the SNV-aware discriminator used by the anchored phaser:
+        // the *difference* in mismatches between two near-identical haplotype
+        // references isolates exactly the bases at their differing sites.
+        h.aligned_len = a.query_end - a.query_start;
+        if (h.aligned_len < 0) h.aligned_len = 0;
+        h.mismatches  = static_cast<int>(
+            (1.0f - a.identity) * static_cast<float>(h.aligned_len) + 0.5f);
         return h;
     }
 };

@@ -145,6 +145,8 @@ void Reconciler::reconcile(
         r.read_id     = a.read_id;
         r.tag_a       = a.tag;
         r.tag_b       = b.tag;
+        r.conf_a      = a.confidence;
+        r.conf_b      = b.confidence;
         r.home_node_a = a.home_node;
         r.home_node_b = b.home_node;
 
