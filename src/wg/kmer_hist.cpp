@@ -65,10 +65,12 @@ void kmer_bits_to_seq(std::uint64_t bits, std::size_t k, char* out) noexcept {
 }
 
 KmerHistBuilder::KmerHistBuilder(const ::branch::graph::TechProfile& profile,
-                                 std::size_t expected_n_distinct_kmers)
+                                 std::size_t expected_n_distinct_kmers,
+                                 std::size_t max_ram_bytes,
+                                 std::string scratch_dir)
     : profile_(profile),
       bloom_(expected_n_distinct_kmers, /*bits_per_key=*/6),
-      counter_(expected_n_distinct_kmers / 10) {  // ~10x reduction post-bloom
+      ext_counter_(max_ram_bytes, std::move(scratch_dir)) {
 }
 
 void KmerHistBuilder::scan_kmers_(std::string_view seq, bool pass2) noexcept {
@@ -95,7 +97,7 @@ void KmerHistBuilder::scan_kmers_(std::string_view seq, bool pass2) noexcept {
         // enumerate 1-bp variants for het-pair detection.
         std::uint64_t cbits = canonical_kmer_bits(kmer, k);
         if (pass2) {
-            if (bloom_.maybe_contains(cbits)) counter_.add(cbits, 1);
+            if (bloom_.maybe_contains(cbits)) ext_counter_.add(cbits);
         } else {
             bloom_.add(cbits);
         }
@@ -124,115 +126,22 @@ void KmerHistBuilder::pass2_add_read(std::string_view seq) noexcept {
 
 KmerHistResult KmerHistBuilder::finalize(int expected_coverage,
                                          double bimodality_z_threshold) {
-    KmerHistResult r;
-    r.n_reads = n_reads_;
-    r.n_bases = n_bases_;
-    r.n_recurrent_kmers = counter_.size();
-
-    // Build histogram[count] over recurrent k-mers.
-    constexpr std::size_t HIST_MAX = 512;
-    r.histogram.assign(HIST_MAX, 0);
-    counter_.for_each([&](std::uint64_t /*key*/, std::uint32_t cnt) {
-        std::size_t bin = std::min<std::size_t>(cnt, HIST_MAX - 1);
-        ++r.histogram[bin];
-    });
-
-    // Find peaks. Start search above the bloom-saturation noise floor:
-    // when the bloom saturates (which it does for whole-genome ONT at
-    // any reasonable bloom size), the histogram is dominated by spurious
-    // count-1/2/3 entries that mask the real single-copy peak. Starting
-    // at ~expected_coverage/3 skips the noise band and reveals the true
-    // single-copy peak. Falls back to lo=4 only when expected_coverage is
-    // unset / very small.
-    int lo = std::max(4, expected_coverage / 3);
-    int hi = std::min<int>(static_cast<int>(HIST_MAX) - 1, expected_coverage * 4);
-    if (lo >= hi) return r;
-
-    auto smooth = [&](int x) -> double {
-        // 5-bin moving average for noise suppression.
-        double s = 0; int n = 0;
-        for (int d = -2; d <= 2; ++d) {
-            int xx = x + d;
-            if (xx >= 0 && xx < (int)r.histogram.size()) {
-                s += static_cast<double>(r.histogram[xx]); ++n;
-            }
-        }
-        return n ? s / n : 0.0;
-    };
-
-    // First peak — highest in [lo, hi]
-    int peak1 = lo;
-    double v1 = smooth(lo);
-    for (int x = lo + 1; x <= hi; ++x) {
-        double v = smooth(x);
-        if (v > v1) { v1 = v; peak1 = x; }
-    }
-    r.detected_coverage = peak1;
-
-    // Second peak — highest in [lo, peak1 * 0.7] (lower than primary)
-    int peak2 = 0;
-    double v2 = 0.0;
-    int hi2 = std::max(lo, static_cast<int>(peak1 * 0.7));
-    for (int x = lo; x <= hi2; ++x) {
-        double v = smooth(x);
-        if (v > v2) { v2 = v; peak2 = x; }
-    }
-
-    // Validate the second peak via z-separation between the two peaks
-    // and the valley between them.
-    if (peak2 > 0) {
-        int valley = (peak1 + peak2) / 2;
-        double vv = smooth(valley);
-        if (vv > 0) {
-            double z_low  = (v2 - vv) / std::sqrt(std::max(vv, 1.0));
-            double z_high = (v1 - vv) / std::sqrt(std::max(vv, 1.0));
-            r.bimodality_z = std::min(z_low, z_high);
-            if (r.bimodality_z >= bimodality_z_threshold) {
-                r.detected_het_coverage = peak2;
-            }
-        }
-    }
-    return r;
+    // External merge-sort the second-pass occurrences into the same sorted
+    // (key, count) arrays the GPU path produces, then reuse the shared
+    // histogram + bimodality logic. keys_/counts_ are retained for write_to().
+    // Peak RAM is bounded by the counter's buffer budget, not the recurrent
+    // k-mer count, so this no longer scales with genome size.
+    ext_counter_.finalize(keys_, counts_);
+    return finalize_from_keys_counts(expected_coverage, bimodality_z_threshold,
+                                     keys_, counts_, n_reads_, n_bases_);
 }
 
 void KmerHistBuilder::write_to(const std::string& path,
                                const KmerHistResult& result) const {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open: " + path);
-
-    // Magic + version
-    constexpr char MAGIC[8] = {'K','H','I','S','T','0','5','\0'};
-    f.write(MAGIC, 8);
-
-    // Header
-    std::uint64_t n_recurrent = result.n_recurrent_kmers;
-    std::uint64_t n_reads = result.n_reads;
-    std::uint64_t n_bases = result.n_bases;
-    std::int32_t  cov = result.detected_coverage;
-    std::int32_t  het = result.detected_het_coverage;
-    double        z   = result.bimodality_z;
-    std::uint32_t k   = static_cast<std::uint32_t>(profile_.minimizer_k);
-    f.write(reinterpret_cast<const char*>(&n_recurrent), sizeof(n_recurrent));
-    f.write(reinterpret_cast<const char*>(&n_reads), sizeof(n_reads));
-    f.write(reinterpret_cast<const char*>(&n_bases), sizeof(n_bases));
-    f.write(reinterpret_cast<const char*>(&cov), sizeof(cov));
-    f.write(reinterpret_cast<const char*>(&het), sizeof(het));
-    f.write(reinterpret_cast<const char*>(&z), sizeof(z));
-    f.write(reinterpret_cast<const char*>(&k), sizeof(k));
-
-    // Histogram
-    std::uint32_t hist_n = static_cast<std::uint32_t>(result.histogram.size());
-    f.write(reinterpret_cast<const char*>(&hist_n), sizeof(hist_n));
-    f.write(reinterpret_cast<const char*>(result.histogram.data()),
-            result.histogram.size() * sizeof(std::uint64_t));
-
-    // Counter dump: (key, count) records, one per recurrent k-mer.
-    counter_.for_each([&](std::uint64_t key, std::uint32_t cnt) {
-        f.write(reinterpret_cast<const char*>(&key), sizeof(key));
-        f.write(reinterpret_cast<const char*>(&cnt), sizeof(cnt));
-    });
-
-    f.close();
+    // Emit the identical .bin format via the shared keys/counts writer; the
+    // sorted arrays were materialized by finalize(). (Same MAGIC, header,
+    // histogram and (key,count) records the GPU path writes.)
+    write_phase0_dump(path, profile_.minimizer_k, result, keys_, counts_);
 }
 
 KmerHistResult finalize_from_keys_counts(

@@ -75,6 +75,7 @@ struct WgArgs {
     // out_gfa_path setup below). Opt-in via --emit-gfa for small inputs
     // or after gfa_writer's bulk-IO refactor.
     bool emit_gfa = false;
+    int  max_ram_gb = 16;   // Phase-0 second-pass buffer budget (GiB)
     bool ok = false;
     std::string err;
 };
@@ -99,6 +100,7 @@ WgArgs parse_wg_args(int argc, char** argv) {
         else if (k == "--ref-hap1")   { auto v = need("--ref-hap1"); if (!v) return a; a.ref_hap1 = v; }
         else if (k == "--ref-hap2")   { auto v = need("--ref-hap2"); if (!v) return a; a.ref_hap2 = v; }
         else if (k == "--neural-voter") { auto v = need("--neural-voter"); if (!v) return a; a.neural_voter = v; }
+        else if (k == "--max-ram-gb") { auto v = need("--max-ram-gb"); if (!v) return a; a.max_ram_gb = std::atoi(v); }
         else if (k == "--emit-gfa")   { a.emit_gfa = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
@@ -214,7 +216,14 @@ int run_wg(int argc, char** argv) {
         std::size_t expected_distinct = std::min<std::size_t>(
             std::max<std::size_t>(total_bp / 4, 100'000'000ULL),
             1'000'000'000ULL);
-        branch::wg::KmerHistBuilder kh(profile, expected_distinct);
+        // Phase-0 second-pass RAM budget (external merge-sort spills beyond
+        // it to TMPDIR/BeeGFS). Bounds the former whole-genome RAM wall.
+        const char* tmpdir = std::getenv("TMPDIR");
+        const std::string scratch = (tmpdir && *tmpdir) ? tmpdir : "/tmp";
+        const std::size_t max_ram_bytes =
+            static_cast<std::size_t>(args.max_ram_gb) << 30;
+        branch::wg::KmerHistBuilder kh(profile, expected_distinct,
+                                       max_ram_bytes, scratch);
         for (const auto& [_, seq] : reads) kh.pass1_add_read(seq);
         kh.switch_to_pass2();
         for (const auto& [_, seq] : reads) kh.pass2_add_read(seq);

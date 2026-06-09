@@ -17,7 +17,7 @@
 
 #include "graph/kmer_sketch.hpp"
 #include "wg/bloom_filter.hpp"
-#include "wg/kmer_counter.hpp"
+#include "wg/external_kmer_counter.hpp"
 
 namespace branch::wg {
 
@@ -52,8 +52,13 @@ public:
     /// used to size the bloom filter; over-estimate is cheap (more
     /// bits) under-estimate is expensive (high FP rate). Default
     /// 30 G is sized for a human whole-genome ONT input at 30× coverage.
+    /// `max_ram_bytes` caps the Phase-0 second-pass occurrence buffer (the
+    /// former exact counter was the whole-genome RAM wall); beyond it, runs
+    /// spill to `scratch_dir` (BeeGFS) and are merged exactly at finalize.
     explicit KmerHistBuilder(const ::branch::graph::TechProfile& profile,
-                             std::size_t expected_n_distinct_kmers = 30'000'000'000ULL);
+                             std::size_t expected_n_distinct_kmers = 30'000'000'000ULL,
+                             std::size_t max_ram_bytes = 16ULL << 30,
+                             std::string scratch_dir = "/tmp");
 
     /// Pass 1: feed every k-mer into the bloom filter.
     void pass1_add_read(std::string_view seq) noexcept;
@@ -80,13 +85,16 @@ public:
 
     /// Diagnostics.
     [[nodiscard]] std::size_t bloom_bytes() const noexcept { return bloom_.bytes(); }
-    [[nodiscard]] std::size_t counter_bytes() const noexcept { return counter_.bytes(); }
+    [[nodiscard]] std::size_t counter_bytes() const noexcept { return ext_counter_.peak_buffer_bytes(); }
     [[nodiscard]] double bloom_saturation() const noexcept { return bloom_.saturation(); }
 
 private:
     const ::branch::graph::TechProfile profile_;
     BloomFilter bloom_;
-    KmerCounter counter_;
+    ExternalKmerCounter ext_counter_;
+    // Sorted (key, count) arrays materialized by finalize(); reused by write_to().
+    std::vector<std::uint64_t> keys_;
+    std::vector<std::uint32_t> counts_;
     bool in_pass2_ = false;
     std::uint64_t n_reads_ = 0;
     std::uint64_t n_bases_ = 0;
