@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "graph/kmer_sketch.hpp"
+#include "wg/mmap_sorted_kmers.hpp"
 
 namespace branch::wg {
 
@@ -96,7 +97,10 @@ private:
 
     /// Recurrent k-mer counter loaded from Phase 0 output. Key =
     /// canonical kmer-bits (decodable to ATCG); value = total count.
-    std::unordered_map<std::uint64_t, std::uint32_t> counter_;
+    // Recurrent k-mer (key→count) table, memory-mapped from the Phase-0 .bin
+    // (sorted by key). Iterated + binary-searched by find_het_pairs; the heap
+    // footprint is ~0 (records stay in the OS page cache).
+    MmapSortedKmers counter_;
 
     /// Het-pair table: canonical_bits → (pair_id, allele_label).
     /// Pair_id is a small dense integer; allele_label is 0 or 1, picked

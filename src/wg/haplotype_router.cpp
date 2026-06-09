@@ -61,38 +61,10 @@ HaplotypeRouter::HaplotypeRouter(const ::branch::graph::TechProfile& profile,
 }
 
 void HaplotypeRouter::load_counter_(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open Phase 0 output: " + path);
-
-    char magic[8];
-    f.read(magic, 8);
-    if (std::memcmp(magic, "KHIST05", 7) != 0)
-        throw std::runtime_error("bad magic in Phase 0 file: " + path);
-
-    std::uint64_t n_recurrent = 0, n_reads = 0, n_bases = 0;
-    std::int32_t cov = 0, het = 0;
-    double z = 0;
-    std::uint32_t k = 0;
-    f.read(reinterpret_cast<char*>(&n_recurrent), sizeof(n_recurrent));
-    f.read(reinterpret_cast<char*>(&n_reads), sizeof(n_reads));
-    f.read(reinterpret_cast<char*>(&n_bases), sizeof(n_bases));
-    f.read(reinterpret_cast<char*>(&cov), sizeof(cov));
-    f.read(reinterpret_cast<char*>(&het), sizeof(het));
-    f.read(reinterpret_cast<char*>(&z), sizeof(z));
-    f.read(reinterpret_cast<char*>(&k), sizeof(k));
-
-    std::uint32_t hist_n = 0;
-    f.read(reinterpret_cast<char*>(&hist_n), sizeof(hist_n));
-    f.seekg(sizeof(std::uint64_t) * hist_n, std::ios::cur);
-
-    counter_.reserve(static_cast<std::size_t>(n_recurrent));
-    for (std::uint64_t i = 0; i < n_recurrent; ++i) {
-        std::uint64_t key = 0;
-        std::uint32_t cnt = 0;
-        f.read(reinterpret_cast<char*>(&key), sizeof(key));
-        f.read(reinterpret_cast<char*>(&cnt), sizeof(cnt));
-        counter_.emplace(key, cnt);
-    }
+    // Memory-map the sorted (key, count) records instead of loading them into
+    // an in-RAM hash (the former ~95 GB whole-genome footprint / v08 OOM).
+    if (!counter_.open(path))
+        throw std::runtime_error("cannot mmap Phase 0 output: " + path);
 }
 
 void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac,
@@ -116,7 +88,9 @@ void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac,
     if (lo == 0 || hi == 0) return;
 
     std::uint32_t pair_id = 0;
-    for (const auto& [bits_a, count_a] : counter_) {
+    for (std::size_t i = 0; i < counter_.size(); ++i) {
+        const std::uint64_t bits_a = counter_.key_at(i);
+        const std::uint32_t count_a = counter_.count_at(i);
         if (count_a < lo || count_a > hi) continue;
         if (het_.find(bits_a) != het_.end()) continue;
 
@@ -131,9 +105,8 @@ void HaplotypeRouter::find_het_pairs(double low_frac, double high_frac,
                 std::uint64_t fwd_bits = cleared | (alt << (2 * pos));
                 std::uint64_t alt_canon = canonical_kmer_bits(fwd_bits, k);
                 if (alt_canon == bits_a) continue;
-                auto it = counter_.find(alt_canon);
-                if (it == counter_.end()) continue;
-                std::uint32_t count_b = it->second;
+                std::uint32_t count_b = counter_.find(alt_canon);
+                if (count_b == 0) continue;
                 if (count_b < lo || count_b > hi) continue;
                 std::uint32_t sum = count_a + count_b;
                 if (sum < sum_lo || sum > sum_hi) continue;
