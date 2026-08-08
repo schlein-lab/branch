@@ -150,6 +150,16 @@ target_include_directories(test_bam_reader SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/htslib)
 gtest_discover_tests(test_bam_reader)
 
+add_executable(test_overlap_store test_overlap_store.cpp)
+target_link_libraries(test_overlap_store PRIVATE branch_io GTest::gtest_main)
+target_compile_features(test_overlap_store PRIVATE cxx_std_20)
+gtest_discover_tests(test_overlap_store)
+
+add_executable(test_read_seq_store test_read_seq_store.cpp)
+target_link_libraries(test_read_seq_store PRIVATE branch_io GTest::gtest_main)
+target_compile_features(test_read_seq_store PRIVATE cxx_std_20)
+gtest_discover_tests(test_read_seq_store)
+
 # --- E2E integration test -------------------------------------------------
 # Spawns the real `branch` binary on a synthetic FASTQ and validates the
 # emitted GFA. Gated on the `branch` target being defined so a standalone

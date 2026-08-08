@@ -2,6 +2,8 @@ add_library(branch_io STATIC
     mosdepth_reader.cpp
     fastq_reader.cpp
     bam_reader.cpp
+    overlap_store.cpp
+    read_seq_store.cpp
 )
 target_include_directories(branch_io PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
