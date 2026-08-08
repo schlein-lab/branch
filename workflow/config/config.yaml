@@ -5,15 +5,15 @@ sample: HG002
 
 # Path overrides (all optional, defaults constructed from $USER environment var).
 # Uncomment and adjust if running as different user or custom layout.
-# shared_dir: /beegfs/u/<user>/<group>/shared
-# project_dir: /beegfs/u/<user>/<group>/<lab>/<user>/projects/branch
-# container_dir: /beegfs/u/<user>/<group>/<lab>/<user>/containers
-# log_dir: /beegfs/u/<user>/<group>/<lab>/<user>/logs/slurm_jobs
-# tmp_dir: /beegfs/u/<user>/<group>/<lab>/<user>/projects/branch/tmp
+# shared_dir: /beegfs/u/$USER/<group>/shared
+# project_dir: /beegfs/u/$USER/<group>/<your_dir>/projects/branch
+# container_dir: /beegfs/u/$USER/<group>/<your_dir>/containers
+# log_dir: /beegfs/u/$USER/<group>/<your_dir>/logs/slurm_jobs
+# tmp_dir: /beegfs/u/$USER/<group>/<your_dir>/projects/branch/tmp
 
 # Optional override. If unset, the Snakefile constructs the path from
 # BeeGFS shared-reference layout using ${USER} and the sample name.
-# Example: /beegfs/u/<user>/<group>/shared/references/human_pangenome/hifi_reads/HG002/15kb
+# Example: /beegfs/u/$USER/<group>/shared/references/human_pangenome/hifi_reads/HG002/15kb
 # hifi_dir: ""
 
 # Runtime knobs that may change per workload size.
@@ -24,7 +24,7 @@ threads_mosdepth: 4
 # Absolute path to the `branch` CLI on the cluster. Locally (e.g. for a
 # --dry-run on a dev machine), override via --config branch_bin=... and/or
 # set skip_check: true below.
-branch_bin: /beegfs/u/<user>/<group>/<lab>/<user>/projects/branch/build/src/cli/branch
+branch_bin: /beegfs/u/$USER/<group>/<your_dir>/projects/branch/build/src/cli/branch
 
 # Baseline prefix for `branch analyze` CN normalization. Regions in the
 # mosdepth regions.bed whose `name` column starts with this prefix are used
@@ -37,7 +37,7 @@ analyze_baseline_prefix: control_
 # SIF exists, `branch_bin` is executed directly on the compute node (requires
 # the build/ tree to be present on BeeGFS, which submit_slurm.sh verifies).
 container:
-  sif: /beegfs/u/<user>/<group>/<lab>/<user>/containers/branch-v0.2.sif
+  sif: /beegfs/u/$USER/<group>/<your_dir>/containers/branch-v0.2.sif
 
 # Set to true to skip the BRANCH_BIN existence assert at parse time.
 # Useful for running `snakemake --dry-run` on a machine where the binary

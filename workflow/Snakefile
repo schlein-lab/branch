@@ -12,8 +12,8 @@ from pathlib import Path
 
 configfile: "config/config.yaml"
 
-USER = os.environ.get("USER", "<user>")
-BEEGFS_BASE = f"/beegfs/u/{USER}/<group>/<lab>/{USER}"
+USER = os.environ.get("USER", "")
+BEEGFS_BASE = f"/beegfs/u/{USER}/<group>/<your_dir>"  # site-specific; override via config
 PROJECT_DIR = config.get("project_dir", f"{BEEGFS_BASE}/projects/branch")
 CONTAINER_DIR = config.get("container_dir", f"{BEEGFS_BASE}/containers")
 LOG_DIR = config.get("log_dir", f"{BEEGFS_BASE}/logs/slurm_jobs")

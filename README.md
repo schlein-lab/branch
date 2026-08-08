@@ -39,9 +39,7 @@ branch assemble  --fastq sample.fq  --out sample.gfa  --out-reads sample.gaf
 branch analyze   --graph sample.gfa --reads sample.gaf --out-bed sample.bubbles.bed
 
 # 2. Aggregate + classify across samples (dbVar overlap, recurrence, VAF)
-python3 phase_d/scripts/11_branch_atlas.py \
-    --inputs "sampleA.bubbles.bed:sampleA,sampleB.bubbles.bed:sampleB" \
-    --out per_bubble_master.tsv
+#    (cross-sample atlas helper — in development, not yet shipped in this repo)
 
 # 3. Convert to portable .vpf (topology) + .vpz (sequences)
 #    schlein-lab/variantpaths/build_vpf.py

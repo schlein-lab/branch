@@ -1,5 +1,5 @@
-# Snakemake SLURM profile for the HPC cluster.
-# Follows AG-Schlein HUMMEL2_SNAKEMAKE_GUIDE.md rules:
+# Snakemake SLURM profile for a SLURM cluster with BeeGFS.
+# Follows site-specific SLURM rules:
 #   - no --mem (forbidden by RRZ policy)
 #   - all caches on BeeGFS (/home is readonly in batch jobs)
 #   - SLURM-PATH must be set before snakemake invocation
@@ -8,13 +8,13 @@ executor: slurm
 
 # --- BeeGFS-only paths (placeholders; run scripts fill $USER/$PROJECT) ---
 # Users override these via env vars or symlinks before launch.
-# directory:                  /beegfs/u/$USER/<group>/<lab>/$USER/projects/branch
-# slurm-logdir:               /beegfs/u/$USER/<group>/<lab>/$USER/logs/slurm_jobs
-# runtime-source-cache-path:  /beegfs/u/$USER/<group>/<lab>/$USER/.cache/snakemake
-# conda-prefix:               /beegfs/u/$USER/<group>/<lab>/$USER/.snakemake/conda
-# apptainer-prefix:           /beegfs/u/$USER/<group>/<lab>/$USER/containers
-# shadow-prefix:              /beegfs/u/$USER/<group>/<lab>/$USER/projects/branch/.snakemake/shadow
-# local-storage-prefix:       /beegfs/u/$USER/<group>/<lab>/$USER/.snakemake/storage
+# directory:                  /beegfs/u/$USER/<group>/<your_dir>/projects/branch
+# slurm-logdir:               /beegfs/u/$USER/<group>/<your_dir>/logs/slurm_jobs
+# runtime-source-cache-path:  /beegfs/u/$USER/<group>/<your_dir>/.cache/snakemake
+# conda-prefix:               /beegfs/u/$USER/<group>/<your_dir>/.snakemake/conda
+# apptainer-prefix:           /beegfs/u/$USER/<group>/<your_dir>/containers
+# shadow-prefix:              /beegfs/u/$USER/<group>/<your_dir>/projects/branch/.snakemake/shadow
+# local-storage-prefix:       /beegfs/u/$USER/<group>/<your_dir>/.snakemake/storage
 
 default-resources:
   slurm_account: your_slurm_account
