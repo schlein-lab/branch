@@ -14,6 +14,7 @@
 
 set(branch_backend_sources
     cpu_backend.cpp
+    csr_overlap_engine.cpp
     backend_factory.cpp
 )
 

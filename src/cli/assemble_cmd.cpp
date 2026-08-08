@@ -20,6 +20,7 @@
 #include "backend/backend_factory.hpp"
 #include "backend/backend_vtable.hpp"
 #include "backend/cpu_backend.hpp"
+#include "backend/csr_overlap_engine.hpp"
 #include "graph/kmer_sketch.hpp"
 #include "graph/minimizer_sketcher.hpp"
 #include "common/memory.hpp"
@@ -72,6 +73,15 @@ void print_assemble_usage(std::ostream& os) {
           "  --backend <mode>  overlap backend to use. auto (default) = prefer GPU,\n"
           "                    fall back to CPU. cpu = force CPU (deterministic,\n"
           "                    reference). gpu = require GPU, fail if unavailable.\n"
+          "  --engine <mode>   overlap engine. legacy (default) = original in-RAM\n"
+          "                    bucketing (small inputs only). csr = WGS-scale CSR\n"
+          "                    index + per-query streaming; no --max-overlaps cap,\n"
+          "                    memory stays bounded. csr implies --backend cpu.\n"
+          "  --seed-cap <N>    csr only: skip minimizers occurring > N times when\n"
+          "                    SEEDING candidates (default 500; 0 = uncapped).\n"
+          "                    Capped hashes are written to <out>.overcap.tsv —\n"
+          "                    seeding-only, reads stay anchored via their other\n"
+          "                    minimizers (lossless contract).\n"
           "\nGraph filter:\n"
           "  --keep-contained  Disable the containment-drop filter. Default: drop contained\n"
           "                    nodes but transfer their read_support onto the covering\n"
@@ -125,6 +135,11 @@ struct Args {
     // k=15, w=10 + a hash-bucket cap of 64 to keep the all-pairs match
     // table from blowing up on basecaller-error noise.
     std::string read_tech{"hifi"};
+    // Overlap engine selection. "legacy" = original monolithic
+    // unordered_map path (kept as reference; OOMs beyond ~5k dense
+    // reads). "csr" = WGS-scale CSR index + query streaming.
+    std::string engine{"legacy"};
+    std::size_t seed_cap{500};
     bool keep_contained{false};
     bool ok{false};
     std::string err;
@@ -167,6 +182,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--backend") { auto v = needs("--backend"); if (!v) return a; a.backend_mode = v; }
         else if (k == "--max-memory") { auto v = needs("--max-memory"); if (!v) return a; a.max_memory = v; }
         else if (k == "--read-tech") { auto v = needs("--read-tech"); if (!v) return a; a.read_tech = v; }
+        else if (k == "--engine")   { auto v = needs("--engine");    if (!v) return a; a.engine = v; }
+        else if (k == "--seed-cap") { auto v = needs("--seed-cap");  if (!v) return a; a.seed_cap = std::strtoull(v, nullptr, 10); }
         else if (k == "--keep-contained") { a.keep_contained = true; }
         else if (k == "--help" || k == "-h") { a.err = "HELP"; return a; }
         else { a.err = std::string("unknown arg: ") + std::string(k); return a; }
@@ -283,21 +300,69 @@ int run_assemble(int argc, char** argv) {
 
     branch::backend::set_cpu_overlap_threads(
         static_cast<unsigned int>(a.threads > 0 ? a.threads : 1));
-    std::string be_err;
-    const auto mode = branch::backend::parse_backend_mode(a.backend_mode, &be_err);
-    if (!be_err.empty()) {
-        std::cerr << "[branch assemble] " << be_err << "\n";
-    }
-    auto bk = branch::backend::make_backend(mode);
-    if (bk.empty()) {
-        std::cerr << "[branch assemble] requested backend unavailable (mode='"
-                  << a.backend_mode << "'); aborting.\n";
-        return 4;
-    }
-    std::vector<branch::backend::OverlapPair> overlaps(a.max_overlaps);
+
+    std::vector<branch::backend::OverlapPair> overlaps;
     std::size_t n_overlaps = 0;
-    bk.compute_overlaps(&batch, overlaps, &n_overlaps);
-    overlaps.resize(n_overlaps);
+    if (a.engine == "csr") {
+        // WGS-scale path: CSR index + query streaming. No pair cap —
+        // the output vector grows to the true overlap count.
+        branch::backend::CsrOverlapConfig csr_cfg;
+        csr_cfg.threads =
+            static_cast<unsigned int>(a.threads > 0 ? a.threads : 1);
+        csr_cfg.seed_cap = a.seed_cap;
+        branch::backend::CsrIndexStats csr_stats;
+        n_overlaps = branch::backend::compute_overlaps_csr(
+            batch, csr_cfg, overlaps, &csr_stats);
+        std::cerr << "[branch assemble] engine=csr seed-cap=" << a.seed_cap
+                  << " hits=" << csr_stats.n_hits_total
+                  << " distinct=" << csr_stats.n_distinct_hashes
+                  << " capped_hashes=" << csr_stats.n_hashes_capped
+                  << " dropped_hits=" << csr_stats.n_entries_dropped << "\n";
+        if (csr_stats.n_hashes_capped > 0) {
+            const std::string overcap_path = a.out + ".overcap.tsv";
+            std::ofstream oc(overcap_path);
+            if (oc) {
+                oc << "hash\tcount\n";
+                for (const auto& c : csr_stats.capped_hashes) {
+                    oc << std::hex << c.hash << std::dec << '\t' << c.count
+                       << '\n';
+                }
+                std::cerr << "[branch assemble] wrote overcap report "
+                          << overcap_path << " (top "
+                          << csr_stats.capped_hashes.size() << " of "
+                          << csr_stats.n_hashes_capped
+                          << " capped hashes; seeding-only, reads stay "
+                             "anchored via remaining minimizers)\n";
+            }
+        }
+    } else if (a.engine == "legacy") {
+        std::string be_err;
+        const auto mode =
+            branch::backend::parse_backend_mode(a.backend_mode, &be_err);
+        if (!be_err.empty()) {
+            std::cerr << "[branch assemble] " << be_err << "\n";
+        }
+        auto bk = branch::backend::make_backend(mode);
+        if (bk.empty()) {
+            std::cerr << "[branch assemble] requested backend unavailable (mode='"
+                      << a.backend_mode << "'); aborting.\n";
+            return 4;
+        }
+        overlaps.resize(a.max_overlaps);
+        bk.compute_overlaps(&batch, overlaps, &n_overlaps);
+        overlaps.resize(n_overlaps);
+        if (n_overlaps == a.max_overlaps) {
+            std::cerr << "[branch assemble] WARNING: overlap count hit the "
+                         "--max-overlaps cap ("
+                      << a.max_overlaps
+                      << ") — pairs beyond the cap were DROPPED. Rerun with "
+                         "--engine csr (uncapped) or raise --max-overlaps.\n";
+        }
+    } else {
+        std::cerr << "branch assemble: unknown --engine '" << a.engine
+                  << "' (supported: legacy, csr)\n";
+        return 2;
+    }
     std::cerr << "[branch assemble] overlaps=" << n_overlaps << "\n";
 
     // 3b. Optional FASTA / PAF sidecars (before graph-build so the

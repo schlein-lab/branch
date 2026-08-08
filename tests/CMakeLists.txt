@@ -278,3 +278,8 @@ target_link_libraries(test_somatic_delta PRIVATE branch_project GTest::gtest_mai
 target_compile_features(test_somatic_delta PRIVATE cxx_std_20)
 target_include_directories(test_somatic_delta PRIVATE ${CMAKE_SOURCE_DIR}/src)
 gtest_discover_tests(test_somatic_delta)
+
+add_executable(test_csr_overlap_engine test_csr_overlap_engine.cpp)
+target_link_libraries(test_csr_overlap_engine PRIVATE branch_backend GTest::gtest_main)
+target_compile_features(test_csr_overlap_engine PRIVATE cxx_std_20)
+gtest_discover_tests(test_csr_overlap_engine)
