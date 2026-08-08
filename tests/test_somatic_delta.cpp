@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include "project/somatic_delta.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>

@@ -92,7 +92,7 @@ TEST(MajorityVoter, MismatchedLengthsThrow) {
         "ACG",  // shorter
     };
     const auto ins = views(owners);
-    EXPECT_THROW(build_consensus(ins), std::invalid_argument);
+    EXPECT_THROW((void)build_consensus(ins), std::invalid_argument);
 }
 
 TEST(MajorityVoter, GapsAreIgnoredForCoverage) {
